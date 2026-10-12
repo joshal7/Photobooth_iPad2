@@ -142,85 +142,31 @@ struct ContentView: View {
             case .error(let message):
                 ErrorView(message: message)
                 
-            case .wifiMismatch(let targetSSID):
-                VStack(spacing: 20) {
-                    Text("Connect to the Camera's WiFi")
-                        .font(.title)
-                        .fontWeight(.bold)
-                        .foregroundColor(.white)
-                    
-                    Text("\"\(targetSSID)\"")
-                        .font(.system(size: 30, weight: .heavy, design: .monospaced))
-                        .foregroundColor(.yellow)
-                        .padding()
-                        .background(Color.white.opacity(0.1))
-                        .cornerRadius(10)
-                    
-                    Button(action: {
-                        UIPasteboard.general.string = ConfigManager.shared.cameraPassword
-                    }) {
-                        HStack {
-                            Image(systemName: "doc.on.doc")
-                            Text("Copy Password")
-                        }
-                        .font(.headline)
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 10)
-                        .background(Color.gray.opacity(0.5))
-                        .cornerRadius(10)
-                    }
-                    .padding(.bottom, 10)
-                    
-                    Button(action: {
-                        // Try multiple URL schemes to open Wi-Fi settings
-                        let schemes = [
-                            "App-Prefs:root=WIFI",
-                            "App-Prefs:WIFI",
-                            "prefs:root=WIFI"
-                        ]
-                        
-                        func openScheme(index: Int) {
-                            guard index < schemes.count else { return }
-                            if let url = URL(string: schemes[index]) {
-                                UIApplication.shared.open(url, options: [:]) { success in
-                                    if !success {
-                                        openScheme(index: index + 1)
-                                    }
-                                }
-                            } else {
-                                openScheme(index: index + 1)
-                            }
-                        }
-                        
-                        openScheme(index: 0)
-                    }) {
-                        Text("Open Wi-Fi Settings")
-                            .font(.headline)
-                            .foregroundColor(.white)
-                            .padding()
-                            .background(Color.blue)
-                            .cornerRadius(10)
-                    }
-                    
-                    Button(action: {
-                        stateMachine.forceConnection()
-                    }) {
-                        Text("I'm connected, try anyway")
-                            .font(.subheadline)
-                            .foregroundColor(.white.opacity(0.7))
-                            .padding(.top, 10)
-                    }
-                }
-                .padding()
-                .background(Color.black.opacity(0.8))
-                .cornerRadius(20)
-                
             case .sharingPrompt:
                 SharingOverlayView()
                 
             case .airDrop(let images):
                 AirDropInstructionsView(images: images)
+            }
+            
+            // Low Storage Warning Banner (< 2 GB free)
+            if let storageWarning = stateMachine.lowStorageWarning {
+                VStack {
+                    HStack(spacing: 8) {
+                        Image(systemName: "externaldrive.badge.exclamationmark")
+                        Text(storageWarning)
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                    }
+                    .foregroundColor(.black)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Color.yellow.opacity(0.95))
+                    .cornerRadius(20)
+                    .padding(.top, 16)
+                    Spacer()
+                }
+                .allowsHitTesting(false)
             }
             
             // Global Settings Button Overlay

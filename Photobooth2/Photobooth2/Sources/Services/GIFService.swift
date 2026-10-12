@@ -8,9 +8,16 @@ final class GIFService: Sendable {
     // No shared instance needed for stateless service
     private init() {}
     
-    /// Creates an animated GIF from a list of image paths.
+    private nonisolated static func resolveFileURL(_ pathOrURL: String) -> URL {
+        if pathOrURL.hasPrefix("file://"), let url = URL(string: pathOrURL) {
+            return url
+        }
+        return URL(fileURLWithPath: pathOrURL)
+    }
+
+    /// Creates an animated GIF from a list of image paths or file:// URLs.
     /// - Parameters:
-    ///   - imagePaths: List of file paths (strings) to source images.
+    ///   - imagePaths: List of file paths or file:// URL strings to source images.
     ///   - frameDuration: Duration for each frame in seconds.
     ///   - resolution: 0 for 720p (1280x720), 1 for 480p (640x480).
     /// - Returns: URL to the created GIF file, or nil if failed.
@@ -43,26 +50,27 @@ final class GIFService: Sendable {
         // Calculate maxPixelSize based on the first image's aspect ratio
         var computedMaxPixelSize: Int = Int(targetHeight)
         
-        if let firstPath = imagePaths.first,
-           let url = URL(string: "file://\(firstPath)"),
-           let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-           let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] {
-            
-            let width = properties[kCGImagePropertyPixelWidth as String] as? Double ?? 0
-            let height = properties[kCGImagePropertyPixelHeight as String] as? Double ?? 0
-            
-            if height > 0 {
-                let aspectRatio = width / height
-                // If Landscape (AR > 1), we must scale Width such that Height = targetHeight.
-                // MaxPixelSize limits the longest edge.
-                if width >= height {
-                    // Landscape: Longest edge is Width.
-                    // Width = Height * AR
-                    computedMaxPixelSize = Int(targetHeight * aspectRatio)
-                } else {
-                    // Portrait: Longest edge is Height.
-                    // Height = targetHeight
-                    computedMaxPixelSize = Int(targetHeight)
+        if let firstPath = imagePaths.first {
+            let url = resolveFileURL(firstPath)
+            if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] {
+                
+                let width = properties[kCGImagePropertyPixelWidth as String] as? Double ?? 0
+                let height = properties[kCGImagePropertyPixelHeight as String] as? Double ?? 0
+                
+                if height > 0 {
+                    let aspectRatio = width / height
+                    // If Landscape (AR > 1), we must scale Width such that Height = targetHeight.
+                    // MaxPixelSize limits the longest edge.
+                    if width >= height {
+                        // Landscape: Longest edge is Width.
+                        // Width = Height * AR
+                        computedMaxPixelSize = Int(targetHeight * aspectRatio)
+                    } else {
+                        // Portrait: Longest edge is Height.
+                        // Height = targetHeight
+                        computedMaxPixelSize = Int(targetHeight)
+                    }
                 }
             }
         }
@@ -76,7 +84,7 @@ final class GIFService: Sendable {
         ]
         
         for path in imagePaths {
-            let url = URL(fileURLWithPath: path)
+            let url = resolveFileURL(path)
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
                 print("Failed to load image source at \(path)")
                 continue

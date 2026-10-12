@@ -252,31 +252,18 @@ struct AirDropInstructionsView: View {
         isPreparing = true
         cancelReset() // Cancel any existing timers
         
-        Task {
-            var items: [Any] = []
-            
-            for path in images {
-                if let url = URL(string: path) {
-                    if url.isFileURL { // Covers file:// scheme
-                         items.append(url)
-                    } else {
-                        // Remote URL: Download to temp
-                        if let data = try? await URLSession.shared.data(from: url).0 {
-                            let filename = url.lastPathComponent
-                            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
-                            try? data.write(to: tempURL)
-                            items.append(tempURL)
-                        }
-                    }
-                }
-            }
-            
-            await MainActor.run {
-                isPreparing = false
-                isSheetPresented = true
-                presentShareSheet(items: items)
+        var items: [Any] = []
+        for path in images {
+            if path.hasPrefix("file://"), let url = URL(string: path) {
+                items.append(url)
+            } else {
+                items.append(URL(fileURLWithPath: path))
             }
         }
+        
+        isPreparing = false
+        isSheetPresented = true
+        presentShareSheet(items: items)
     }
     
     private func presentShareSheet(items: [Any]) {

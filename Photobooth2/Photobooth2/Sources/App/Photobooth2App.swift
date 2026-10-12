@@ -10,13 +10,26 @@ struct Photobooth2App: App {
             ContentView()
                 .environmentObject(stateMachine)
                 .onAppear {
+                    #if DEBUG
+                    if CommandLine.arguments.contains("--verify") {
+                        Task { @MainActor in
+                            await AutomatedVerificationSuite.runAllAndExit()
+                        }
+                        return
+                    }
+                    #endif
                     stateMachine.start()
                     // Prevent auto-lock while app is running
                     UIApplication.shared.isIdleTimerDisabled = true
                 }
                 .onChange(of: scenePhase) { _, newPhase in
-                    if newPhase == .active {
+                    switch newPhase {
+                    case .active:
                         stateMachine.handleAppDidBecomeActive()
+                    case .background:
+                        stateMachine.handleAppDidEnterBackground()
+                    default:
+                        break
                     }
                 }
         }

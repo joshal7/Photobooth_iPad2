@@ -4,9 +4,6 @@ struct SettingsView: View {
     @ObservedObject var config = ConfigManager.shared
     @Environment(\.presentationMode) var presentationMode
     @EnvironmentObject var stateMachine: StateMachine
-    @State private var isCleaningFrames = false
-    @State private var alertMessage: String?
-    @State private var showAlert = false
     
     var body: some View {
         NavigationView {
@@ -25,18 +22,13 @@ struct SettingsView: View {
                         // Frame Count: Max 10 frames
                         Stepper("GIF Frame Count: \(config.gifFrameCount)", value: $config.gifFrameCount, in: 2...10)
                         
-                        // Capture Interval: Min 0.1s
-                        // Capture Interval: Min 0.1s
-                        if !config.useLocalCamera {
-                            HStack {
-                                Text("Capture Interval")
-                                Spacer()
-                                Text("-")
-                                    .foregroundColor(.gray)
-                            }
-                        } else {
-                            Stepper("Capture Interval: \(String(format: "%.2f", config.gifCaptureInterval))s", value: $config.gifCaptureInterval, in: 0.1...2.0, step: 0.05)
-                        }
+                        // Min Time Between GIFs (0.5s minimum for strobe recycling, 2.0s default for guest repositioning)
+                        Stepper(
+                            "Min Time Between GIFs: \(String(format: "%.1f", config.gifCaptureInterval))s",
+                            value: $config.gifCaptureInterval,
+                            in: 0.5...5.0,
+                            step: 0.5
+                        )
                         
                         // Frame Duration
                         Stepper("Frame Duration: \(String(format: "%.2f", config.gifFrameDuration))s", value: $config.gifFrameDuration, in: 0.05...1.0, step: 0.05)
@@ -50,31 +42,6 @@ struct SettingsView: View {
                             Text("480p").tag(1)
                         }
                         .pickerStyle(SegmentedPickerStyle())
-                        
-                        if !config.useLocalCamera {
-                            if config.pendingGIFFramesToDelete > 0 {
-                                Button(action: {
-                                    cleanUpGIFFrames()
-                                }) {
-                                    HStack {
-                                        if isCleaningFrames {
-                                            ProgressView()
-                                                .progressViewStyle(CircularProgressViewStyle())
-                                                .padding(.trailing, 5)
-                                            Text("Cleaning...")
-                                        } else {
-                                            Image(systemName: "trash")
-                                            Text("Clean Up Sony Camera GIF Frames (\(config.pendingGIFFramesToDelete))")
-                                        }
-                                    }
-                                }
-                                .disabled(isCleaningFrames)
-                                .foregroundColor(isCleaningFrames ? .gray : .red)
-                            } else {
-                                Text("No pending GIF frames to clean.")
-                                    .foregroundColor(.gray)
-                            }
-                        }
                         
                         // GIF Retrieval Window
                         Stepper("GIF Retrieval Window: \(config.gifRetrievalWindowHours) hrs", value: $config.gifRetrievalWindowHours, in: 1...72)
@@ -155,66 +122,39 @@ struct SettingsView: View {
                     
                     if !config.useLocalCamera {
                         HStack {
-                            Text("Endpoint")
+                            Text("USB Connection Status")
                             Spacer()
-                            TextField("http://...", text: $config.cameraEndpoint)
-                                .multilineTextAlignment(.trailing)
-                                .autocapitalization(.none)
-                                .disableAutocorrection(true)
-                                .foregroundColor(.gray)
-                        }
-                        
-                        HStack {
-                            Text("Camera SSID")
-                            Spacer()
-                            TextField("DIRECT-xxxx:Sony", text: $config.cameraSSID)
-                                .multilineTextAlignment(.trailing)
-                                .autocapitalization(.none)
-                                .disableAutocorrection(true)
-                                .foregroundColor(.gray)
-                        }
-                        
-                        HStack {
-                            Text("Password")
-                            Spacer()
-                            TextField("Password", text: $config.cameraPassword)
-                                .multilineTextAlignment(.trailing)
-                                .autocapitalization(.none)
-                                .disableAutocorrection(true)
-                            
-                            Button(action: {
-                                UIPasteboard.general.string = config.cameraPassword
-                            }) {
-                                Image(systemName: "doc.on.doc")
-                                    .foregroundColor(.blue)
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(stateMachine.isCameraConnected ? Color.green : Color.red)
+                                    .frame(width: 10, height: 10)
+                                Text(stateMachine.isCameraConnected ? "Connected (Sony USB PTP)" : "Disconnected")
+                                    .foregroundColor(stateMachine.isCameraConnected ? .primary : .secondary)
                             }
                         }
-                        
- 
-                        
                     }
-
-                    
                 }
                 
                 if !config.useLocalCamera {
-                    Section(header: Text("Connection Instructions")) {
+                    Section(header: Text("Sony A7V + USB-C Hub Setup")) {
                         VStack(alignment: .leading, spacing: 10) {
                             Group {
-                                Text("Required:")
+                                Text("Camera Dial & Menu (Save to Mode Dial '1'):")
                                     .font(.subheadline)
                                     .bold()
-                                Text("• Open 'Smart Remote Control' app on Camera.")
-                                Text("• Keep Camera and iPad plugged into power.")
+                                Text("• Exposure: Manual (f/10, ISO 200, 1/125s) & Manual Focus (~1.75m)")
+                                Text("• Setup > USB > USB Connection Mode: PC Remote")
+                                Text("• Setup > Power Setting Option > Auto Power OFF Temp.: High")
                             }
                             
                             Group {
-                                Text("Recommended:")
+                                Text("Hardware Connections:")
                                     .font(.subheadline)
                                     .bold()
                                     .padding(.top, 5)
-                                Text("• Disable 'Auto-Join' for other Wi-Fi networks in iPad Settings.")
-                                Text("• This ensures the iPad automatically reconnects to the Camera if the connection drops.")
+                                Text("• Connect Sony A7V USB-C Data Port (trident icon) to UGREEN Hub 10Gbps data port.")
+                                Text("• Connect Wall Charger to UGREEN Hub 100W PD port, and Hub host cable to iPad.")
+                                Text("• Attach Godox X2T-S trigger to hot shoe and set strobe to 1/4 + 0.9.")
                             }
                         }
                         .font(.caption)
@@ -231,13 +171,6 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
-            .alert(isPresented: $showAlert) {
-                Alert(
-                    title: Text("Camera Maintenance"),
-                    message: Text(alertMessage ?? ""),
-                    dismissButton: .default(Text("OK"))
-                )
-            }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
@@ -258,7 +191,6 @@ struct SettingsView: View {
                 
                 await MainActor.run {
                     if urls.isEmpty {
-                        // Optional: Show alert if no GIFs found (omitted for simplicity as per request "no impact to runtime logic")
                         print("No GIFs found in the last \(hours) hours.")
                     } else {
                         presentShareSheet(items: urls)
@@ -273,10 +205,6 @@ struct SettingsView: View {
     private func presentShareSheet(items: [Any]) {
         guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
               let rootVC = windowScene.windows.first?.rootViewController else { return }
-        
-        // If a presentation is already active (e.g. Settings sheet itself), we should present from there?
-        // SettingsView is likely presented as a sheet or in a nav view. 
-        // We generally want to present 'on top' of the top-most controller.
         
         let topController: UIViewController = rootVC.presentedViewController ?? rootVC
         
@@ -297,42 +225,5 @@ struct SettingsView: View {
         }
         
         topController.present(activityVC, animated: true)
-    }
-    
-    private func cleanUpGIFFrames() {
-        isCleaningFrames = true
-        let count = config.pendingGIFFramesToDelete
-        
-        Task {
-            let cameraService = SonyCameraClient(config: config)
-            do {
-                try await cameraService.deleteLastCapturedImages(count: count)
-                
-                // Wait 2.0 seconds for the camera to fully transition back to Remote Shooting mode
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                
-                await MainActor.run {
-                    config.pendingGIFFramesToDelete = 0
-                    isCleaningFrames = false
-                    alertMessage = "Successfully deleted \(count) source frames from the Sony SD card."
-                    showAlert = true
-                    
-                    // Force the state machine to re-initialize and reconnect the camera
-                    stateMachine.forceConnection()
-                }
-            } catch {
-                print("Failed to clean up GIF frames: \(error)")
-                
-                // Even on failure, wait and attempt reconnect to restore state
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                await MainActor.run {
-                    isCleaningFrames = false
-                    alertMessage = "Failed to clean up GIF frames. Please check your camera Wi-Fi connection and try again.\n\nError: \(error.localizedDescription)"
-                    showAlert = true
-                    
-                    stateMachine.forceConnection()
-                }
-            }
-        }
     }
 }

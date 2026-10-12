@@ -43,14 +43,31 @@ class MockCameraClient: CameraService {
     }
     
     func takePicture() async throws -> [String] {
-        try await Task.sleep(nanoseconds: 2_000_000_000) // Simulate capture delay
-        // Return mock image URLs
-        return ["http://mock.local/image1.jpg"]
+        try await Task.sleep(nanoseconds: 300_000_000) // Simulate capture delay
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 800, height: 600))
+        let image = renderer.image { ctx in
+            UIColor.random().setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 800, height: 600))
+        }
+        guard let data = image.jpegData(compressionQuality: 0.85) else {
+            throw CameraError.invalidResponse
+        }
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("mock_\(UUID().uuidString).jpg")
+        try data.write(to: fileURL, options: .atomic)
+        return [fileURL.absoluteString]
     }
     
     func fetchImage(url: String) async throws -> Data {
-        try await Task.sleep(nanoseconds: 500_000_000)
-        // Return a solid color image as mock data
+        if url.hasPrefix("file://"), let fileURL = URL(string: url),
+           let data = try? Data(contentsOf: fileURL) {
+            return data
+        }
+        if FileManager.default.fileExists(atPath: url),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: url)) {
+            return data
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        // Fallback solid color image as mock data
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 800, height: 600))
         let image = renderer.image { ctx in
             UIColor.random().setFill()
@@ -60,7 +77,7 @@ class MockCameraClient: CameraService {
     }
     
     func checkConnection() async -> Bool {
-        return true
+        return isConnected
     }
 }
 

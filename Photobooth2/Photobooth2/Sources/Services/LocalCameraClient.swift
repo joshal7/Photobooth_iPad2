@@ -18,6 +18,7 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
     private let photoOutput = AVCapturePhotoOutput()
     private let videoOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
+    private let ciContext = CIContext()
     
     private var photoContinuation: CheckedContinuation<[String], Error>?
     
@@ -106,8 +107,11 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
     
     func fetchImage(url: String) async throws -> Data {
         // For local files, we can just read from disk
-        guard let fileURL = URL(string: url) else {
-            throw CameraError.invalidResponse
+        let fileURL: URL
+        if url.hasPrefix("file://"), let parsed = URL(string: url) {
+            fileURL = parsed
+        } else {
+            fileURL = URL(fileURLWithPath: url)
         }
         return try Data(contentsOf: fileURL)
     }
@@ -134,8 +138,7 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
             default: imageOrientation = .right
             }
             
-            let context = CIContext()
-            if let cgImage = context.createCGImage(ciImage, from: ciImage.extent) {
+            if let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) {
                 let uiImage = UIImage(cgImage: cgImage, scale: 1.0, orientation: imageOrientation)
                 _previewStream.send(uiImage)
             }
