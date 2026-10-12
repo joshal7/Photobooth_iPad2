@@ -15,13 +15,13 @@ final class GIFService: Sendable {
         return URL(fileURLWithPath: pathOrURL)
     }
 
-    /// Creates an animated GIF from a list of image paths or file:// URLs.
+    /// Creates an animated GIF from a list of image paths or file:// URLs at 1080p resolution.
     /// - Parameters:
     ///   - imagePaths: List of file paths or file:// URL strings to source images.
     ///   - frameDuration: Duration for each frame in seconds.
-    ///   - resolution: 0 for 720p (1280x720), 1 for 480p (640x480).
+    ///   - resolution: Unused legacy parameter (defaults to 1080p).
     /// - Returns: URL to the created GIF file, or nil if failed.
-    nonisolated static func createGIF(from imagePaths: [String], frameDuration: Double, resolution: Int) -> URL? {
+    nonisolated static func createGIF(from imagePaths: [String], frameDuration: Double, resolution: Int = 0) -> URL? {
         let fileProperties: [String: Any] = [
             kCGImagePropertyGIFDictionary as String: [
                 kCGImagePropertyGIFLoopCount as String: 0 // 0 = infinite loop
@@ -44,8 +44,8 @@ final class GIFService: Sendable {
         
         CGImageDestinationSetProperties(destination, fileProperties as CFDictionary)
         
-        // Determine target height
-        let targetHeight: Double = (resolution == 1) ? 480 : 720
+        // Default 1080p height
+        let targetHeight: Double = 1080
         
         // Calculate maxPixelSize based on the first image's aspect ratio
         var computedMaxPixelSize: Int = Int(targetHeight)

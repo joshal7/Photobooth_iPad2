@@ -42,18 +42,18 @@ class ConfigManager: ObservableObject {
         self.showGuidanceText = UserDefaults.standard.object(forKey: "showGuidanceText") as? Bool ?? true
         self.enableImageSharing = UserDefaults.standard.object(forKey: "enableImageSharing") as? Bool ?? true
 
-        // Animated GIF Defaults (Min Time Between GIFs defaults to 2.0s, minimum 0.5s)
+        // Animated GIF Defaults (Min Time Between GIFs defaults to 3.0s, minimum 0.5s)
         self.enableGIFMode = UserDefaults.standard.object(forKey: "enableGIFMode") as? Bool ?? true
         self.gifFrameCount = UserDefaults.standard.object(forKey: "gifFrameCount") as? Int ?? 4
-        let savedInterval = UserDefaults.standard.object(forKey: "minTimeBetweenGIFs") as? Double ?? 2.0
+        let savedInterval = UserDefaults.standard.object(forKey: "minTimeBetweenGIFs_v2") as? Double ?? 3.0
         self.gifCaptureInterval = max(0.5, savedInterval)
         self.gifFrameDuration = UserDefaults.standard.object(forKey: "gifFrameDuration") as? Double ?? 0.25
         self.gifPreviewDuration = UserDefaults.standard.object(forKey: "gifPreviewDuration") as? Double ?? 8.0
-        self.gifResolution = UserDefaults.standard.object(forKey: "gifResolution") as? Int ?? 0 // Default 720p
+        self.gifResolution = 0 // 1080p
         self.gifRetrievalWindowHours = UserDefaults.standard.object(forKey: "gifRetrievalWindowHours") as? Int ?? 24
 
-        // QR Code Defaults
-        self.isQRCodeEnabled = UserDefaults.standard.object(forKey: "isQRCodeEnabled") as? Bool ?? false
+        // QR Code Defaults (Enabled by default)
+        self.isQRCodeEnabled = UserDefaults.standard.object(forKey: "isQRCodeEnabled_v2") as? Bool ?? true
         let currentYear = Calendar.current.component(.year, from: Date())
         self.qrCodeURLString = UserDefaults.standard.string(forKey: "qrCodeURLString") ?? "https://www.joshal.com/\(currentYear)"
         self.daysUntilPhotosAvailable = UserDefaults.standard.object(forKey: "daysUntilPhotosAvailable") as? Int ?? 2
@@ -71,13 +71,13 @@ class ConfigManager: ObservableObject {
 
         UserDefaults.standard.set(enableGIFMode, forKey: "enableGIFMode")
         UserDefaults.standard.set(gifFrameCount, forKey: "gifFrameCount")
-        UserDefaults.standard.set(max(0.5, gifCaptureInterval), forKey: "minTimeBetweenGIFs")
+        UserDefaults.standard.set(max(0.5, gifCaptureInterval), forKey: "minTimeBetweenGIFs_v2")
         UserDefaults.standard.set(gifFrameDuration, forKey: "gifFrameDuration")
         UserDefaults.standard.set(gifPreviewDuration, forKey: "gifPreviewDuration")
         UserDefaults.standard.set(gifResolution, forKey: "gifResolution")
         UserDefaults.standard.set(gifRetrievalWindowHours, forKey: "gifRetrievalWindowHours")
 
-        UserDefaults.standard.set(isQRCodeEnabled, forKey: "isQRCodeEnabled")
+        UserDefaults.standard.set(isQRCodeEnabled, forKey: "isQRCodeEnabled_v2")
         UserDefaults.standard.set(qrCodeURLString, forKey: "qrCodeURLString")
         UserDefaults.standard.set(daysUntilPhotosAvailable, forKey: "daysUntilPhotosAvailable")
     }
@@ -94,13 +94,13 @@ class ConfigManager: ObservableObject {
 
         self.enableGIFMode = true
         self.gifFrameCount = 4
-        self.gifCaptureInterval = 2.0
+        self.gifCaptureInterval = 3.0
         self.gifFrameDuration = 0.25
         self.gifPreviewDuration = 6.0
-        self.gifResolution = 0 // 720p
+        self.gifResolution = 0 // 1080p
         self.gifRetrievalWindowHours = 24
 
-        self.isQRCodeEnabled = false
+        self.isQRCodeEnabled = true
         let currentYear = Calendar.current.component(.year, from: Date())
         self.qrCodeURLString = "https://www.joshal.com/\(currentYear)"
         self.daysUntilPhotosAvailable = 2

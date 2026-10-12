@@ -393,7 +393,7 @@ enum AutomatedVerificationSuite {
         // 4. ConfigManager Min Time Between GIFs Clamping Verification
         let config = ConfigManager.shared
         config.resetToDefaults()
-        assertEqual(config.gifCaptureInterval, 2.0, "Default Min Time Between GIFs is 2.0s")
+        assertEqual(config.gifCaptureInterval, 3.0, "Default Min Time Between GIFs is 3.0s")
         config.gifCaptureInterval = 0.2
         assertEqual(config.gifCaptureInterval, 0.5, "Min Time Between GIFs clamps values < 0.5s to 0.5s")
         

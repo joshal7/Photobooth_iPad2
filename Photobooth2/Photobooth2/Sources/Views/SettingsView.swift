@@ -8,6 +8,31 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             Form {
+                Section(header: Text("Camera Configuration")) {
+                    Picker("Camera Source", selection: Binding(
+                        get: { config.useLocalCamera ? 0 : 1 },
+                        set: { config.useLocalCamera = ($0 == 0) }
+                    )) {
+                        Text("iPad Camera").tag(0)
+                        Text("External Camera").tag(1)
+                    }
+                    .pickerStyle(SegmentedPickerStyle())
+                    
+                    if !config.useLocalCamera {
+                        HStack {
+                            Text("USB Connection Status")
+                            Spacer()
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(stateMachine.isCameraConnected ? Color.green : Color.red)
+                                    .frame(width: 10, height: 10)
+                                Text(stateMachine.isCameraConnected ? "Connected (Sony USB PTP)" : "Disconnected")
+                                    .foregroundColor(stateMachine.isCameraConnected ? .primary : .secondary)
+                            }
+                        }
+                    }
+                }
+                
                 Section(header: Text("Timers & Counts")) {
                     Stepper("Initial Countdown: \(config.initialCountdownSec)s", value: $config.initialCountdownSec, in: 1...10)
                     Stepper("Between Shots: \(config.interShotCountdownSec)s", value: $config.interShotCountdownSec, in: 1...10)
@@ -22,7 +47,7 @@ struct SettingsView: View {
                         // Frame Count: Max 10 frames
                         Stepper("GIF Frame Count: \(config.gifFrameCount)", value: $config.gifFrameCount, in: 2...10)
                         
-                        // Min Time Between GIFs (0.5s minimum for strobe recycling, 2.0s default for guest repositioning)
+                        // Min Time Between GIFs (0.5s minimum for strobe recycling, 3.0s default for guest repositioning)
                         Stepper(
                             "Min Time Between GIFs: \(String(format: "%.1f", config.gifCaptureInterval))s",
                             value: $config.gifCaptureInterval,
@@ -35,13 +60,6 @@ struct SettingsView: View {
                         
                         // GIF Preview Duration
                         Stepper("Photo Preview: \(String(format: "%.1f", config.gifPreviewDuration))s", value: $config.gifPreviewDuration, in: 1...30, step: 1.0)
-                        
-                        // Resolution
-                        Picker("GIF Resolution", selection: $config.gifResolution) {
-                            Text("720p").tag(0)
-                            Text("480p").tag(1)
-                        }
-                        .pickerStyle(SegmentedPickerStyle())
                         
                         // GIF Retrieval Window
                         Stepper("GIF Retrieval Window: \(config.gifRetrievalWindowHours) hrs", value: $config.gifRetrievalWindowHours, in: 1...72)
@@ -107,31 +125,6 @@ struct SettingsView: View {
                             Text("7 days").tag(7)
                         }
                         .pickerStyle(.menu)
-                    }
-                }
-                
-                Section(header: Text("Camera Configuration")) {
-                    Picker("Camera Source", selection: Binding(
-                        get: { config.useLocalCamera ? 0 : 1 },
-                        set: { config.useLocalCamera = ($0 == 0) }
-                    )) {
-                        Text("iPad Camera").tag(0)
-                        Text("External Camera").tag(1)
-                    }
-                    .pickerStyle(SegmentedPickerStyle())
-                    
-                    if !config.useLocalCamera {
-                        HStack {
-                            Text("USB Connection Status")
-                            Spacer()
-                            HStack(spacing: 6) {
-                                Circle()
-                                    .fill(stateMachine.isCameraConnected ? Color.green : Color.red)
-                                    .frame(width: 10, height: 10)
-                                Text(stateMachine.isCameraConnected ? "Connected (Sony USB PTP)" : "Disconnected")
-                                    .foregroundColor(stateMachine.isCameraConnected ? .primary : .secondary)
-                            }
-                        }
                     }
                 }
                 

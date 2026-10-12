@@ -72,16 +72,16 @@ struct LookAtCameraView: View {
             return .up // External camera is always "up" (above screen usually)
         }
         
-        // iPad Camera Logic (Front camera is on the top bezel in Portrait)
+        // iPad Gen 10 Camera Logic (Front camera is on the landscape top bezel)
         switch orientation {
-        case .portrait:
+        case .landscapeLeft:
             return .up
-        case .portraitUpsideDown:
+        case .landscapeRight:
             return .down
-        case .landscapeLeft: // Home button right -> Camera is left
-            return .left
-        case .landscapeRight: // Home button left -> Camera is right
+        case .portrait:
             return .right
+        case .portraitUpsideDown:
+            return .left
         default:
             return .up
         }
