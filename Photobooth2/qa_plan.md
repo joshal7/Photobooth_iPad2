@@ -1,6 +1,6 @@
-# Photobooth App QA Plan
+# Photobooth2 App QA Plan
 
-Use this guide to validate the robustness of the Photobooth app, specifically focusing on connection stability and recovery.
+Use this guide to validate the robustness of the Photobooth2 app, specifically focusing on connection stability and recovery.
 
 ## 1. Connection Robustness
 

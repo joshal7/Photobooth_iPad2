@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct PhotoboothApp: App {
+struct Photobooth2App: App {
     @StateObject private var stateMachine = StateMachine()
     @Environment(\.scenePhase) var scenePhase
     

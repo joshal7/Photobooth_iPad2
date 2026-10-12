@@ -1,15 +1,13 @@
-# Photobooth App Walkthrough
+# Photobooth2 App Walkthrough
 
 ## Overview
-The iPad Photobooth app has been implemented as a Swift Package. It includes a `MockCameraClient` to allow testing without physical hardware.
+The iPad Photobooth2 app has been implemented as an iOS application and Swift Package. It includes a `MockCameraClient` to allow testing without physical hardware.
 
 ## Verification Steps
 
 ### 1. Open in Xcode
-1.  Open the `PhotoboothApp` folder in Xcode.
-2.  Xcode should recognize it as a Swift Package.
-3.  To run it, you may need to create a dummy iOS App target and import this package, or use Swift Playgrounds.
-    *Alternatively, since I provided the source files, you can drag the `Sources` folder into a new iOS App project.*
+1.  Open `Photobooth2/Photobooth2.xcodeproj` in Xcode.
+2.  Select the `Photobooth2` scheme and target device/simulator.
 
 ### 2. Mock Mode Verification
 The app is currently configured to use `MockCameraClient` by default (controlled by `StateMachine.useMockCamera`).
@@ -29,11 +27,12 @@ You can modify default settings in `ConfigManager.swift`:
 - `photoCount`
 
 ### 4. Real Hardware
-To test with a real Sony A7R II:
-1.  Connect iPad to Camera Wi-Fi.
+To test with real camera hardware:
+1.  Connect iPad to Camera Wi-Fi / network.
 2.  Change `StateMachine.useMockCamera` to `false`.
 3.  Run the app.
 
 ## Artifacts
-- **Source Code**: `PhotoboothApp/Sources`
-- **Package Definition**: `PhotoboothApp/Package.swift`
+- **Xcode Project**: `Photobooth2/Photobooth2.xcodeproj`
+- **Source Code**: `Photobooth2/Photobooth2/Sources`
+- **Package Definition**: `Package.swift`

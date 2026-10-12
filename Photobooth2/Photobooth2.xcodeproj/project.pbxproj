@@ -7,26 +7,26 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		158C3BA22ECEE55D00D49C74 /* Photobooth.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Photobooth.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		158C3BA22ECEE55D00D49C74 /* Photobooth2.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Photobooth2.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		158C3BD42ED0384000D49C74 /* Exceptions for "Photobooth" folder in "Photobooth" target */ = {
+		158C3BD42ED0384000D49C74 /* Exceptions for "Photobooth2" folder in "Photobooth2" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
-			target = 158C3BA12ECEE55D00D49C74 /* Photobooth */;
+			target = 158C3BA12ECEE55D00D49C74 /* Photobooth2 */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		158C3BA42ECEE55D00D49C74 /* Photobooth */ = {
+		158C3BA42ECEE55D00D49C74 /* Photobooth2 */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				158C3BD42ED0384000D49C74 /* Exceptions for "Photobooth" folder in "Photobooth" target */,
+				158C3BD42ED0384000D49C74 /* Exceptions for "Photobooth2" folder in "Photobooth2" target */,
 			);
-			path = Photobooth;
+			path = Photobooth2;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -45,7 +45,7 @@
 		158C3B992ECEE55D00D49C74 = {
 			isa = PBXGroup;
 			children = (
-				158C3BA42ECEE55D00D49C74 /* Photobooth */,
+				158C3BA42ECEE55D00D49C74 /* Photobooth2 */,
 				158C3BA32ECEE55D00D49C74 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -53,7 +53,7 @@
 		158C3BA32ECEE55D00D49C74 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				158C3BA22ECEE55D00D49C74 /* Photobooth.app */,
+				158C3BA22ECEE55D00D49C74 /* Photobooth2.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -61,9 +61,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		158C3BA12ECEE55D00D49C74 /* Photobooth */ = {
+		158C3BA12ECEE55D00D49C74 /* Photobooth2 */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 158C3BAD2ECEE55D00D49C74 /* Build configuration list for PBXNativeTarget "Photobooth" */;
+			buildConfigurationList = 158C3BAD2ECEE55D00D49C74 /* Build configuration list for PBXNativeTarget "Photobooth2" */;
 			buildPhases = (
 				158C3B9E2ECEE55D00D49C74 /* Sources */,
 				158C3B9F2ECEE55D00D49C74 /* Frameworks */,
@@ -74,13 +74,13 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				158C3BA42ECEE55D00D49C74 /* Photobooth */,
+				158C3BA42ECEE55D00D49C74 /* Photobooth2 */,
 			);
-			name = Photobooth;
+			name = Photobooth2;
 			packageProductDependencies = (
 			);
-			productName = Photobooth;
-			productReference = 158C3BA22ECEE55D00D49C74 /* Photobooth.app */;
+			productName = Photobooth2;
+			productReference = 158C3BA22ECEE55D00D49C74 /* Photobooth2.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -98,7 +98,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 158C3B9D2ECEE55D00D49C74 /* Build configuration list for PBXProject "Photobooth" */;
+			buildConfigurationList = 158C3B9D2ECEE55D00D49C74 /* Build configuration list for PBXProject "Photobooth2" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -112,7 +112,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				158C3BA12ECEE55D00D49C74 /* Photobooth */,
+				158C3BA12ECEE55D00D49C74 /* Photobooth2 */,
 			);
 		};
 /* End PBXProject section */
@@ -272,7 +272,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = Photobooth/Info.plist;
+				INFOPLIST_FILE = Photobooth2/Info.plist;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -288,7 +288,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = joshal.com.Photobooth;
+				PRODUCT_BUNDLE_IDENTIFIER = joshal.com.Photobooth2;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
@@ -318,7 +318,7 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = Photobooth/Info.plist;
+				INFOPLIST_FILE = Photobooth2/Info.plist;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -334,7 +334,7 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = joshal.com.Photobooth;
+				PRODUCT_BUNDLE_IDENTIFIER = joshal.com.Photobooth2;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = auto;
@@ -353,7 +353,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		158C3B9D2ECEE55D00D49C74 /* Build configuration list for PBXProject "Photobooth" */ = {
+		158C3B9D2ECEE55D00D49C74 /* Build configuration list for PBXProject "Photobooth2" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				158C3BAB2ECEE55D00D49C74 /* Debug */,
@@ -362,7 +362,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		158C3BAD2ECEE55D00D49C74 /* Build configuration list for PBXNativeTarget "Photobooth" */ = {
+		158C3BAD2ECEE55D00D49C74 /* Build configuration list for PBXNativeTarget "Photobooth2" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				158C3BAE2ECEE55D00D49C74 /* Debug */,
