@@ -111,35 +111,49 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     }
     
     private var isOpeningOrHandshaking: Bool = false
+    private var isAuthorizingBrowser: Bool = false
+    private var controlAuthSummary: String = "pending"
+    private var contentsAuthSummary: String = "pending"
     
-    private func setupDeviceBrowser() {
+    private func setupDeviceBrowser(forceRestart: Bool = false) {
+        if forceRestart, let existing = self.deviceBrowser {
+            existing.delegate = nil
+            existing.stop()
+            self.deviceBrowser = nil
+        }
+        
+        guard self.deviceBrowser == nil, !isAuthorizingBrowser else { return }
+        isAuthorizingBrowser = true
+        
         let browser = ICDeviceBrowser()
         browser.delegate = self
-        let maskRaw = ICDeviceTypeMask.camera.rawValue | ICDeviceLocationTypeMask.local.rawValue
-        if let mask = ICDeviceTypeMask(rawValue: maskRaw) {
-            browser.browsedDeviceTypeMask = mask
-        } else {
-            browser.browsedDeviceTypeMask = .camera
-        }
         self.deviceBrowser = browser
-        self.statusMessage = "Waiting for USB camera authorization..."
+        self.statusMessage = "Requesting iPadOS USB camera permissions..."
         
         #if os(iOS)
         browser.requestControlAuthorization { [weak self] controlStatus in
             browser.requestContentsAuthorization { [weak self] contentsStatus in
                 Task { @MainActor [weak self] in
                     guard let self = self else { return }
+                    self.isAuthorizingBrowser = false
+                    self.controlAuthSummary = controlStatus.rawValue
+                    self.contentsAuthSummary = contentsStatus.rawValue
+                    
                     if controlStatus == .denied || contentsStatus == .denied {
-                        self.statusMessage = CameraError.usbPermissionDenied.localizedDescription
+                        self.statusMessage = "\(CameraError.usbPermissionDenied.localizedDescription) (Control: \(controlStatus.rawValue), Contents: \(contentsStatus.rawValue))"
                     } else {
-                        self.statusMessage = "Scanning USB bus for camera (0 devices detected)..."
+                        self.statusMessage = "Scanning USB bus (Auth: OK)..."
                     }
+                    
+                    // Restart browser cleanly after permissions are granted
+                    self.deviceBrowser?.stop()
                     self.deviceBrowser?.start()
                     self.checkAlreadyDiscoveredDevices()
                 }
             }
         }
         #else
+        isAuthorizingBrowser = false
         self.statusMessage = "Scanning USB bus for camera..."
         browser.start()
         #endif
@@ -147,9 +161,9 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     
     @MainActor
     private func checkAlreadyDiscoveredDevices() {
-        guard cameraDevice == nil, let devices = deviceBrowser?.devices, !devices.isEmpty else { return }
+        guard cameraDevice == nil, let browser = deviceBrowser, let devices = browser.devices, !devices.isEmpty else { return }
         for dev in devices {
-            deviceBrowser(deviceBrowser!, didAdd: dev, moreComing: false)
+            deviceBrowser(browser, didAdd: dev, moreComing: false)
         }
     }
     
@@ -168,18 +182,28 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         }
         
         await MainActor.run {
-            if self.deviceBrowser == nil {
-                self.setupDeviceBrowser()
+            if self.cameraDevice == nil {
+                // Force a fresh ICDeviceBrowser scan when retrying with no device found
+                self.setupDeviceBrowser(forceRestart: self.deviceBrowser != nil && !self.isAuthorizingBrowser)
             } else {
-                self.deviceBrowser?.start()
                 self.checkAlreadyDiscoveredDevices()
             }
+        }
+        
+        // Wait while authorization prompt is active
+        for _ in 0..<40 {
+            let authorizing = await MainActor.run { self.isAuthorizingBrowser }
+            if !authorizing { break }
+            try await Task.sleep(nanoseconds: 250_000_000)
         }
         
         // Wait up to 4.0s if USB enumeration or handshake is in progress
         for _ in 0..<16 {
             if isConnected, ptpTransport != nil {
                 return
+            }
+            await MainActor.run {
+                self.checkAlreadyDiscoveredDevices()
             }
             if cameraDevice != nil, !isOpeningOrHandshaking, !isConnected {
                 break
@@ -196,7 +220,8 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 throw CameraError.usbMassStorageModeDetected
             }
             let count = deviceBrowser?.devices?.count ?? 0
-            self.statusMessage = "No USB camera detected by iPadOS (USB devices seen: \(count)). Check camera power, PC Remote mode, and USB data cable."
+            let browsing = deviceBrowser?.isBrowsing ?? false
+            self.statusMessage = "No USB camera detected by iPadOS (devices: \(count), browsing: \(browsing), auth: \(controlAuthSummary)/\(contentsAuthSummary)). Try plugging camera directly into iPad without hub to test cable/port."
             throw CameraError.connectionFailed
         }
         
