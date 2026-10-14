@@ -9,12 +9,9 @@ struct SettingsView: View {
         NavigationView {
             Form {
                 Section(header: Text("Camera Configuration")) {
-                    Picker("Camera Source", selection: Binding(
-                        get: { config.useLocalCamera ? 0 : 1 },
-                        set: { config.useLocalCamera = ($0 == 0) }
-                    )) {
-                        Text("iPad Camera").tag(0)
-                        Text("External Camera").tag(1)
+                    Picker("Camera Source", selection: $config.useLocalCamera) {
+                        Text("iPad Camera").tag(true)
+                        Text("External Camera").tag(false)
                     }
                     .pickerStyle(SegmentedPickerStyle())
                     
@@ -28,6 +25,23 @@ struct SettingsView: View {
                                     .frame(width: 10, height: 10)
                                 Text(stateMachine.isCameraConnected ? "Connected (Sony USB PTP)" : "Disconnected")
                                     .foregroundColor(stateMachine.isCameraConnected ? .primary : .secondary)
+                            }
+                        }
+                        
+                        if let statusMsg = stateMachine.cameraStatusMessage, !statusMsg.isEmpty {
+                            Text(statusMsg)
+                                .font(.caption)
+                                .foregroundColor(stateMachine.isCameraConnected ? .green : .orange)
+                        }
+                        
+                        if !stateMachine.isCameraConnected {
+                            Button(action: {
+                                stateMachine.retryConnection()
+                            }) {
+                                HStack {
+                                    Image(systemName: "arrow.clockwise")
+                                    Text("Retry USB Connection")
+                                }
                             }
                         }
                     }

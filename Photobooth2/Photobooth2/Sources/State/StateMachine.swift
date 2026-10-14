@@ -60,6 +60,7 @@ class StateMachine: ObservableObject {
     private func setupBindings() {
         config.$useLocalCamera
             .dropFirst()
+            .removeDuplicates()
             .sink { [weak self] useLocal in
                 Task { @MainActor [weak self] in
                     self?.switchCameraService(useLocal: useLocal)
@@ -77,6 +78,13 @@ class StateMachine: ObservableObject {
             .receive(on: DispatchQueue.main)
             .assign(to: \.previewImage, on: self)
             .store(in: &serviceCancellables)
+        
+        if let sonyClient = cameraService as? SonyUSBCameraClient {
+            sonyClient.$statusMessage
+                .receive(on: DispatchQueue.main)
+                .assign(to: \.cameraStatusMessage, on: self)
+                .store(in: &serviceCancellables)
+        }
         
         cameraService.connectionStatus
             .receive(on: DispatchQueue.main)
@@ -225,7 +233,8 @@ class StateMachine: ObservableObject {
         } catch {
             self.isCameraConnected = cameraService.isConnected
             self.cameraStatusMessage = cameraService.statusMessage
-            transition(to: .error(message: error.localizedDescription))
+            let detailedMessage = cameraService.statusMessage ?? error.localizedDescription
+            transition(to: .error(message: detailedMessage))
         }
     }
     

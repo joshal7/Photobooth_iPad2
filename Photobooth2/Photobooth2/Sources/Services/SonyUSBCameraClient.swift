@@ -110,6 +110,8 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         keepAliveTask?.cancel()
     }
     
+    private var isOpeningOrHandshaking: Bool = false
+    
     private func setupDeviceBrowser() {
         let browser = ICDeviceBrowser()
         browser.delegate = self
@@ -120,6 +122,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             browser.browsedDeviceTypeMask = .camera
         }
         self.deviceBrowser = browser
+        self.statusMessage = "Waiting for USB camera authorization..."
         
         #if os(iOS)
         browser.requestControlAuthorization { [weak self] controlStatus in
@@ -128,14 +131,26 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                     guard let self = self else { return }
                     if controlStatus == .denied || contentsStatus == .denied {
                         self.statusMessage = CameraError.usbPermissionDenied.localizedDescription
+                    } else {
+                        self.statusMessage = "Scanning USB bus for camera (0 devices detected)..."
                     }
                     self.deviceBrowser?.start()
+                    self.checkAlreadyDiscoveredDevices()
                 }
             }
         }
         #else
+        self.statusMessage = "Scanning USB bus for camera..."
         browser.start()
         #endif
+    }
+    
+    @MainActor
+    private func checkAlreadyDiscoveredDevices() {
+        guard cameraDevice == nil, let devices = deviceBrowser?.devices, !devices.isEmpty else { return }
+        for dev in devices {
+            deviceBrowser(deviceBrowser!, didAdd: dev, moreComing: false)
+        }
     }
     
     func connect() async throws {
@@ -152,41 +167,85 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             return
         }
         
-        // Wait up to 2.5s if USB enumeration is in progress
-        if cameraDevice == nil {
-            for _ in 0..<10 {
-                if cameraDevice != nil { break }
-                try await Task.sleep(nanoseconds: 250_000_000)
+        await MainActor.run {
+            if self.deviceBrowser == nil {
+                self.setupDeviceBrowser()
+            } else {
+                self.deviceBrowser?.start()
+                self.checkAlreadyDiscoveredDevices()
             }
+        }
+        
+        // Wait up to 4.0s if USB enumeration or handshake is in progress
+        for _ in 0..<16 {
+            if isConnected, ptpTransport != nil {
+                return
+            }
+            if cameraDevice != nil, !isOpeningOrHandshaking, !isConnected {
+                break
+            }
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        
+        if isConnected, ptpTransport != nil {
+            return
         }
         
         guard let device = cameraDevice else {
             if let msg = statusMessage, msg.contains("Mass Storage") {
                 throw CameraError.usbMassStorageModeDetected
             }
+            let count = deviceBrowser?.devices?.count ?? 0
+            self.statusMessage = "No USB camera detected by iPadOS (USB devices seen: \(count)). Check camera power, PC Remote mode, and USB data cable."
             throw CameraError.connectionFailed
         }
         
+        // If didAdd / didOpenSessionWithError is already opening the session and running the handshake, wait for it
+        if isOpeningOrHandshaking {
+            for _ in 0..<20 {
+                if isConnected || !isOpeningOrHandshaking { break }
+                try await Task.sleep(nanoseconds: 200_000_000)
+            }
+            if isConnected { return }
+        }
+        
+        isOpeningOrHandshaking = true
+        defer { isOpeningOrHandshaking = false }
+        
         if !device.hasOpenSession {
+            self.statusMessage = "Opening USB session with \(device.name ?? "Camera")..."
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 self.sessionOpenContinuation = continuation
                 device.requestOpenSession()
             }
         }
         
+        if isConnected, ptpTransport != nil {
+            return
+        }
+        
         let transport = ICCameraPTPTransport(device: device)
         self.ptpTransport = transport
+        self.statusMessage = "Running Sony PTP handshake with \(device.name ?? "Camera")..."
         try await performSonySDIOHandshake(using: transport)
         self.isConnected = true
-        self.statusMessage = nil
+        self.statusMessage = "Connected to \(device.name ?? "Sony Camera")"
         startKeepAliveLoop()
     }
     
     // MARK: - Sony 3-Phase SDIO Handshake
     
     private func performSonySDIOHandshake(using transport: PTPTransport) async throws {
-        // Phase 1: SDIO_Connect(1, 0, 0)
-        let (_, rc1) = try await commandQueue.execute(on: transport, opcode: .sdioConnect, params: [1, 0, 0])
+        // Phase 1: SDIO_Connect(1, 0, 0) (with retry if camera is busy initializing USB)
+        var rc1: UInt16 = 0
+        for attempt in 0..<3 {
+            let (_, code) = try await commandQueue.execute(on: transport, opcode: .sdioConnect, params: [1, 0, 0])
+            rc1 = code
+            if rc1 == SonyPTPResponseCode.ok.rawValue { break }
+            if attempt < 2 {
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            }
+        }
         guard rc1 == SonyPTPResponseCode.ok.rawValue else {
             throw CameraError.ptpHandshakeFailed("SDIO Phase 1 returned 0x\(String(rc1, radix: 16))")
         }
@@ -197,12 +256,26 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             throw CameraError.ptpHandshakeFailed("SDIO Phase 2 returned 0x\(String(rc2, radix: 16))")
         }
         
-        // Query Extended Device Info (Protocol 3.00 = 0x012C)
-        _ = try await commandQueue.execute(
+        // Query Extended Device Info (Protocol 3.00 = 0x012C, fallback to 1-arg or Protocol 2.00 = 0x00C8)
+        let (_, rcExt) = try await commandQueue.execute(
             on: transport,
             opcode: .sdioGetExtDeviceInfo,
             params: [Self.sonyProtocolVersion3, 1]
         )
+        if rcExt != SonyPTPResponseCode.ok.rawValue {
+            let (_, rcExt1Arg) = try await commandQueue.execute(
+                on: transport,
+                opcode: .sdioGetExtDeviceInfo,
+                params: [Self.sonyProtocolVersion3]
+            )
+            if rcExt1Arg != SonyPTPResponseCode.ok.rawValue {
+                _ = try? await commandQueue.execute(
+                    on: transport,
+                    opcode: .sdioGetExtDeviceInfo,
+                    params: [0x00C8]
+                )
+            }
+        }
         
         // Phase 3: SDIO_Connect(3, 0, 0)
         let (_, rc3) = try await commandQueue.execute(on: transport, opcode: .sdioConnect, params: [3, 0, 0])
@@ -476,11 +549,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     // MARK: - ICDeviceBrowserDelegate (Hot-Plug & App Background/Foreground Suspension)
     
     func deviceBrowser(_ browser: ICDeviceBrowser, didAdd device: ICDevice, moreComing: Bool) {
-        let isSony = (device.usbVendorID == Self.sonyUSBVendorID)
-            || (device.name?.localizedCaseInsensitiveContains("Sony") == true)
-            || (device.name?.localizedCaseInsensitiveContains("ILCE") == true)
-        
-        guard isSony else { return }
+        let devName = device.name ?? "Unknown USB Device"
         
         if device.transportType == ICDeviceTransport.transportTypeMassStorage.rawValue {
             self.statusMessage = CameraError.usbMassStorageModeDetected.localizedDescription
@@ -488,10 +557,19 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             return
         }
         
-        guard let camera = device as? ICCameraDevice else { return }
+        guard let camera = device as? ICCameraDevice else {
+            self.statusMessage = "Detected non-PTP USB device: \(devName)"
+            return
+        }
+        
         self.cameraDevice = camera
         camera.delegate = self
-        camera.requestOpenSession()
+        
+        if !camera.hasOpenSession && !isOpeningOrHandshaking {
+            isOpeningOrHandshaking = true
+            self.statusMessage = "Found \(devName) — opening USB PTP session..."
+            camera.requestOpenSession()
+        }
     }
     
     func deviceBrowser(_ browser: ICDeviceBrowser, didRemove device: ICDevice, moreGoing: Bool) {
@@ -533,24 +611,36 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     
     func device(_ device: ICDevice, didOpenSessionWithError error: (any Error)?) {
         if let error = error {
+            isOpeningOrHandshaking = false
+            self.statusMessage = "USB Session Error: \(error.localizedDescription)"
             sessionOpenContinuation?.resume(throwing: error)
             sessionOpenContinuation = nil
             return
         }
-        sessionOpenContinuation?.resume(returning: ())
-        sessionOpenContinuation = nil
         
+        // If `connect()` is waiting on `sessionOpenContinuation`, let `connect()` perform the single handshake.
+        if let continuation = sessionOpenContinuation {
+            sessionOpenContinuation = nil
+            continuation.resume(returning: ())
+            return
+        }
+        
+        // Otherwise (hot-plug via `deviceBrowser(_:didAdd:)`), perform the single handshake here.
         Task { @MainActor in
-            guard let camera = device as? ICCameraDevice else { return }
+            defer { self.isOpeningOrHandshaking = false }
+            guard !self.isConnected, let camera = device as? ICCameraDevice else { return }
+            let devName = camera.name ?? "Sony Camera"
             let transport = ICCameraPTPTransport(device: camera)
             self.ptpTransport = transport
+            self.statusMessage = "Session open with \(devName) — running Sony PTP handshake..."
             do {
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms USB pipe settle
                 try await self.performSonySDIOHandshake(using: transport)
-                self.statusMessage = nil
+                self.statusMessage = "Connected to \(devName)"
                 self.isConnected = true
                 self.startKeepAliveLoop()
             } catch {
-                self.statusMessage = error.localizedDescription
+                self.statusMessage = "PTP Handshake Error: \(error.localizedDescription)"
                 self.isConnected = false
             }
         }
@@ -566,9 +656,11 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         stopLiveView()
         keepAliveTask?.cancel()
         keepAliveTask = nil
+        isOpeningOrHandshaking = false
         ptpTransport = nil
         cameraDevice = nil
         isConnected = false
+        statusMessage = "USB camera disconnected."
     }
     
     // Required ICCameraDeviceDelegate conformance
