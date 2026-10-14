@@ -308,8 +308,8 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             throw CameraError.ptpHandshakeFailed("SDIO Phase 3 returned 0x\(String(rc3, radix: 16))")
         }
         
-        // 1. Set Priority Mode to PC Application (0xD25A = 1)
-        try? await setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
+        // 1. Set Priority Mode to Camera Priority (0xD25A = 0) so physical camera dials (shutter speed, aperture, ISO) remain fully controllable
+        try? await setDevicePropertyUInt8(.priorityMode, value: 0, using: transport)
         
         // 2. Set default PC+Camera save destination (0xD222 = 0x0011) FIRST so 0xD269 and 0xD268 are unlocked,
         //    then enforce 2M JPEG transfer format (0xD269 = 2 JPEG Only, 0xD268 = 2 2M).
