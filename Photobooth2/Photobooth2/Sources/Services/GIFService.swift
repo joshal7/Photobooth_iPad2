@@ -2,6 +2,7 @@ import Foundation
 import ImageIO
 import MobileCoreServices
 import UniformTypeIdentifiers
+import CoreImage
 
 final class GIFService: Sendable {
     
@@ -83,6 +84,8 @@ final class GIFService: Sendable {
             kCGImageSourceThumbnailMaxPixelSize: computedMaxPixelSize as NSNumber
         ]
         
+        let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+        
         for path in imagePaths {
             let url = resolveFileURL(path)
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
@@ -91,7 +94,8 @@ final class GIFService: Sendable {
             }
             
             if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
-                CGImageDestinationAddImage(destination, cgImage, frameProperties as CFDictionary)
+                let exposedCGImage = SonyUSBCameraClient.autoExposeCapturedCGImage(cgImage, ciContext: ciContext)
+                CGImageDestinationAddImage(destination, exposedCGImage, frameProperties as CFDictionary)
             }
         }
         

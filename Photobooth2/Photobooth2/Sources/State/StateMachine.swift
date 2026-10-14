@@ -544,7 +544,7 @@ class StateMachine: ObservableObject {
             do {
                 let data = try await cameraService.fetchImage(url: images[i])
                 if let image = UIImage(data: data) {
-                    self.currentReviewImage = image
+                    self.currentReviewImage = SonyUSBCameraClient.autoExposeCapturedUIImage(image)
                     self.state = .review(images: images, index: i)
                     try? await Task.sleep(nanoseconds: UInt64(config.previewDurationSec) * 1_000_000_000)
                 } else {

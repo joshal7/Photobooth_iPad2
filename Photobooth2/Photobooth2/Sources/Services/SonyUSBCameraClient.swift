@@ -540,9 +540,11 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             await drainStaleRAMObjectIfNeeded(using: transport)
             
             // 2. Trigger shutter with S1 settle + S2 hold until capture starts (0xD215 > 0)
+            //    120ms S1 half-press settle allows the Sony sensor's Auto-ISO / AE meter to converge
+            //    when transitioning from Setting Effect OFF Live View to actual exposure.
             var observedObjState = try await triggerShutterAndConfirmStart(
                 using: transport,
-                s1SettleNs: 50_000_000,   // 50ms S1 half-press settle (allows AE lock in Aperture Priority)
+                s1SettleNs: 120_000_000,  // 120ms S1 half-press settle for Auto-ISO / AE convergence
                 s2MinHoldNs: 70_000_000,  // 70ms minimum S2 hold
                 s2MaxHoldSec: 0.35        // Up to 350ms S2 hold if camera is stopping down aperture / metering
             )
@@ -579,7 +581,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                     didRetriggerShutter = true
                     observedObjState = try await triggerShutterAndConfirmStart(
                         using: transport,
-                        s1SettleNs: 90_000_000,
+                        s1SettleNs: 120_000_000,
                         s2MinHoldNs: 130_000_000,
                         s2MaxHoldSec: 0.55
                     )
@@ -603,7 +605,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     
     /// Re-encodes the downloaded 2MP Sony transfer payload as a clean, standard iOS JFIF JPEG
     /// (stripping Sony MPF multi-stream trailers that stall iOS `sharingd` / AirDrop preview generation)
-    /// and gently brightens dark non-flash test captures when shadow data is present.
+    /// and automatically exposes dark or dim captures for Photo Review, AirDrop, and GIF creation.
     nonisolated private static func normalizeAndAutoExposeCapturedJPEG(_ rawData: Data) -> Data {
         return autoreleasepool {
             let extracted = SonyPTPPacket.extractCapturedJPEG(from: rawData) ?? rawData
@@ -611,16 +613,34 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 return extracted
             }
             let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
-            let (processedImage, _) = adjustImageExposureIfNeeded(
-                uiImage,
-                ciContext: ciContext,
-                minRecoverableLuminance: 0.012,
-                targetLuminance: 0.36,
-                triggerThreshold: 0.22,
-                maxEVBoost: 3.2
-            )
+            let processedImage = autoExposeCapturedUIImage(uiImage, ciContext: ciContext)
             return processedImage.jpegData(compressionQuality: 0.92) ?? extracted
         }
+    }
+    
+    /// Auto-exposes a captured `UIImage` (used for Photo Review, AirDrop, and GIF frames) using
+    /// highlight-rejected center-weighted linear metering and a closed-loop verification pass.
+    nonisolated static func autoExposeCapturedUIImage(_ image: UIImage, ciContext: CIContext? = nil) -> UIImage {
+        guard let cgImage = image.cgImage else { return image }
+        let ctx = ciContext ?? CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+        let boostedCG = autoExposeCapturedCGImage(cgImage, ciContext: ctx)
+        return UIImage(cgImage: boostedCG, scale: image.scale, orientation: image.imageOrientation)
+    }
+    
+    /// Auto-exposes a captured `CGImage` (also called directly by `GIFService.createGIF`) so that both
+    /// very dark manual captures (e.g. ISO 200 with small lights) and slightly dim Auto-ISO captures
+    /// are brought up to a clean, bright target exposure (`~0.50` sRGB midtone brightness).
+    nonisolated static func autoExposeCapturedCGImage(_ cgImage: CGImage, ciContext: CIContext) -> CGImage {
+        let (pass1CG, _) = adjustCGImageExposureIfNeeded(
+            cgImage,
+            ciContext: ciContext,
+            minRecoverableSrgbLuma: 0.0,   // Never bail out on dark captured photos/GIFs
+            targetSrgbLuma: 0.50,          // Bright, well-lit portrait target
+            triggerThresholdSrgb: 0.44,    // Boost any capture dimmer than 0.44 sRGB (fixes dim Auto-ISO shots too)
+            maxLinearEVBoost: 9.0,         // Up to +9 EV in linear light (~512x linear gain for dark ISO 200 captures)
+            allowClosedLoopSecondPass: true
+        )
+        return pass1CG
     }
     
     // MARK: - Paced 30 FPS PTP Live View (0xFFFFC002) & Sleep Prevention
@@ -669,7 +689,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                         // the camera reloads Memory Recall 1 which resets Live View Setting Effect (0xD231) to ON (1),
                         // causing the camera to send dark Live View frames. Immediately re-assert Setting Effect OFF (2)!
                         let nowNs = DispatchTime.now().uptimeNanoseconds
-                        if meanLuma < 0.14, nowNs - lastSettingEffectEnforceTime > 2_000_000_000 {
+                        if meanLuma < 0.16, nowNs - lastSettingEffectEnforceTime > 2_000_000_000 {
                             lastSettingEffectEnforceTime = nowNs
                             try? await self.setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
                             try? await self.setDevicePropertyUInt8(.liveViewSettingEffect, value: 2, using: transport)
@@ -691,30 +711,29 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     /// Ensures the iPad Live View preview remains bright and clearly visible for framing
     /// without amplifying 8-bit quantization noise into black-and-white blocks while 0xD231 switches.
     nonisolated private static func autoExposeLiveViewIfNeeded(_ image: UIImage, ciContext: CIContext) -> (UIImage, Double) {
-        return adjustImageExposureIfNeeded(
-            image,
+        guard let cgImage = image.cgImage else { return (image, 0.5) }
+        let (boostedCG, subjectSrgbLuma) = adjustCGImageExposureIfNeeded(
+            cgImage,
             ciContext: ciContext,
-            minRecoverableLuminance: 0.025,
-            targetLuminance: 0.38,
-            triggerThreshold: 0.25,
-            maxEVBoost: 1.8
+            minRecoverableSrgbLuma: 0.025, // Avoid quantizing pitch-black frames during the 100ms while 0xD231 switches to 2
+            targetSrgbLuma: 0.48,
+            triggerThresholdSrgb: 0.40,
+            maxLinearEVBoost: 3.5,
+            allowClosedLoopSecondPass: false
         )
+        if boostedCG === cgImage {
+            return (image, subjectSrgbLuma)
+        }
+        return (UIImage(cgImage: boostedCG, scale: image.scale, orientation: image.imageOrientation), subjectSrgbLuma)
     }
     
-    nonisolated private static func adjustImageExposureIfNeeded(
-        _ image: UIImage,
-        ciContext: CIContext,
-        minRecoverableLuminance: Double,
-        targetLuminance: Double,
-        triggerThreshold: Double,
-        maxEVBoost: Double
-    ) -> (UIImage, Double) {
-        guard let cgImage = image.cgImage else { return (image, 0.5) }
-        
-        // Fast 16x16 downsample to measure average scene luminance in <0.1ms
-        let sampleSize = 16
+    /// Measures highlight-rejected, center-weighted scene luminance in both sRGB (`0..1`) and
+    /// true IEC 61966-2-1 linear light (`0..1`). Discards the brightest 20% of pixels so small
+    /// specular lights or lamps in a dark room never trick the meter into under-boosting.
+    nonisolated private static func measureSubjectLuminance(_ cgImage: CGImage) -> (srgbY: Double, linearY: Double) {
+        let sampleSize = 24
         var pixels = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(
             data: &pixels,
             width: sampleSize,
@@ -724,50 +743,153 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
-            return (image, 0.5)
+            return (0.5, 0.214)
         }
         ctx.interpolationQuality = .low
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
         
-        var totalLuma: Double = 0
-        let count = sampleSize * sampleSize
-        for i in 0..<count {
-            let offset = i * 4
-            let r = Double(pixels[offset])
-            let g = Double(pixels[offset + 1])
-            let b = Double(pixels[offset + 2])
-            totalLuma += (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
-        }
-        let meanLuminance = totalLuma / Double(count)
-        
-        // Do not boost well-exposed frames (>= triggerThreshold) or crushed 8-bit black frames (< minRecoverableLuminance)
-        // where boosting 0/1 quantization steps would create posterized black-and-white blocks.
-        guard meanLuminance < triggerThreshold, meanLuminance >= minRecoverableLuminance else {
-            return (image, meanLuminance)
+        @inline(__always)
+        func srgbToLinear(_ c: Double) -> Double {
+            return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4)
         }
         
-        let evBoost = min(max(log2(targetLuminance / meanLuminance), 0.35), maxEVBoost)
+        struct Sample {
+            let srgbY: Double
+            let linearY: Double
+            let weight: Double
+        }
         
-        let ciInput = CIImage(cgImage: cgImage)
-        guard let exposureFilter = CIFilter(name: "CIExposureAdjust") else { return (image, meanLuminance) }
-        exposureFilter.setValue(ciInput, forKey: kCIInputImageKey)
-        exposureFilter.setValue(evBoost, forKey: kCIInputEVKey)
+        var samples: [Sample] = []
+        samples.reserveCapacity(sampleSize * sampleSize)
         
-        var outputCI = exposureFilter.outputImage ?? ciInput
-        
-        if evBoost > 1.0, let gammaFilter = CIFilter(name: "CIGammaAdjust") {
-            let gammaPower = max(0.72, 1.0 - (evBoost - 1.0) * 0.10)
-            gammaFilter.setValue(outputCI, forKey: kCIInputImageKey)
-            gammaFilter.setValue(gammaPower, forKey: "inputPower")
-            if let gammaOut = gammaFilter.outputImage {
-                outputCI = gammaOut
+        for y in 0..<sampleSize {
+            let isCenterY = (y >= sampleSize / 4) && (y < (sampleSize * 3) / 4)
+            for x in 0..<sampleSize {
+                let isCenterX = (x >= sampleSize / 4) && (x < (sampleSize * 3) / 4)
+                let offset = (y * sampleSize + x) * 4
+                let r = Double(pixels[offset]) / 255.0
+                let g = Double(pixels[offset + 1]) / 255.0
+                let b = Double(pixels[offset + 2]) / 255.0
+                
+                let srgbY = 0.2126 * r + 0.7152 * g + 0.0722 * b
+                let linY = 0.2126 * srgbToLinear(r) + 0.7152 * srgbToLinear(g) + 0.0722 * srgbToLinear(b)
+                let weight = (isCenterX && isCenterY) ? 2.5 : 1.0
+                samples.append(Sample(srgbY: srgbY, linearY: linY, weight: weight))
             }
         }
         
-        guard let boostedCG = ciContext.createCGImage(outputCI, from: ciInput.extent) else {
-            return (image, meanLuminance)
+        // Sort ascending by brightness and discard the brightest 20% of pixels
+        // so small bright lights / lamps in the background don't skew the subject exposure meter.
+        samples.sort { $0.srgbY < $1.srgbY }
+        let keepCount = max(1, Int(Double(samples.count) * 0.80))
+        
+        var weightedSrgbSum = 0.0
+        var weightedLinearSum = 0.0
+        var totalWeight = 0.0
+        for i in 0..<keepCount {
+            let s = samples[i]
+            weightedSrgbSum += s.srgbY * s.weight
+            weightedLinearSum += s.linearY * s.weight
+            totalWeight += s.weight
         }
-        return (UIImage(cgImage: boostedCG, scale: image.scale, orientation: image.imageOrientation), meanLuminance)
+        
+        guard totalWeight > 0 else { return (0.5, 0.214) }
+        return (weightedSrgbSum / totalWeight, weightedLinearSum / totalWeight)
+    }
+    
+    nonisolated private static func adjustCGImageExposureIfNeeded(
+        _ cgImage: CGImage,
+        ciContext: CIContext,
+        minRecoverableSrgbLuma: Double,
+        targetSrgbLuma: Double,
+        triggerThresholdSrgb: Double,
+        maxLinearEVBoost: Double,
+        allowClosedLoopSecondPass: Bool
+    ) -> (CGImage, Double) {
+        let (subjectSrgbY, subjectLinearY) = measureSubjectLuminance(cgImage)
+        
+        guard subjectSrgbY < triggerThresholdSrgb, subjectSrgbY >= minRecoverableSrgbLuma else {
+            return (cgImage, subjectSrgbY)
+        }
+        
+        // Convert target sRGB luminance to true IEC 61966-2-1 linear luminance
+        // because CIExposureAdjust operates in linear light (output_linear = input_linear * 2^EV).
+        let targetLinearY = (targetSrgbLuma <= 0.04045)
+            ? (targetSrgbLuma / 12.92)
+            : pow((targetSrgbLuma + 0.055) / 1.055, 2.4)
+        
+        let safeLinearY = max(subjectLinearY, 0.00020)
+        let linearEV = min(max(log2(targetLinearY / safeLinearY), 0.25), maxLinearEVBoost)
+        
+        let ciInput = CIImage(cgImage: cgImage)
+        var currentCI = ciInput
+        
+        // 1. Lift shadows & protect small bright highlights first
+        if let shadowFilter = CIFilter(name: "CIHighlightShadowAdjust") {
+            let shadowLift = min(1.0, max(0.30, linearEV * 0.22))
+            shadowFilter.setValue(currentCI, forKey: kCIInputImageKey)
+            shadowFilter.setValue(shadowLift, forKey: "inputShadowAmount")
+            shadowFilter.setValue(0.80, forKey: "inputHighlightAmount")
+            if let out = shadowFilter.outputImage {
+                currentCI = out
+            }
+        }
+        
+        // 2. Apply true-linear EV boost
+        if let exposureFilter = CIFilter(name: "CIExposureAdjust") {
+            exposureFilter.setValue(currentCI, forKey: kCIInputImageKey)
+            exposureFilter.setValue(linearEV, forKey: kCIInputEVKey)
+            if let out = exposureFilter.outputImage {
+                currentCI = out
+            }
+        }
+        
+        // 3. Apply midtone gamma lift when boosting dark or dim images
+        if linearEV > 0.8, let gammaFilter = CIFilter(name: "CIGammaAdjust") {
+            let gammaPower = max(0.52, 0.92 - (linearEV - 0.8) * 0.055)
+            gammaFilter.setValue(currentCI, forKey: kCIInputImageKey)
+            gammaFilter.setValue(gammaPower, forKey: "inputPower")
+            if let out = gammaFilter.outputImage {
+                currentCI = out
+            }
+        }
+        
+        guard var outputCG = ciContext.createCGImage(currentCI, from: ciInput.extent) else {
+            return (cgImage, subjectSrgbY)
+        }
+        
+        // 4. Closed-loop second pass for captured Review/GIF frames:
+        //    If the image started almost pitch-black (e.g. ISO 200 without flash) and is still dimmer
+        //    than 0.42 sRGB after Pass 1, apply a second tone-mapped exposure + gamma lift so it reaches target brightness.
+        if allowClosedLoopSecondPass {
+            let (postSrgbY, postLinearY) = measureSubjectLuminance(outputCG)
+            if postSrgbY < 0.42 {
+                let safePostLinear = max(postLinearY, 0.0015)
+                let secondEV = min(max(log2(targetLinearY / safePostLinear), 0.35), 4.5)
+                var pass2CI = CIImage(cgImage: outputCG)
+                
+                if let exp2 = CIFilter(name: "CIExposureAdjust") {
+                    exp2.setValue(pass2CI, forKey: kCIInputImageKey)
+                    exp2.setValue(secondEV, forKey: kCIInputEVKey)
+                    if let out = exp2.outputImage {
+                        pass2CI = out
+                    }
+                }
+                if let gamma2 = CIFilter(name: "CIGammaAdjust") {
+                    let gPower = max(0.60, 0.90 - secondEV * 0.07)
+                    gamma2.setValue(pass2CI, forKey: kCIInputImageKey)
+                    gamma2.setValue(gPower, forKey: "inputPower")
+                    if let out = gamma2.outputImage {
+                        pass2CI = out
+                    }
+                }
+                if let pass2CG = ciContext.createCGImage(pass2CI, from: pass2CI.extent) {
+                    outputCG = pass2CG
+                }
+            }
+        }
+        
+        return (outputCG, subjectSrgbY)
     }
     
     func stopLiveView() {
