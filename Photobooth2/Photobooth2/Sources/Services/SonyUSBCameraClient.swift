@@ -311,31 +311,37 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         // 1. Set Priority Mode to PC Application (0xD25A = 1)
         try? await setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
         
-        // 2. Enforce 2M JPEG transfer format (0xD269 = 2 JPEG Only, 0xD268 = 2 2M) and default PC+Camera save destination (0xD222 = 0x0011)
+        // 2. Set default PC+Camera save destination (0xD222 = 0x0011) FIRST so 0xD269 and 0xD268 are unlocked,
+        //    then enforce 2M JPEG transfer format (0xD269 = 2 JPEG Only, 0xD268 = 2 2M).
+        try? await setDevicePropertyUInt16(.stillImageSaveDestination, value: SonySaveDestination.pcAndCamera.rawValue, using: transport)
         try? await setDevicePropertyUInt8(.pcSaveImageFormat, value: 2, using: transport)
         try? await setDevicePropertyUInt8(.pcSaveImageSize, value: SonyTransferImageSize.twoMegapixel.rawValue, using: transport)
-        try? await setDevicePropertyUInt16(.stillImageSaveDestination, value: SonySaveDestination.pcAndCamera.rawValue, using: transport)
         
-        // 3. Drain any leftover image in camera RAM (0xFFFFC001) from a prior interrupted session
+        // 3. Drain any leftover image(s) in camera RAM (0xFFFFC001) from a prior interrupted session
         await drainStaleRAMObjectIfNeeded(using: transport)
     }
     
     private func drainStaleRAMObjectIfNeeded(using transport: PTPTransport) async {
-        guard let (propData, _) = try? await commandQueue.execute(on: transport, opcode: .sdioGetAllExtDevicePropInfo),
-              let objectInMem = SonyPTPPacket.parseObjectInMemory(from: propData),
-              objectInMem >= 0x8000 else {
-            return
+        for _ in 0..<4 {
+            guard let (propData, _) = try? await commandQueue.execute(on: transport, opcode: .sdioGetAllExtDevicePropInfo),
+                  let objectInMem = SonyPTPPacket.parseObjectInMemory(from: propData),
+                  objectInMem >= 0x8000 else {
+                return
+            }
+            _ = try? await commandQueue.execute(
+                on: transport,
+                opcode: .getObjectInfo,
+                params: [SonyPTPHostHandle.capturedImageRAM.rawValue]
+            )
+            _ = try? await commandQueue.execute(
+                on: transport,
+                opcode: .getObject,
+                params: [SonyPTPHostHandle.capturedImageRAM.rawValue]
+            )
+            if objectInMem <= 0x8001 {
+                return
+            }
         }
-        _ = try? await commandQueue.execute(
-            on: transport,
-            opcode: .getObjectInfo,
-            params: [SonyPTPHostHandle.capturedImageRAM.rawValue]
-        )
-        _ = try? await commandQueue.execute(
-            on: transport,
-            opcode: .getObject,
-            params: [SonyPTPHostHandle.capturedImageRAM.rawValue]
-        )
     }
     
     // MARK: - Property & Control Helpers
@@ -385,11 +391,13 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             case .gif:
                 // GIF Mode: Route exclusively to iPad RAM (0x0001) so SD card is NEVER touched.
                 try await setDevicePropertyUInt16(.stillImageSaveDestination, value: SonySaveDestination.pcOnly.rawValue, using: transport)
+                try? await setDevicePropertyUInt8(.pcSaveImageFormat, value: 2, using: transport)
                 try await setDevicePropertyUInt8(.pcSaveImageSize, value: SonyTransferImageSize.twoMegapixel.rawValue, using: transport)
                 
             case .standard:
                 // Standard Mode: Archive Full-Res on SD Card + transfer 2M JPEG to iPad (0x0011)
                 try await setDevicePropertyUInt16(.stillImageSaveDestination, value: SonySaveDestination.pcAndCamera.rawValue, using: transport)
+                try? await setDevicePropertyUInt8(.pcSaveImageFormat, value: 2, using: transport)
                 try await setDevicePropertyUInt8(.pcSaveImageSize, value: SonyTransferImageSize.twoMegapixel.rawValue, using: transport)
             }
             await commandQueue.endCaptureScope()
@@ -405,65 +413,139 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         if mode == .gif {
             // Restore default PC + Camera destination
             try? await setDevicePropertyUInt16(.stillImageSaveDestination, value: SonySaveDestination.pcAndCamera.rawValue, using: transport)
+            try? await setDevicePropertyUInt8(.pcSaveImageFormat, value: 2, using: transport)
+            try? await setDevicePropertyUInt8(.pcSaveImageSize, value: SonyTransferImageSize.twoMegapixel.rawValue, using: transport)
         }
         await commandQueue.endCaptureScope()
     }
     
     // MARK: - Capture & RAM Buffer Ingestion (0xFFFFC001)
     
+    private func triggerShutterAndConfirmStart(
+        using transport: PTPTransport,
+        s1SettleNs: UInt64,
+        s2MinHoldNs: UInt64,
+        s2MaxHoldSec: TimeInterval
+    ) async throws -> UInt16 {
+        // Assert S1 (0xD2C1 = 2) and wait for half-press / AE lock registration
+        try await sendControlUInt16(.shutterHalfRelease, value: 2, using: transport)
+        try? await Task.sleep(nanoseconds: s1SettleNs)
+        
+        var latestObjState: UInt16 = 0
+        do {
+            // Assert S2 (0xD2C2 = 2 -> fires mechanical shutter & strobe)
+            try await sendControlUInt16(.shutterRelease, value: 2, using: transport)
+            try? await Task.sleep(nanoseconds: s2MinHoldNs)
+            
+            // Poll 0xD215 while S2 is held so if the camera needs ~100-350ms to meter AE / stop down
+            // aperture blades in Aperture Priority before firing, S2 stays pressed until capture starts (0xD215 > 0).
+            let holdDeadline = Date().addingTimeInterval(s2MaxHoldSec)
+            while Date() < holdDeadline {
+                if let (propBlob, _) = try? await commandQueue.execute(on: transport, opcode: .sdioGetAllExtDevicePropInfo),
+                   let objState = SonyPTPPacket.parseObjectInMemory(from: propBlob) {
+                    latestObjState = objState
+                    if objState > 0 {
+                        break
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 35_000_000)
+            }
+            
+            // Sequentially release S2 = 1 followed by S1 = 1 so Live View runs freely between poses
+            try await sendControlUInt16(.shutterRelease, value: 1, using: transport)
+            try? await sendControlUInt16(.shutterHalfRelease, value: 1, using: transport)
+        } catch {
+            try? await sendControlUInt16(.shutterRelease, value: 1, using: transport)
+            try? await sendControlUInt16(.shutterHalfRelease, value: 1, using: transport)
+            throw error
+        }
+        return latestObjState
+    }
+    
+    private func downloadCapturedJPEGFromRAM(
+        initialObjState: UInt16,
+        using transport: PTPTransport
+    ) async throws -> Data? {
+        var bestJPEGData: Data? = nil
+        var currentObjState = initialObjState
+        var safetyCount = 0
+        
+        while currentObjState >= 0x8000, safetyCount < 4 {
+            safetyCount += 1
+            
+            // Query object info first (required by Sony firmware before GetObject on 0xFFFFC001)
+            _ = try? await commandQueue.execute(
+                on: transport,
+                opcode: .getObjectInfo,
+                params: [SonyPTPHostHandle.capturedImageRAM.rawValue]
+            )
+            
+            let (objData, rc) = try await commandQueue.execute(
+                on: transport,
+                opcode: .getObject,
+                params: [SonyPTPHostHandle.capturedImageRAM.rawValue]
+            )
+            
+            if rc == SonyPTPResponseCode.ok.rawValue, !objData.isEmpty {
+                let isJPEG = objData.count >= 2 && objData[objData.startIndex] == 0xFF && objData[objData.startIndex + 1] == 0xD8
+                if isJPEG || bestJPEGData == nil {
+                    bestJPEGData = objData
+                }
+            } else {
+                break
+            }
+            
+            if currentObjState <= 0x8001 {
+                break
+            }
+            
+            if let (propBlob, _) = try? await commandQueue.execute(on: transport, opcode: .sdioGetAllExtDevicePropInfo),
+               let nextState = SonyPTPPacket.parseObjectInMemory(from: propBlob),
+               nextState > 0x8000 {
+                currentObjState = nextState
+            } else {
+                break
+            }
+        }
+        
+        return bestJPEGData
+    }
+    
     func takePicture() async throws -> [String] {
         guard let transport = ptpTransport, isConnected else {
             throw CameraError.connectionFailed
         }
         
-        // Lock the capture & RAM ingestion sequence (~0.3s) so 30 FPS Live View polling
-        // pauses during S1/S2 + 0xFFFFC001 transfer, then immediately resumes during the
-        // 2.0s reposition window between GIF poses.
+        // Lock the capture & RAM ingestion sequence so 30 FPS Live View polling
+        // pauses during S1/S2 + 0xFFFFC001 transfer, then immediately resumes between poses.
         await commandQueue.beginCaptureScope()
         
         do {
-            // 1. Pre-drain any leftover object in 0xFFFFC001 so we never read a stale frame or stall the shutter
+            // 1. Pre-drain any leftover object(s) in 0xFFFFC001 so we never read a stale frame or stall the shutter
             await drainStaleRAMObjectIfNeeded(using: transport)
             
-            // 2. Assert S1 (0xD2C1 = 2) and wait 25ms for half-press state registration
-            try await sendControlUInt16(.shutterHalfRelease, value: 2, using: transport)
-            try? await Task.sleep(nanoseconds: 25_000_000) // 25ms S1 settle
+            // 2. Trigger shutter with S1 settle + S2 hold until capture starts (0xD215 > 0)
+            var observedObjState = try await triggerShutterAndConfirmStart(
+                using: transport,
+                s1SettleNs: 50_000_000,   // 50ms S1 half-press settle (allows AE lock in Aperture Priority)
+                s2MinHoldNs: 70_000_000,  // 70ms minimum S2 hold
+                s2MaxHoldSec: 0.35        // Up to 350ms S2 hold if camera is stopping down aperture / metering
+            )
             
-            // 3. Trigger Shutter Release (S2 press = 2 -> fires mechanical shutter & Godox X2T-S strobe)
-            // and sequentially release S2 = 1 followed by S1 = 1 so Live View runs freely between poses.
-            do {
-                try await sendControlUInt16(.shutterRelease, value: 2, using: transport)
-                try? await Task.sleep(nanoseconds: 40_000_000) // 40ms shutter hold
-                try await sendControlUInt16(.shutterRelease, value: 1, using: transport)
-                try? await sendControlUInt16(.shutterHalfRelease, value: 1, using: transport)
-            } catch {
-                try? await sendControlUInt16(.shutterHalfRelease, value: 1, using: transport)
-                throw error
-            }
+            // 3. Poll 0xD215 (ObjectInMemory):
+            //    - 0x0000: shutter hasn't fired yet
+            //    - 0x0001..<0x8000: shutter HAS fired; exposure/encoding in progress
+            //    - >= 0x8000 (0x8001+): image ready in RAM at 0xFFFFC001
+            let startWait = Date()
+            let maxExposureWaitSec: TimeInterval = 10.0
+            var didRetriggerShutter = false
             
-            // 4. Allow 80ms for BIONZ XR JPEG encoding before polling 0xD215 (ObjectInMemory >= 0x8000)
-            try? await Task.sleep(nanoseconds: 80_000_000)
-            
-            let deadline = Date().addingTimeInterval(6.0)
-            while Date() < deadline {
-                if let (propBlob, _) = try? await commandQueue.execute(on: transport, opcode: .sdioGetAllExtDevicePropInfo),
-                   let objState = SonyPTPPacket.parseObjectInMemory(from: propBlob),
-                   objState >= 0x8000 {
-                    
-                    // Query object info first (required by Sony firmware before GetObject on 0xFFFFC001)
-                    _ = try? await commandQueue.execute(
-                        on: transport,
-                        opcode: .getObjectInfo,
-                        params: [SonyPTPHostHandle.capturedImageRAM.rawValue]
-                    )
-                    
-                    let (jpegData, rc) = try await commandQueue.execute(
-                        on: transport,
-                        opcode: .getObject,
-                        params: [SonyPTPHostHandle.capturedImageRAM.rawValue]
-                    )
-                    
-                    if rc == SonyPTPResponseCode.ok.rawValue, !jpegData.isEmpty {
+            while Date().timeIntervalSince(startWait) < maxExposureWaitSec {
+                if observedObjState >= 0x8000 {
+                    if let jpegData = try await downloadCapturedJPEGFromRAM(
+                        initialObjState: observedObjState,
+                        using: transport
+                    ) {
                         let tempURL = FileManager.default.temporaryDirectory
                             .appendingPathComponent("sony_\(UUID().uuidString).jpg")
                         try jpegData.write(to: tempURL, options: .atomic)
@@ -471,7 +553,28 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                         return [tempURL.absoluteString]
                     }
                 }
-                try await Task.sleep(nanoseconds: 50_000_000) // 50ms poll interval
+                
+                // Fast re-trigger: if 0.40s has passed since S2 release and 0xD215 is STILL 0x0000
+                // (meaning the camera ignored the first shutter pulse because it was busy with SD card / Live View),
+                // re-pulse S1/S2 immediately instead of waiting 6+ seconds to time out!
+                if !didRetriggerShutter,
+                   observedObjState == 0,
+                   Date().timeIntervalSince(startWait) >= 0.40 {
+                    didRetriggerShutter = true
+                    observedObjState = try await triggerShutterAndConfirmStart(
+                        using: transport,
+                        s1SettleNs: 90_000_000,
+                        s2MinHoldNs: 130_000_000,
+                        s2MaxHoldSec: 0.55
+                    )
+                    continue
+                }
+                
+                try await Task.sleep(nanoseconds: 40_000_000) // 40ms poll interval
+                if let (propBlob, _) = try? await commandQueue.execute(on: transport, opcode: .sdioGetAllExtDevicePropInfo),
+                   let stateVal = SonyPTPPacket.parseObjectInMemory(from: propBlob) {
+                    observedObjState = stateVal
+                }
             }
             
             await commandQueue.endCaptureScope()

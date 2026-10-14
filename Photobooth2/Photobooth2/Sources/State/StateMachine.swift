@@ -180,6 +180,7 @@ class StateMachine: ObservableObject {
             Task { await initializeCamera() }
             
         case .idle:
+            cleanupSessionStillImages()
             purgeOrphanedTempFilesAndCheckStorage()
             Task { await startLiveView() }
             
@@ -205,6 +206,7 @@ class StateMachine: ObservableObject {
             
         case .error:
             cameraService.stopLiveView()
+            cleanupSessionStillImages()
             
         case .sharingPrompt:
             cameraService.stopLiveView()
@@ -274,8 +276,12 @@ class StateMachine: ObservableObject {
                 throw CameraError.invalidResponse
             }
             return first
+        } catch let error as CameraError where error == .timeout {
+            // takePicture() already performs a fast internal re-trigger if 0xD215 == 0;
+            // rethrow immediately so we don't stall for a second full timeout window.
+            throw error
         } catch {
-            // Allow 1 quick retry for transient device busy / timeout states
+            // Allow 1 quick retry for transient device busy / pipe states
             try await Task.sleep(nanoseconds: 150_000_000)
             let urls = try await cameraService.takePicture()
             guard let first = urls.first else {
@@ -356,7 +362,11 @@ class StateMachine: ObservableObject {
                 do {
                     let fileURLString = try await self.captureSinglePhoto()
                     self.capturedImages.append(fileURLString)
-                    self.saveToPhotoLibrary(urls: [fileURLString])
+                    // When using the external Sony camera, full-res still images are stored on the camera's SD card,
+                    // and the 2MP iPad copies are kept only in /tmp for preview & AirDrop and then deleted (not saved to iPad Photos).
+                    if self.config.useLocalCamera {
+                        self.saveToPhotoLibrary(urls: [fileURLString])
+                    }
                 } catch {
                     self.isFlashing = false
                     self.transition(to: .error(message: "Capture Failed: \(error.localizedDescription)"))
@@ -586,6 +596,17 @@ class StateMachine: ObservableObject {
     }
     
     // MARK: - Temporary File Cleanup & 2GB Storage Guard
+    
+    /// Deletes the current session's temporary 2MP still `.jpg` images from the iPad
+    /// once previewing and AirDrop (or skipping AirDrop) have completed.
+    private func cleanupSessionStillImages() {
+        let stillJPGs = capturedImages.filter { !$0.lowercased().hasSuffix(".gif") }
+        if !stillJPGs.isEmpty {
+            cleanupTempFiles(stillJPGs)
+        }
+        capturedImages.removeAll()
+        currentReviewImage = nil
+    }
     
     /// Immediately deletes temporary source frame files (accepts either `file://` URL strings or POSIX paths).
     func cleanupTempFiles(_ pathsOrURLs: [String]) {

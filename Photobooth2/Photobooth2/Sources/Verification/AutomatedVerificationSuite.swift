@@ -556,11 +556,16 @@ enum AutomatedVerificationSuite {
         sm.selectAirDrop()
         if case .airDrop(let airDropImgs) = sm.state {
             assertEqual(airDropImgs.count, 2, "selectAirDrop() transitions to .airDrop with 2 photos")
+            for urlStr in airDropImgs {
+                if let u = URL(string: urlStr) {
+                    assertTrue(FileManager.default.fileExists(atPath: u.path), "2MP still image exists in /tmp during AirDrop")
+                }
+            }
         } else {
             assertTrue(false, "Expected .airDrop state after selectAirDrop()")
         }
         
-        // 8. Race-Free /tmp Cleanup (>10m deleted, <10m preserved)
+        // 8. Immediate 2MP Still Image Deletion + Race-Free /tmp Cleanup (>10m deleted, <10m preserved)
         let tempDir = FileManager.default.temporaryDirectory
         let oldTempFile = tempDir.appendingPathComponent("old_orphan_\(UUID().uuidString).jpg")
         let freshTempFile = tempDir.appendingPathComponent("fresh_active_\(UUID().uuidString).jpg")
@@ -571,14 +576,16 @@ enum AutomatedVerificationSuite {
             ofItemAtPath: oldTempFile.path
         )
         
-        sm.skipSharing() // Transitions to .idle and triggers cleanupTemporaryFiles(olderThan: 600)
+        sm.skipSharing() // Transitions to .idle, immediately deleting the session's 2MP still images
         try await Task.sleep(nanoseconds: 150_000_000)
+        for urlStr in stdReviewImages {
+            if let u = URL(string: urlStr) {
+                assertTrue(!FileManager.default.fileExists(atPath: u.path), "2MP still image was immediately deleted from iPad after review/AirDrop finished")
+            }
+        }
         assertTrue(!FileManager.default.fileExists(atPath: oldTempFile.path), "Orphaned /tmp file older than 10 minutes (15m) was purged on return to .idle")
         assertTrue(FileManager.default.fileExists(atPath: freshTempFile.path), "Recent /tmp file (< 10 minutes old) was preserved for background Photo Library / AirDrop")
         try? FileManager.default.removeItem(at: freshTempFile)
-        for urlStr in stdReviewImages {
-            if let u = URL(string: urlStr) { try? FileManager.default.removeItem(at: u) }
-        }
         
         // 9. App Switching Lifecycle (handleAppDidEnterBackground / handleAppDidBecomeActive)
         sm.handleAppDidEnterBackground()

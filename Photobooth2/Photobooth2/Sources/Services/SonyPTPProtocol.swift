@@ -138,9 +138,15 @@ struct SonyPTPPacket: Sendable {
         var searchStart = propBlob.startIndex + 8
         while searchStart < propBlob.endIndex,
               let range = propBlob.range(of: pattern, in: searchStart..<propBlob.endIndex) {
-            let valueOffset = range.lowerBound - propBlob.startIndex + 8
-            if let currentValue = propBlob.readUInt16LE(at: valueOffset) {
-                return currentValue
+            let baseOffset = range.lowerBound - propBlob.startIndex
+            if baseOffset + 10 <= propBlob.count {
+                let getSet = propBlob[propBlob.startIndex + baseOffset + 4]
+                let isEnabled = propBlob[propBlob.startIndex + baseOffset + 5]
+                if (getSet <= 0x01 || getSet >= 0x80) && isEnabled <= 0x02 {
+                    if let currentValue = propBlob.readUInt16LE(at: baseOffset + 8) {
+                        return currentValue
+                    }
+                }
             }
             searchStart = range.upperBound
         }
