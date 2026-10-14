@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import UIKit
+import CoreImage
 import ImageCaptureCore
 
 /// Abstraction over `ICCameraDevice.requestSendPTPCommand` to allow deterministic unit testing.
@@ -308,16 +309,21 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             throw CameraError.ptpHandshakeFailed("SDIO Phase 3 returned 0x\(String(rc3, radix: 16))")
         }
         
-        // 1. Set Priority Mode to Camera Priority (0xD25A = 0) so physical camera dials (shutter speed, aperture, ISO) remain fully controllable
-        try? await setDevicePropertyUInt8(.priorityMode, value: 0, using: transport)
+        // 1. Temporarily set Priority Mode to PC Application (0xD25A = 1) so the camera accepts 0x9205 property writes
+        try? await setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
         
         // 2. Set default PC+Camera save destination (0xD222 = 0x0011) FIRST so 0xD269 and 0xD268 are unlocked,
-        //    then enforce 2M JPEG transfer format (0xD269 = 2 JPEG Only, 0xD268 = 2 2M).
+        //    enforce 2M JPEG transfer format (0xD269 = 2 JPEG Only, 0xD268 = 2 2M),
+        //    and set Live View Setting Effect OFF (0xD231 = 2) so the camera auto-brightens Live View prior to flash.
         try? await setDevicePropertyUInt16(.stillImageSaveDestination, value: SonySaveDestination.pcAndCamera.rawValue, using: transport)
         try? await setDevicePropertyUInt8(.pcSaveImageFormat, value: 2, using: transport)
         try? await setDevicePropertyUInt8(.pcSaveImageSize, value: SonyTransferImageSize.twoMegapixel.rawValue, using: transport)
+        try? await setDevicePropertyUInt8(.liveViewSettingEffect, value: 2, using: transport)
         
-        // 3. Drain any leftover image(s) in camera RAM (0xFFFFC001) from a prior interrupted session
+        // 3. Return Priority Mode to Camera (0xD25A = 0) so physical shutter speed, aperture, and ISO dials remain unlocked
+        try? await setDevicePropertyUInt8(.priorityMode, value: 0, using: transport)
+        
+        // 4. Drain any leftover image(s) in camera RAM (0xFFFFC001) from a prior interrupted session
         await drainStaleRAMObjectIfNeeded(using: transport)
     }
     
@@ -387,21 +393,26 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         
         await commandQueue.beginCaptureScope()
         do {
+            try? await setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
             switch mode {
             case .gif:
                 // GIF Mode: Route exclusively to iPad RAM (0x0001) so SD card is NEVER touched.
                 try await setDevicePropertyUInt16(.stillImageSaveDestination, value: SonySaveDestination.pcOnly.rawValue, using: transport)
                 try? await setDevicePropertyUInt8(.pcSaveImageFormat, value: 2, using: transport)
                 try await setDevicePropertyUInt8(.pcSaveImageSize, value: SonyTransferImageSize.twoMegapixel.rawValue, using: transport)
+                try? await setDevicePropertyUInt8(.liveViewSettingEffect, value: 2, using: transport)
                 
             case .standard:
                 // Standard Mode: Archive Full-Res on SD Card + transfer 2M JPEG to iPad (0x0011)
                 try await setDevicePropertyUInt16(.stillImageSaveDestination, value: SonySaveDestination.pcAndCamera.rawValue, using: transport)
                 try? await setDevicePropertyUInt8(.pcSaveImageFormat, value: 2, using: transport)
                 try await setDevicePropertyUInt8(.pcSaveImageSize, value: SonyTransferImageSize.twoMegapixel.rawValue, using: transport)
+                try? await setDevicePropertyUInt8(.liveViewSettingEffect, value: 2, using: transport)
             }
+            try? await setDevicePropertyUInt8(.priorityMode, value: 0, using: transport)
             await commandQueue.endCaptureScope()
         } catch {
+            try? await setDevicePropertyUInt8(.priorityMode, value: 0, using: transport)
             await commandQueue.endCaptureScope()
             throw error
         }
@@ -412,9 +423,12 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         await commandQueue.beginCaptureScope()
         if mode == .gif {
             // Restore default PC + Camera destination
+            try? await setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
             try? await setDevicePropertyUInt16(.stillImageSaveDestination, value: SonySaveDestination.pcAndCamera.rawValue, using: transport)
             try? await setDevicePropertyUInt8(.pcSaveImageFormat, value: 2, using: transport)
             try? await setDevicePropertyUInt8(.pcSaveImageSize, value: SonyTransferImageSize.twoMegapixel.rawValue, using: transport)
+            try? await setDevicePropertyUInt8(.liveViewSettingEffect, value: 2, using: transport)
+            try? await setDevicePropertyUInt8(.priorityMode, value: 0, using: transport)
         }
         await commandQueue.endCaptureScope()
     }
@@ -594,6 +608,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         liveViewTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             let targetFrameIntervalNs: UInt64 = 33_000_000 // ~30 FPS
+            let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
             
             while !Task.isCancelled {
                 let frameStart = DispatchTime.now().uptimeNanoseconds
@@ -613,10 +628,11 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 ), rc == SonyPTPResponseCode.ok.rawValue {
                     
                     let decodedImage: UIImage? = autoreleasepool {
-                        guard let jpegData = SonyPTPPacket.extractLiveViewJPEG(from: payload) else {
+                        guard let jpegData = SonyPTPPacket.extractLiveViewJPEG(from: payload),
+                              let rawImage = UIImage(data: jpegData) else {
                             return nil
                         }
-                        return UIImage(data: jpegData)
+                        return Self.autoExposeLiveViewIfNeeded(rawImage, ciContext: ciContext)
                     }
                     
                     if let image = decodedImage {
@@ -634,6 +650,72 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 }
             }
         }
+    }
+    
+    /// Ensures the iPad Live View preview remains bright and clearly visible for framing
+    /// even when the camera is set to dark manual flash settings (e.g. 1/125s, f/8, ISO 100)
+    /// prior to the flash firing, or if the camera's internal Setting Effect OFF is overridden.
+    nonisolated private static func autoExposeLiveViewIfNeeded(_ image: UIImage, ciContext: CIContext) -> UIImage {
+        guard let cgImage = image.cgImage else { return image }
+        
+        // Fast 16x16 downsample to measure average scene luminance in <0.1ms
+        let sampleSize = 16
+        var pixels = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: &pixels,
+            width: sampleSize,
+            height: sampleSize,
+            bitsPerComponent: 8,
+            bytesPerRow: sampleSize * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return image
+        }
+        ctx.interpolationQuality = .low
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
+        
+        var totalLuma: Double = 0
+        let count = sampleSize * sampleSize
+        for i in 0..<count {
+            let offset = i * 4
+            let r = Double(pixels[offset])
+            let g = Double(pixels[offset + 1])
+            let b = Double(pixels[offset + 2])
+            totalLuma += (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+        }
+        let meanLuminance = totalLuma / Double(count)
+        
+        // If the frame is already well-exposed (mean luminance >= 0.28), return as-is
+        let targetLuminance = 0.42
+        guard meanLuminance < 0.28 else { return image }
+        
+        // Compute EV boost needed to bring dark ambient preview up to target visibility (capped at +4.5 EV)
+        let safeLuma = max(meanLuminance, 0.015)
+        let evBoost = min(max(log2(targetLuminance / safeLuma), 0.5), 4.5)
+        
+        let ciInput = CIImage(cgImage: cgImage)
+        guard let exposureFilter = CIFilter(name: "CIExposureAdjust") else { return image }
+        exposureFilter.setValue(ciInput, forKey: kCIInputImageKey)
+        exposureFilter.setValue(evBoost, forKey: kCIInputEVKey)
+        
+        var outputCI = exposureFilter.outputImage ?? ciInput
+        
+        // Apply a gentle shadow-lifting gamma curve when boosting heavily dark frames
+        if evBoost > 1.5, let gammaFilter = CIFilter(name: "CIGammaAdjust") {
+            let gammaPower = max(0.55, 1.0 - (evBoost - 1.5) * 0.12)
+            gammaFilter.setValue(outputCI, forKey: kCIInputImageKey)
+            gammaFilter.setValue(gammaPower, forKey: "inputPower")
+            if let gammaOut = gammaFilter.outputImage {
+                outputCI = gammaOut
+            }
+        }
+        
+        guard let boostedCG = ciContext.createCGImage(outputCI, from: ciInput.extent) else {
+            return image
+        }
+        return UIImage(cgImage: boostedCG, scale: image.scale, orientation: image.imageOrientation)
     }
     
     func stopLiveView() {

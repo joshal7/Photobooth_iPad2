@@ -26,7 +26,8 @@ enum SonyPTPPropertyCode: UInt16, Sendable {
     case batteryLevel                = 0xD218 // UInt8: battery %
     case liveViewStatus              = 0xD221 // UInt8: 1 = active
     case stillImageSaveDestination   = 0xD222 // UInt16: 0x0001 = PC, 0x0010 = Card, 0x0011 = PC+Card
-    case priorityMode                = 0xD25A // UInt8: 1 = PC Priority
+    case liveViewSettingEffect       = 0xD231 // UInt8: 1 = Setting Effect ON, 2 = Setting Effect OFF (auto-expose Live View)
+    case priorityMode                = 0xD25A // UInt8: 0 = Camera Priority, 1 = PC Application Priority
     case pcSaveImageSize             = 0xD268 // UInt8: 1 = Original, 2 = 2M
     case pcSaveImageFormat           = 0xD269 // UInt8: 1 = RAW+J, 2 = JPEG Only, 3 = RAW Only
     case shutterHalfRelease          = 0xD2C1 // UInt16: 2 = Press S1, 1 = Release S1

@@ -295,10 +295,14 @@ enum AutomatedVerificationSuite {
             $0.1.first == UInt32(SonyPTPPropertyCode.stillImageSaveDestination.rawValue) &&
             $0.2 == [0x11, 0x00]
         }
-        let touchedLiveViewEffect = handshakeOps.contains { $0.1.first == 0xD231 }
+        let setLiveViewEffectOff = handshakeOps.contains {
+            $0.0 == SonyPTPOpcode.sdioSetExtDevicePropValue.rawValue &&
+            $0.1.first == UInt32(SonyPTPPropertyCode.liveViewSettingEffect.rawValue) &&
+            $0.2 == [0x02]
+        }
         assertTrue(set2M, "Handshake sets 0xD268 (Transfer Size) = 2 (2M)")
         assertTrue(setPCCamera, "Handshake sets 0xD222 (Save Destination) = 0x0011 (PC + Camera)")
-        assertTrue(!touchedLiveViewEffect, "Handshake does NOT touch 0xD231 (Live View Setting Effect)")
+        assertTrue(setLiveViewEffectOff, "Handshake sets 0xD231 (Live View Setting Effect) = 2 (Setting Effect OFF)")
         
         // 2. Mode-Based Storage Routing Verification
         transport.resetLog()
