@@ -123,9 +123,62 @@ struct SonyPTPPacket: Sendable {
         return payload.subdata(in: soiRange.lowerBound..<eoiRange.upperBound)
     }
     
+    /// Extracts a valid JPEG image from a `0xFFFFC001` captured image payload (whether pure JPEG,
+    /// Sony MPF multi-stream JPEG, or embedded preview JPEG inside a Sony `.ARW` RAW container).
+    nonisolated static func extractCapturedJPEG(from payload: Data) -> Data? {
+        guard payload.count > 16 else { return nil }
+        let soi = Data([0xFF, 0xD8, 0xFF])
+        let eoi = Data([0xFF, 0xD9])
+        
+        // If it already starts with a JPEG SOI marker, return the payload (UIImage/ImageIO will decode primary image)
+        if payload[payload.startIndex] == 0xFF && payload[payload.startIndex + 1] == 0xD8 {
+            return payload
+        }
+        
+        // Otherwise (e.g. Sony .ARW RAW TIFF container starting with 0x49 0x49 0x2A 0x00),
+        // locate the largest embedded JPEG stream (2MP preview JPEG inside the RAW container).
+        var bestSlice: Data? = nil
+        var searchStart = payload.startIndex
+        while searchStart < payload.endIndex,
+              let soiRange = payload.range(of: soi, in: searchStart..<payload.endIndex) {
+            if let eoiRange = payload.range(of: eoi, options: .backwards, in: soiRange.lowerBound..<payload.endIndex) {
+                let candidate = payload.subdata(in: soiRange.lowerBound..<eoiRange.upperBound)
+                if candidate.count > (bestSlice?.count ?? 0) {
+                    bestSlice = candidate
+                }
+            }
+            searchStart = soiRange.upperBound
+        }
+        return bestSlice
+    }
+    
     /// Parses `0xD215` (`ObjectInMemory`) current `UInt16` value from Sony's `0x9209` `SDIO_GetAllExtDevicePropInfo` blob.
     nonisolated static func parseObjectInMemory(from propBlob: Data) -> UInt16? {
         return parseUInt16Property(.objectInMemory, from: propBlob)
+    }
+    
+    /// Scans Sony's `0x9209` property descriptor list for a specific `UInt8` DevicePropCode (`0xD2xx`)
+    /// with DataType `0x0002` (`PTP_DTC_UINT8`).
+    nonisolated static func parseUInt8Property(_ prop: SonyPTPPropertyCode, from propBlob: Data) -> UInt8? {
+        guard propBlob.count >= 16 else { return nil }
+        let codeLo = UInt8(prop.rawValue & 0xFF)
+        let codeHi = UInt8((prop.rawValue >> 8) & 0xFF)
+        let pattern = Data([codeLo, codeHi, 0x02, 0x00])
+        
+        var searchStart = propBlob.startIndex + 8
+        while searchStart < propBlob.endIndex,
+              let range = propBlob.range(of: pattern, in: searchStart..<propBlob.endIndex) {
+            let baseOffset = range.lowerBound - propBlob.startIndex
+            if baseOffset + 8 <= propBlob.count {
+                let getSet = propBlob[propBlob.startIndex + baseOffset + 4]
+                let isEnabled = propBlob[propBlob.startIndex + baseOffset + 5]
+                if (getSet <= 0x01 || getSet >= 0x80) && isEnabled <= 0x02 {
+                    return propBlob[propBlob.startIndex + baseOffset + 7]
+                }
+            }
+            searchStart = range.upperBound
+        }
+        return nil
     }
     
     /// Scans Sony's `0x9209` property descriptor list for a specific `UInt16` DevicePropCode (`0xD2xx`)

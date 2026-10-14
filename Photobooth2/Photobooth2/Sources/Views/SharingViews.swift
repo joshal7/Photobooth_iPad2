@@ -254,10 +254,14 @@ struct AirDropInstructionsView: View {
         
         var items: [Any] = []
         for path in images {
+            let fileURL: URL
             if path.hasPrefix("file://"), let url = URL(string: path) {
-                items.append(url)
+                fileURL = URL(fileURLWithPath: url.path)
             } else {
-                items.append(URL(fileURLWithPath: path))
+                fileURL = URL(fileURLWithPath: path)
+            }
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                items.append(fileURL)
             }
         }
         
@@ -309,7 +313,7 @@ struct AirDropInstructionsView: View {
             
             // Reset state
             isSheetPresented = false
-            self.cancelReset() // Stop the 45s timer
+            self.cancelReset() // Stop the 120s timer
             
             // Dismissal of the share sheet can sometimes conflict with state transitions if done too fast.
             // We wait a brief moment to ensure the sheet is fully dismissed before changing state.
@@ -321,8 +325,8 @@ struct AirDropInstructionsView: View {
         
         rootVC.present(activityVC, animated: true)
         
-        // Start 45s timer for the Share Sheet interaction
-        scheduleReset(delay: 45.0)
+        // Start 120s timer for the Share Sheet interaction (allows time to enable AirDrop on iPhone + transfer)
+        scheduleReset(delay: 120.0)
         
         // SAFETY POLL: Check every 1s if the VC is still presented.
         // If the system dismisses it (e.g. after AirDrop) but fails to call the handler,

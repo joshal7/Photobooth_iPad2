@@ -501,21 +501,22 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             )
             
             if rc == SonyPTPResponseCode.ok.rawValue, !objData.isEmpty {
-                let isJPEG = objData.count >= 2 && objData[objData.startIndex] == 0xFF && objData[objData.startIndex + 1] == 0xD8
-                if isJPEG || bestJPEGData == nil {
+                let startsWithJPEG = objData.count >= 2 && objData[objData.startIndex] == 0xFF && objData[objData.startIndex + 1] == 0xD8
+                if let extractedJPEG = SonyPTPPacket.extractCapturedJPEG(from: objData) {
+                    if startsWithJPEG || bestJPEGData == nil {
+                        bestJPEGData = extractedJPEG
+                    }
+                } else if bestJPEGData == nil {
                     bestJPEGData = objData
                 }
             } else {
                 break
             }
             
-            if currentObjState <= 0x8001 {
-                break
-            }
-            
+            // Query 0xD215 again to see if another object (e.g. second slot in RAW+JPEG mode) is still in RAM
             if let (propBlob, _) = try? await commandQueue.execute(on: transport, opcode: .sdioGetAllExtDevicePropInfo),
                let nextState = SonyPTPPacket.parseObjectInMemory(from: propBlob),
-               nextState > 0x8000 {
+               nextState >= 0x8000 {
                 currentObjState = nextState
             } else {
                 break
@@ -556,13 +557,14 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             
             while Date().timeIntervalSince(startWait) < maxExposureWaitSec {
                 if observedObjState >= 0x8000 {
-                    if let jpegData = try await downloadCapturedJPEGFromRAM(
+                    if let rawJPEGData = try await downloadCapturedJPEGFromRAM(
                         initialObjState: observedObjState,
                         using: transport
                     ) {
+                        let normalizedData = Self.normalizeAndAutoExposeCapturedJPEG(rawJPEGData)
                         let tempURL = FileManager.default.temporaryDirectory
                             .appendingPathComponent("sony_\(UUID().uuidString).jpg")
-                        try jpegData.write(to: tempURL, options: .atomic)
+                        try normalizedData.write(to: tempURL, options: .atomic)
                         await commandQueue.endCaptureScope()
                         return [tempURL.absoluteString]
                     }
@@ -599,6 +601,28 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         }
     }
     
+    /// Re-encodes the downloaded 2MP Sony transfer payload as a clean, standard iOS JFIF JPEG
+    /// (stripping Sony MPF multi-stream trailers that stall iOS `sharingd` / AirDrop preview generation)
+    /// and gently brightens dark non-flash test captures when shadow data is present.
+    nonisolated private static func normalizeAndAutoExposeCapturedJPEG(_ rawData: Data) -> Data {
+        return autoreleasepool {
+            let extracted = SonyPTPPacket.extractCapturedJPEG(from: rawData) ?? rawData
+            guard let uiImage = UIImage(data: extracted) else {
+                return extracted
+            }
+            let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+            let (processedImage, _) = adjustImageExposureIfNeeded(
+                uiImage,
+                ciContext: ciContext,
+                minRecoverableLuminance: 0.012,
+                targetLuminance: 0.36,
+                triggerThreshold: 0.22,
+                maxEVBoost: 3.2
+            )
+            return processedImage.jpegData(compressionQuality: 0.92) ?? extracted
+        }
+    }
+    
     // MARK: - Paced 30 FPS PTP Live View (0xFFFFC002) & Sleep Prevention
     
     func startLiveView() async throws {
@@ -609,6 +633,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             guard let self = self else { return }
             let targetFrameIntervalNs: UInt64 = 33_000_000 // ~30 FPS
             let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+            var lastSettingEffectEnforceTime: UInt64 = 0
             
             while !Task.isCancelled {
                 let frameStart = DispatchTime.now().uptimeNanoseconds
@@ -627,7 +652,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                     highPriority: false
                 ), rc == SonyPTPResponseCode.ok.rawValue {
                     
-                    let decodedImage: UIImage? = autoreleasepool {
+                    let result: (UIImage, Double)? = autoreleasepool {
                         guard let jpegData = SonyPTPPacket.extractLiveViewJPEG(from: payload),
                               let rawImage = UIImage(data: jpegData) else {
                             return nil
@@ -635,9 +660,20 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                         return Self.autoExposeLiveViewIfNeeded(rawImage, ciContext: ciContext)
                     }
                     
-                    if let image = decodedImage {
+                    if let (image, meanLuma) = result {
                         await MainActor.run {
                             self._previewStream.send(image)
+                        }
+                        
+                        // If the operator rotated the physical mode dial (e.g. from M to Custom "1"),
+                        // the camera reloads Memory Recall 1 which resets Live View Setting Effect (0xD231) to ON (1),
+                        // causing the camera to send dark Live View frames. Immediately re-assert Setting Effect OFF (2)!
+                        let nowNs = DispatchTime.now().uptimeNanoseconds
+                        if meanLuma < 0.14, nowNs - lastSettingEffectEnforceTime > 2_000_000_000 {
+                            lastSettingEffectEnforceTime = nowNs
+                            try? await self.setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
+                            try? await self.setDevicePropertyUInt8(.liveViewSettingEffect, value: 2, using: transport)
+                            try? await self.setDevicePropertyUInt8(.priorityMode, value: 0, using: transport)
                         }
                     }
                 }
@@ -653,10 +689,27 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     }
     
     /// Ensures the iPad Live View preview remains bright and clearly visible for framing
-    /// even when the camera is set to dark manual flash settings (e.g. 1/125s, f/8, ISO 100)
-    /// prior to the flash firing, or if the camera's internal Setting Effect OFF is overridden.
-    nonisolated private static func autoExposeLiveViewIfNeeded(_ image: UIImage, ciContext: CIContext) -> UIImage {
-        guard let cgImage = image.cgImage else { return image }
+    /// without amplifying 8-bit quantization noise into black-and-white blocks while 0xD231 switches.
+    nonisolated private static func autoExposeLiveViewIfNeeded(_ image: UIImage, ciContext: CIContext) -> (UIImage, Double) {
+        return adjustImageExposureIfNeeded(
+            image,
+            ciContext: ciContext,
+            minRecoverableLuminance: 0.025,
+            targetLuminance: 0.38,
+            triggerThreshold: 0.25,
+            maxEVBoost: 1.8
+        )
+    }
+    
+    nonisolated private static func adjustImageExposureIfNeeded(
+        _ image: UIImage,
+        ciContext: CIContext,
+        minRecoverableLuminance: Double,
+        targetLuminance: Double,
+        triggerThreshold: Double,
+        maxEVBoost: Double
+    ) -> (UIImage, Double) {
+        guard let cgImage = image.cgImage else { return (image, 0.5) }
         
         // Fast 16x16 downsample to measure average scene luminance in <0.1ms
         let sampleSize = 16
@@ -671,7 +724,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
-            return image
+            return (image, 0.5)
         }
         ctx.interpolationQuality = .low
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
@@ -687,24 +740,23 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         }
         let meanLuminance = totalLuma / Double(count)
         
-        // If the frame is already well-exposed (mean luminance >= 0.28), return as-is
-        let targetLuminance = 0.42
-        guard meanLuminance < 0.28 else { return image }
+        // Do not boost well-exposed frames (>= triggerThreshold) or crushed 8-bit black frames (< minRecoverableLuminance)
+        // where boosting 0/1 quantization steps would create posterized black-and-white blocks.
+        guard meanLuminance < triggerThreshold, meanLuminance >= minRecoverableLuminance else {
+            return (image, meanLuminance)
+        }
         
-        // Compute EV boost needed to bring dark ambient preview up to target visibility (capped at +4.5 EV)
-        let safeLuma = max(meanLuminance, 0.015)
-        let evBoost = min(max(log2(targetLuminance / safeLuma), 0.5), 4.5)
+        let evBoost = min(max(log2(targetLuminance / meanLuminance), 0.35), maxEVBoost)
         
         let ciInput = CIImage(cgImage: cgImage)
-        guard let exposureFilter = CIFilter(name: "CIExposureAdjust") else { return image }
+        guard let exposureFilter = CIFilter(name: "CIExposureAdjust") else { return (image, meanLuminance) }
         exposureFilter.setValue(ciInput, forKey: kCIInputImageKey)
         exposureFilter.setValue(evBoost, forKey: kCIInputEVKey)
         
         var outputCI = exposureFilter.outputImage ?? ciInput
         
-        // Apply a gentle shadow-lifting gamma curve when boosting heavily dark frames
-        if evBoost > 1.5, let gammaFilter = CIFilter(name: "CIGammaAdjust") {
-            let gammaPower = max(0.55, 1.0 - (evBoost - 1.5) * 0.12)
+        if evBoost > 1.0, let gammaFilter = CIFilter(name: "CIGammaAdjust") {
+            let gammaPower = max(0.72, 1.0 - (evBoost - 1.0) * 0.10)
             gammaFilter.setValue(outputCI, forKey: kCIInputImageKey)
             gammaFilter.setValue(gammaPower, forKey: "inputPower")
             if let gammaOut = gammaFilter.outputImage {
@@ -713,9 +765,9 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         }
         
         guard let boostedCG = ciContext.createCGImage(outputCI, from: ciInput.extent) else {
-            return image
+            return (image, meanLuminance)
         }
-        return UIImage(cgImage: boostedCG, scale: image.scale, orientation: image.imageOrientation)
+        return (UIImage(cgImage: boostedCG, scale: image.scale, orientation: image.imageOrientation), meanLuminance)
     }
     
     func stopLiveView() {
@@ -723,20 +775,30 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         liveViewTask = nil
     }
     
-    /// Sends a lightweight periodic PTP status query every 60s to prevent Sony camera auto-sleep.
+    /// Periodically polls Sony property table (0x9209) every 4s to prevent auto-sleep and immediately
+    /// re-asserts Setting Effect OFF (0xD231 = 2) if the operator turns the physical camera mode dial (e.g. to "1").
     private func startKeepAliveLoop() {
         keepAliveTask?.cancel()
         keepAliveTask = Task.detached(priority: .utility) { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 60_000_000_000) // 60s
+                try? await Task.sleep(nanoseconds: 4_000_000_000) // 4s
                 guard let self = self, !Task.isCancelled else { break }
                 if await self.commandQueue.isBusyWithCaptureOrConfig { continue }
                 guard let transport = await MainActor.run(body: { self.ptpTransport }) else { break }
-                _ = try? await self.commandQueue.execute(
+                if let (propBlob, rc) = try? await self.commandQueue.execute(
                     on: transport,
                     opcode: .sdioGetAllExtDevicePropInfo,
                     highPriority: false
-                )
+                ), rc == SonyPTPResponseCode.ok.rawValue {
+                    let currentEffect = SonyPTPPacket.parseUInt8Property(.liveViewSettingEffect, from: propBlob)
+                    if currentEffect == 1 {
+                        // Camera mode dial was turned (e.g. to Memory Recall "1") which reset 0xD231 to Setting Effect ON (1).
+                        // Immediately restore Setting Effect OFF (2) and unlock physical dials (0xD25A = 0).
+                        try? await self.setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
+                        try? await self.setDevicePropertyUInt8(.liveViewSettingEffect, value: 2, using: transport)
+                        try? await self.setDevicePropertyUInt8(.priorityMode, value: 0, using: transport)
+                    }
+                }
             }
         }
     }

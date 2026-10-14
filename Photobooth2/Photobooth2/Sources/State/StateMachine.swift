@@ -171,6 +171,7 @@ class StateMachine: ObservableObject {
     
     func transition(to newState: AppState) {
         print("Transitioning to: \(newState)")
+        let previousState = self.state
         sharingPromptTimeoutTask?.cancel()
         sharingPromptTimeoutTask = nil
         self.state = newState
@@ -180,7 +181,13 @@ class StateMachine: ObservableObject {
             Task { await initializeCamera() }
             
         case .idle:
-            cleanupSessionStillImages()
+            if case .airDrop = previousState {
+                // Keep temporary .jpg files alive on disk for 90s after the AirDrop sheet closes
+                // so iPadOS's background `sharingd` daemon can finish transmitting them to the iPhone.
+                cleanupSessionStillImages(afterDelay: 90.0)
+            } else {
+                cleanupSessionStillImages(afterDelay: 0)
+            }
             purgeOrphanedTempFilesAndCheckStorage()
             Task { await startLiveView() }
             
@@ -206,12 +213,12 @@ class StateMachine: ObservableObject {
             
         case .error:
             cameraService.stopLiveView()
-            cleanupSessionStillImages()
+            cleanupSessionStillImages(afterDelay: 0)
             
         case .sharingPrompt:
             cameraService.stopLiveView()
             sharingPromptTimeoutTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
                 guard let self = self, !Task.isCancelled else { return }
                 if case .sharingPrompt = self.state {
                     self.transition(to: .idle)
@@ -599,13 +606,20 @@ class StateMachine: ObservableObject {
     
     /// Deletes the current session's temporary 2MP still `.jpg` images from the iPad
     /// once previewing and AirDrop (or skipping AirDrop) have completed.
-    private func cleanupSessionStillImages() {
+    private func cleanupSessionStillImages(afterDelay delaySec: TimeInterval = 0) {
         let stillJPGs = capturedImages.filter { !$0.lowercased().hasSuffix(".gif") }
-        if !stillJPGs.isEmpty {
-            cleanupTempFiles(stillJPGs)
-        }
         capturedImages.removeAll()
         currentReviewImage = nil
+        
+        guard !stillJPGs.isEmpty else { return }
+        if delaySec <= 0 {
+            cleanupTempFiles(stillJPGs)
+        } else {
+            Task.detached(priority: .background) { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(delaySec * 1_000_000_000))
+                await self?.cleanupTempFiles(stillJPGs)
+            }
+        }
     }
     
     /// Immediately deletes temporary source frame files (accepts either `file://` URL strings or POSIX paths).
