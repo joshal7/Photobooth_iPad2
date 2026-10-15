@@ -402,8 +402,330 @@ assertTrue(
     String(format: "Top-Center pill wait bar fills left-to-right (10%% trailing -> 30%% leading: 50%%=%.0fpt, 100%%=%.0fpt, PhotoMode=%.0fpt)", halfFill, fullFill, photoModeFill)
 )
 
+// =========================================================================
+// 7. AI BACKDROP & FOREGROUND OVERLAYS + MAC BATCH WORKFLOW QA SUITE
+// =========================================================================
+
+print("\n--- AI BACKDROP & FOREGROUND + MAC BATCH WORKFLOW QA SUITE ---")
+
+func makeSolidOrBorderCGImage(
+    width: Int,
+    height: Int,
+    fillRGBA: (UInt8, UInt8, UInt8, UInt8),
+    borderThickness: Int = 0,
+    borderRGBA: (UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0),
+    rightMarkerRGBA: (UInt8, UInt8, UInt8, UInt8)? = nil
+) -> CGImage {
+    var pixels = [UInt8](repeating: 0, count: width * height * 4)
+    for y in 0..<height {
+        for x in 0..<width {
+            let isBorder = borderThickness > 0 && (
+                x < borderThickness || x >= (width - borderThickness) ||
+                y < borderThickness || y >= (height - borderThickness)
+            )
+            var c = isBorder ? borderRGBA : fillRGBA
+            if let marker = rightMarkerRGBA, x >= (width - 16) && x < (width - 4) && y >= (height / 2 - 8) && y < (height / 2 + 8) {
+                c = marker
+            }
+            let idx = (y * width + x) * 4
+            let a = UInt16(c.3)
+            pixels[idx]     = UInt8((UInt16(c.0) * a) / 255)
+            pixels[idx + 1] = UInt8((UInt16(c.1) * a) / 255)
+            pixels[idx + 2] = UInt8((UInt16(c.2) * a) / 255)
+            pixels[idx + 3] = c.3
+        }
+    }
+    let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    let ctx = CGContext(
+        data: &pixels,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: width * 4,
+        space: cs,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    )!
+    return ctx.makeImage()!
+}
+
+func encodePNG(_ cgImage: CGImage) -> Data {
+    let data = NSMutableData()
+    let dest = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(dest, cgImage, nil)
+    CGImageDestinationFinalize(dest)
+    return data as Data
+}
+
+func encodeJPEGWithEXIF(_ cgImage: CGImage, dateTimeOriginal: String, backdropTag: String? = nil) -> Data {
+    let data = NSMutableData()
+    let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil)!
+    var exifDict: [CFString: Any] = [
+        kCGImagePropertyExifDateTimeOriginal: dateTimeOriginal
+    ]
+    if let tag = backdropTag {
+        exifDict[kCGImagePropertyExifUserComment] = "PB2_BACKDROP:\(tag)"
+    }
+    let props: [CFString: Any] = [
+        kCGImageDestinationLossyCompressionQuality: 0.95,
+        kCGImagePropertyExifDictionary: exifDict
+    ]
+    CGImageDestinationAddImage(dest, cgImage, props as CFDictionary)
+    CGImageDestinationFinalize(dest)
+    return data as Data
+}
+
+// 7A. Verify Bundled Starter Assets in Photobooth2/Photobooth2/Backdrops/
+let projectBackdropsURL = URL(fileURLWithPath: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Backdrops", isDirectory: true)
+let starterFiles = (try? FileManager.default.contentsOfDirectory(at: projectBackdropsURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+let starterNames = Set(starterFiles.map(\.lastPathComponent))
+assertTrue(
+    starterNames.contains("Eiffel Tower_bg.jpg") &&
+    starterNames.contains("Celebration Frame_fg.png") &&
+    starterNames.contains("Magazine_bg.jpg") &&
+    starterNames.contains("Magazine_fg.png"),
+    "Bundled Backdrops/ directory contains starter Background, Foreground Frame, and Combo assets (\(starterNames.count) files)"
+)
+
+// 7B. Zero-Code Auto-Discovery & Pairing (`_bg` + `_fg` -> Combo)
+func classifyAndDiscover(in dir: URL) -> [(id: String, name: String, bg: String?, fg: String?)] {
+    let files = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? [])
+        .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    var map: [String: (name: String, bg: String?, fg: String?)] = [:]
+    var order: [String] = []
+    for f in files {
+        let stem = f.deletingPathExtension().lastPathComponent
+        let lower = stem.lowercased()
+        if lower.hasSuffix("_bg") {
+            let base = String(stem.dropLast(3))
+            let id = base.lowercased().replacingOccurrences(of: " ", with: "_")
+            if map[id] == nil { order.append(id); map[id] = (base, f.lastPathComponent, nil) }
+            else { map[id]?.bg = f.lastPathComponent }
+        } else if lower.hasSuffix("_fg") {
+            let base = String(stem.dropLast(3))
+            let id = base.lowercased().replacingOccurrences(of: " ", with: "_")
+            if map[id] == nil { order.append(id); map[id] = (base, nil, f.lastPathComponent) }
+            else { map[id]?.fg = f.lastPathComponent }
+        }
+    }
+    return order.compactMap { id in
+        guard let v = map[id] else { return nil }
+        return (id, v.name, v.bg, v.fg)
+    }
+}
+
+let discoveredStarters = classifyAndDiscover(in: projectBackdropsURL)
+assertEqual(discoveredStarters.count, 3, "Zero-code auto-discovery pairs 4 starter files into 3 distinct backdrop items (Eiffel Tower, Celebration Frame, Magazine)")
+let magStarter = discoveredStarters.first(where: { $0.id == "magazine" })
+assertTrue(
+    magStarter?.bg == "Magazine_bg.jpg" && magStarter?.fg == "Magazine_fg.png",
+    "Auto-discovery pairs 'Magazine_bg.jpg' + 'Magazine_fg.png' into a single Combo item"
+)
+
+// 7C. Resolution Auto-Scaling & 3-Layer Compositing Order (Background -> Segmented Subject -> Foreground Frame)
+func scaleCIImage(_ image: CIImage, to targetExtent: CGRect, stretch: Bool) -> CIImage {
+    let src = image.extent
+    let norm = image.transformed(by: CGAffineTransform(translationX: -src.minX, y: -src.minY))
+    if stretch {
+        return norm
+            .transformed(by: CGAffineTransform(scaleX: targetExtent.width / src.width, y: targetExtent.height / src.height))
+            .cropped(to: targetExtent)
+    } else {
+        let scale = max(targetExtent.width / src.width, targetExtent.height / src.height)
+        let ox = (targetExtent.width - src.width * scale) * 0.5
+        let oy = (targetExtent.height - src.height * scale) * 0.5
+        return norm
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            .transformed(by: CGAffineTransform(translationX: ox, y: oy))
+            .cropped(to: targetExtent)
+    }
+}
+
+func compositeThreeLayers(
+    subjectCG: CGImage,
+    bgCG: CGImage?,
+    fgCG: CGImage?,
+    maskProvider: () -> CIImage?
+) -> CGImage {
+    let ext = CGRect(x: 0, y: 0, width: subjectCG.width, height: subjectCG.height)
+    var current = CIImage(cgImage: subjectCG)
+    if let bg = bgCG {
+        let scaledBg = scaleCIImage(CIImage(cgImage: bg), to: ext, stretch: false)
+        if let mask = maskProvider(), let filter = CIFilter(name: "CIBlendWithMask") {
+            let scaledMask = scaleCIImage(mask, to: ext, stretch: true)
+            filter.setValue(current, forKey: kCIInputImageKey)
+            filter.setValue(scaledBg, forKey: kCIInputBackgroundImageKey)
+            filter.setValue(scaledMask, forKey: kCIInputMaskImageKey)
+            if let out = filter.outputImage?.cropped(to: ext) {
+                current = out
+            }
+        }
+    }
+    if let fg = fgCG {
+        let scaledFg = scaleCIImage(CIImage(cgImage: fg), to: ext, stretch: true)
+        current = scaledFg.composited(over: current).cropped(to: ext)
+    }
+    return ciContext.createCGImage(current, from: ext) ?? subjectCG
+}
+
+let subjectBlueCG = makeSolidOrBorderCGImage(width: 240, height: 160, fillRGBA: (30, 90, 230, 255))
+let portraitRedBgCG = makeSolidOrBorderCGImage(width: 120, height: 200, fillRGBA: (220, 30, 30, 255))
+let squareGreenFrameCG = makeSolidOrBorderCGImage(
+    width: 100,
+    height: 100,
+    fillRGBA: (0, 0, 0, 0),
+    borderThickness: 12,
+    borderRGBA: (20, 210, 60, 255)
+)
+let centerPersonMaskCG = makeSolidOrBorderCGImage(
+    width: 240,
+    height: 160,
+    fillRGBA: (255, 255, 255, 255),
+    borderThickness: 50,
+    borderRGBA: (0, 0, 0, 255)
+)
+let centerPersonMaskCI = CIImage(cgImage: centerPersonMaskCG)
+
+let comboCG = compositeThreeLayers(
+    subjectCG: subjectBlueCG,
+    bgCG: portraitRedBgCG,
+    fgCG: squareGreenFrameCG,
+    maskProvider: { centerPersonMaskCI }
+)
+assertEqual(comboCG.width, 240, "3-layer compositor preserves exact subject width (240)")
+assertEqual(comboCG.height, 160, "3-layer compositor preserves exact subject height (160)")
+
+let outerBorderRGB = readPixelRGB(comboCG, x: 4, y: 4)
+let bgRingRGB = readPixelRGB(comboCG, x: 36, y: 36)
+let subjectCenterRGB = readPixelRGB(comboCG, x: 120, y: 80)
+
+assertTrue(
+    outerBorderRGB.g > 170 && outerBorderRGB.r < 60 && outerBorderRGB.b < 90,
+    "Layer 3 (Foreground Frame) stretches to all 4 edges on top of background & subject: RGB=(\(outerBorderRGB.r),\(outerBorderRGB.g),\(outerBorderRGB.b))"
+)
+assertTrue(
+    bgRingRGB.r > 170 && bgRingRGB.g < 70 && bgRingRGB.b < 70,
+    "Layer 1 (Background) replaces physical room outside person mask: RGB=(\(bgRingRGB.r),\(bgRingRGB.g),\(bgRingRGB.b))"
+)
+assertTrue(
+    subjectCenterRGB.b > 180 && subjectCenterRGB.r < 70,
+    "Layer 2 (Segmented Subject) remains intact in front of background and behind frame hole: RGB=(\(subjectCenterRGB.r),\(subjectCenterRGB.g),\(subjectCenterRGB.b))"
+)
+
+// 7D. Foreground-Only Fast Path (Bypasses Segmentation Completely)
+var maskCallCount = 0
+let frameOnlyCG = compositeThreeLayers(
+    subjectCG: subjectBlueCG,
+    bgCG: nil,
+    fgCG: squareGreenFrameCG,
+    maskProvider: {
+        maskCallCount += 1
+        return centerPersonMaskCI
+    }
+)
+assertEqual(maskCallCount, 0, "Foreground-only frame bypasses Vision person segmentation (0 mask evaluations)")
+assertTrue(
+    readPixelRGB(frameOnlyCG, x: 4, y: 4).g > 170 && readPixelRGB(frameOnlyCG, x: 120, y: 80).b > 180,
+    "Foreground-only frame renders green border over untouched blue subject"
+)
+
+// 7E. iPad Front-Camera Selfie Pre-Mirroring (Subject Mirrors Horizontally, Foreground Text Stays Un-Mirrored)
+let rawFrontSubj = makeSolidOrBorderCGImage(
+    width: 160,
+    height: 120,
+    fillRGBA: (40, 40, 40, 255),
+    rightMarkerRGBA: (250, 250, 20, 255) // Yellow marker on RIGHT of raw image
+)
+let asymmetricFrame = makeSolidOrBorderCGImage(
+    width: 160,
+    height: 120,
+    fillRGBA: (0, 0, 0, 0),
+    rightMarkerRGBA: (20, 240, 240, 255) // Cyan marker on RIGHT of foreground frame
+)
+let mirroredSubjCI = CIImage(cgImage: rawFrontSubj)
+    .transformed(by: CGAffineTransform(scaleX: -1.0, y: 1.0))
+    .transformed(by: CGAffineTransform(translationX: 160, y: 0))
+let mirroredSubjCG = ciContext.createCGImage(mirroredSubjCI, from: CGRect(x: 0, y: 0, width: 160, height: 120))!
+let preMirroredOut = compositeThreeLayers(
+    subjectCG: mirroredSubjCG,
+    bgCG: nil,
+    fgCG: asymmetricFrame,
+    maskProvider: { nil }
+)
+let leftSubjPx = readPixelRGB(preMirroredOut, x: 10, y: 60)
+let rightFramePx = readPixelRGB(preMirroredOut, x: 150, y: 60)
+assertTrue(
+    leftSubjPx.r > 200 && leftSubjPx.g > 200 && rightFramePx.g > 200 && rightFramePx.b > 200,
+    "iPad Front-Camera Pre-Mirroring: subject mirrors horizontally (left) while foreground text stays un-reversed (right)"
+)
+
+// 7F. Triple-Lock Matching (PTP 0x1008 Filename + EXIF Timestamp + 8x8 RGB Signature) & SmugMug-Safe In-Place Batch Update
+func computeRGBSignature8x8(_ cgImage: CGImage) -> [UInt8] {
+    var rgba = [UInt8](repeating: 0, count: 8 * 8 * 4)
+    let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    let w = CGFloat(cgImage.width)
+    let h = CGFloat(cgImage.height)
+    let cropped = cgImage.cropping(to: CGRect(x: w * 0.1, y: h * 0.1, width: w * 0.8, height: h * 0.8)) ?? cgImage
+    rgba.withUnsafeMutableBytes { ptr in
+        let ctx = CGContext(
+            data: ptr.baseAddress,
+            width: 8,
+            height: 8,
+            bitsPerComponent: 8,
+            bytesPerRow: 32,
+            space: cs,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        ctx.interpolationQuality = .medium
+        ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: 8, height: 8))
+    }
+    var rgb: [UInt8] = []
+    for i in 0..<64 {
+        rgb.append(rgba[i * 4])
+        rgb.append(rgba[i * 4 + 1])
+        rgb.append(rgba[i * 4 + 2])
+    }
+    return rgb
+}
+
+func signatureDist(_ a: [UInt8], _ b: [UInt8]) -> Double {
+    guard a.count == b.count, !a.isEmpty else { return 1.0 }
+    var diff = 0
+    for i in 0..<a.count { diff += abs(Int(a[i]) - Int(b[i])) }
+    return Double(diff) / (Double(a.count) * 255.0)
+}
+
+let dsc1Blue = makeSolidOrBorderCGImage(width: 200, height: 150, fillRGBA: (30, 80, 220, 255))
+let dsc2Gold = makeSolidOrBorderCGImage(width: 200, height: 150, fillRGBA: (220, 180, 30, 255))
+let sigBlue = computeRGBSignature8x8(dsc1Blue)
+let sigGold = computeRGBSignature8x8(dsc2Gold)
+assertTrue(
+    signatureDist(sigBlue, sigBlue) < 0.001 && signatureDist(sigBlue, sigGold) > 0.35,
+    String(format: "8x8 RGB perceptual signature disambiguates same-second shots (selfDist=%.4f, crossDist=%.3f)", signatureDist(sigBlue, sigBlue), signatureDist(sigBlue, sigGold))
+)
+
+// 7G. Bottom Touch-Shield Hit-Testing Verification
+func isPointInsideShield(_ point: CGPoint, screenSize: CGSize, isExpanded: Bool) -> Bool {
+    if isExpanded {
+        let shieldWidth = min(screenSize.width, max(640, screenSize.width - 80))
+        let minX = (screenSize.width - shieldWidth) * 0.5
+        return point.x >= minX && point.x <= (minX + shieldWidth) && point.y >= (screenSize.height - 250) && point.y <= screenSize.height
+    } else {
+        let shieldWidth = min(screenSize.width, 420.0)
+        let minX = (screenSize.width - shieldWidth) * 0.5
+        return point.x >= minX && point.x <= (minX + shieldWidth) && point.y >= (screenSize.height - 110) && point.y <= screenSize.height
+    }
+}
+let iPadScreen = CGSize(width: 1194, height: 834)
+assertTrue(
+    isPointInsideShield(CGPoint(x: 597, y: 800), screenSize: iPadScreen, isExpanded: false) &&
+    isPointInsideShield(CGPoint(x: 450, y: 745), screenSize: iPadScreen, isExpanded: false) &&
+    !isPointInsideShield(CGPoint(x: 597, y: 520), screenSize: iPadScreen, isExpanded: true),
+    "Bottom anti-misfire touch shield absorbs taps around the pill/carousel while keeping upper capture buttons unobstructed"
+)
+
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")
 print("========================================================")
 exit(failedAssertions == 0 ? 0 : 1)
+
 

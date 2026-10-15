@@ -26,12 +26,16 @@ protocol CameraService: AnyObject {
     
     /// Checks if the connection to the camera is still active.
     func checkConnection() async -> Bool
+    
+    /// Updates the currently active background/foreground overlay preset for Live View and Capture.
+    func updateSelectedBackdrop(_ backdrop: BackdropItem)
 }
 
 extension CameraService {
     var statusMessage: String? { nil }
     func prepareForCapture(mode: CaptureMode) async throws {}
     func finishCaptureSequence(mode: CaptureMode) async {}
+    func updateSelectedBackdrop(_ backdrop: BackdropItem) {}
 }
 
 enum CameraError: Error, Equatable {

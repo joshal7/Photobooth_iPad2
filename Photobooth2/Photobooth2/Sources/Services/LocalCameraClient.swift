@@ -18,13 +18,84 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
     private let photoOutput = AVCapturePhotoOutput()
     private let videoOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
-    private let ciContext = CIContext()
+    nonisolated private let ciContext = CIContext()
     
+    private nonisolated final class ThreadSafeState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var currentBackdrop: BackdropItem = .none
+        private var activeCaptureMode: CaptureMode = .standard
+        private var cachedOrientation: UIDeviceOrientation = .portrait
+        private var isRenderingPreview: Bool = false
+        
+        func setBackdrop(_ backdrop: BackdropItem) {
+            lock.lock()
+            currentBackdrop = backdrop
+            lock.unlock()
+        }
+        
+        func setCaptureMode(_ mode: CaptureMode) {
+            lock.lock()
+            activeCaptureMode = mode
+            lock.unlock()
+        }
+        
+        func setOrientation(_ orientation: UIDeviceOrientation) {
+            lock.lock()
+            cachedOrientation = orientation
+            lock.unlock()
+        }
+        
+        func snapshot() -> (backdrop: BackdropItem, mode: CaptureMode, orientation: UIDeviceOrientation) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (currentBackdrop, activeCaptureMode, cachedOrientation)
+        }
+        
+        func tryBeginPreviewRender() -> (orientation: UIDeviceOrientation, backdrop: BackdropItem)? {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !isRenderingPreview else { return nil }
+            isRenderingPreview = true
+            return (cachedOrientation, currentBackdrop)
+        }
+        
+        func endPreviewRender() {
+            lock.lock()
+            isRenderingPreview = false
+            lock.unlock()
+        }
+    }
+    
+    nonisolated private let threadSafeState = ThreadSafeState()
     private var photoContinuation: CheckedContinuation<[String], Error>?
     
     override init() {
         super.init()
+        Task { @MainActor [weak self] in
+            self?.refreshCachedDeviceOrientation()
+        }
         checkPermissions()
+    }
+    
+    nonisolated func updateSelectedBackdrop(_ backdrop: BackdropItem) {
+        threadSafeState.setBackdrop(backdrop)
+    }
+    
+    @MainActor
+    private func refreshCachedDeviceOrientation() {
+        let orientation = UIDevice.current.orientation
+        if orientation.isValidInterfaceOrientation {
+            threadSafeState.setOrientation(orientation)
+        }
+    }
+    
+    func prepareForCapture(mode: CaptureMode) async throws {
+        refreshCachedDeviceOrientation()
+        threadSafeState.setCaptureMode(mode)
+    }
+    
+    func finishCaptureSequence(mode: CaptureMode) async {
+        threadSafeState.setCaptureMode(.standard)
     }
     
     private func checkPermissions() {
@@ -61,6 +132,7 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
             }
             
             if self.session.canAddOutput(self.videoOutput) {
+                self.videoOutput.alwaysDiscardsLateVideoFrames = true
                 self.videoOutput.setSampleBufferDelegate(self, queue: self.sessionQueue)
                 self.session.addOutput(self.videoOutput)
             }
@@ -122,103 +194,126 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
     
     // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
     nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let cvBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let ciImage = CIImage(cvPixelBuffer: cvBuffer)
+        // Frame-drop backpressure gate so fast Vision segmentation never queues up stale frames
+        guard let (deviceOrientation, selectedBackdrop) = threadSafeState.tryBeginPreviewRender() else {
+            return
+        }
+        defer {
+            threadSafeState.endPreviewRender()
+        }
         
-        Task { @MainActor in
-            // Rotate to match UI orientation
-            let orientation = UIDevice.current.orientation
-            let imageOrientation: UIImage.Orientation
-            
-            switch orientation {
-            case .portrait: imageOrientation = .right
-            case .portraitUpsideDown: imageOrientation = .left
-            case .landscapeLeft: imageOrientation = .down
-            case .landscapeRight: imageOrientation = .up
-            default: imageOrientation = .right
-            }
-            
-            if let cgImage = self.ciContext.createCGImage(ciImage, from: ciImage.extent) {
-                let uiImage = UIImage(cgImage: cgImage, scale: 1.0, orientation: imageOrientation)
-                _previewStream.send(uiImage)
-            }
+        guard let cvBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let rawCI = CIImage(cvPixelBuffer: cvBuffer)
+        
+        // Pre-orient and horizontally mirror raw front-camera frame BEFORE compositing any foreground text/frame
+        let orientedMirroredCI = BackdropCompositorService.orientAndMirrorFrontCameraCIImage(
+            rawCI,
+            interfaceOrientation: deviceOrientation
+        )
+        
+        guard let rawCG = self.ciContext.createCGImage(orientedMirroredCI, from: orientedMirroredCI.extent) else {
+            return
+        }
+        
+        let finalCG: CGImage
+        if !selectedBackdrop.isNone {
+            finalCG = BackdropCompositorService.composite(
+                cgImage: rawCG,
+                backdrop: selectedBackdrop,
+                quality: .liveFast,
+                ciContext: self.ciContext
+            )
+        } else {
+            finalCG = rawCG
+        }
+        
+        let uiImage = UIImage(cgImage: finalCG, scale: 1.0, orientation: .up)
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            self.refreshCachedDeviceOrientation()
+            self._previewStream.send(uiImage)
         }
     }
     
     // MARK: - AVCapturePhotoCaptureDelegate
     nonisolated func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
         let photoData = photo.fileDataRepresentation()
+        let (selectedBackdrop, captureMode, cachedOrientation) = self.threadSafeState.snapshot()
+        let ciCtx = self.ciContext
         
-        Task { @MainActor in
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
             if let error = error {
-                photoContinuation?.resume(throwing: error)
-                photoContinuation = nil
+                await MainActor.run {
+                    self.photoContinuation?.resume(throwing: error)
+                    self.photoContinuation = nil
+                }
                 return
             }
             
-            guard let data = photoData, let image = UIImage(data: data) else {
-                photoContinuation?.resume(throwing: CameraError.invalidResponse)
-                photoContinuation = nil
+            guard let data = photoData,
+                  let image = UIImage(data: data),
+                  let rawCG = image.cgImage else {
+                await MainActor.run {
+                    self.photoContinuation?.resume(throwing: CameraError.invalidResponse)
+                    self.photoContinuation = nil
+                }
                 return
             }
             
-            // Determine orientation
-            let orientation = UIDevice.current.orientation
-            let imageOrientation: UIImage.Orientation
+            // Step 1: Orient and horizontally mirror raw front-camera frame into upright selfie coordinates
+            let rawCI = CIImage(cgImage: rawCG)
+            let orientedMirroredCI = BackdropCompositorService.orientAndMirrorFrontCameraCIImage(
+                rawCI,
+                interfaceOrientation: cachedOrientation
+            )
+            let uprightSubjectCG = ciCtx.createCGImage(orientedMirroredCI, from: orientedMirroredCI.extent) ?? rawCG
             
-            // For Front Camera, we want to MIRROR the result so it looks like the preview.
-            // Standard orientations are:
-            // Portrait -> Right
-            // LandscapeLeft -> Down
-            // LandscapeRight -> Up
-            //
-            // To Mirror:
-            // Portrait -> LeftMirrored (This flips it horizontally relative to Right)
-            // Actually, let's look at the standard mappings:
-            // .right -> .leftMirrored ? No, .right is 90 deg CW.
-            //
-            // Let's try explicit mapping for Front Camera Mirroring:
-            switch orientation {
-            case .portrait: imageOrientation = .leftMirrored
-            case .portraitUpsideDown: imageOrientation = .rightMirrored
-            case .landscapeLeft: imageOrientation = .downMirrored
-            case .landscapeRight: imageOrientation = .upMirrored
-            default: imageOrientation = .leftMirrored
+            // Step 2: Run single-pass subject auto-exposure BEFORE backdrop compositing
+            let exposedSubjectUI = SonyUSBCameraClient.autoExposeCapturedUIImage(
+                UIImage(cgImage: uprightSubjectCG, scale: 1.0, orientation: .up)
+            )
+            let exposedSubjectCG = exposedSubjectUI.cgImage ?? uprightSubjectCG
+            
+            // Step 3: For standard photo captures, apply high-accuracy backdrop/foreground compositing now.
+            // For GIF captures, leave the frame un-composited so GIFService.createGIF can equalize luminance
+            // across all 4 frames first and then composite the backdrop/foreground with .captureAccurate.
+            let finalCG: CGImage
+            if captureMode == .standard && !selectedBackdrop.isNone {
+                finalCG = BackdropCompositorService.composite(
+                    cgImage: exposedSubjectCG,
+                    backdrop: selectedBackdrop,
+                    quality: .captureAccurate,
+                    ciContext: ciCtx
+                )
+            } else {
+                finalCG = exposedSubjectCG
             }
             
-            // Create rotated image
-            // Note: We need to actually redraw the image to bake in the orientation if we want it to persist correctly
-            // across all viewers, or we can just set the orientation metadata.
-            // For simplicity and robustness, let's create a new UIImage with the correct orientation metadata
-            // and then save that.
-            
-            guard let cgImage = image.cgImage else {
-                photoContinuation?.resume(throwing: CameraError.invalidResponse)
-                photoContinuation = nil
+            let finalImage = UIImage(cgImage: finalCG, scale: 1.0, orientation: .up)
+            guard let finalData = finalImage.jpegData(compressionQuality: 0.92) else {
+                await MainActor.run {
+                    self.photoContinuation?.resume(throwing: CameraError.invalidResponse)
+                    self.photoContinuation = nil
+                }
                 return
             }
             
-            let rotatedImage = UIImage(cgImage: cgImage, scale: 1.0, orientation: imageOrientation)
-            
-            // Convert back to data (JPEG)
-            // We use a high quality compression
-            guard let finalData = rotatedImage.jpegData(compressionQuality: 0.9) else {
-                photoContinuation?.resume(throwing: CameraError.invalidResponse)
-                photoContinuation = nil
-                return
-            }
-            
-            // Save to temporary file
-            let filename = UUID().uuidString + ".jpg"
+            let filename = "local_" + UUID().uuidString + ".jpg"
             let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
             
             do {
-                try finalData.write(to: url)
-                photoContinuation?.resume(returning: [url.absoluteString])
+                try finalData.write(to: url, options: .atomic)
+                await MainActor.run {
+                    self.photoContinuation?.resume(returning: [url.absoluteString])
+                    self.photoContinuation = nil
+                }
             } catch {
-                photoContinuation?.resume(throwing: error)
+                await MainActor.run {
+                    self.photoContinuation?.resume(throwing: error)
+                    self.photoContinuation = nil
+                }
             }
-            photoContinuation = nil
         }
     }
 }

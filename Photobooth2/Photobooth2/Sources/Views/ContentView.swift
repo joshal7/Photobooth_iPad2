@@ -84,7 +84,7 @@ struct ContentView: View {
                             Text("TAP TO TAKE \(ConfigManager.shared.photoCount) PHOTO\(ConfigManager.shared.photoCount == 1 ? "" : "S")")
                                 .font(.system(size: 60, weight: .heavy))
                                 .foregroundColor(.white)
-                                .padding(.bottom, 50)
+                                .padding(.bottom, 105)
                                 .shadow(radius: 10)
                         }
                         .contentShape(Rectangle())
@@ -92,6 +92,10 @@ struct ContentView: View {
                             stateMachine.triggerCapture(mode: .standard)
                         }
                     }
+                    
+                    // Subtle Bottom Backdrop/Frame Pill & Expandable Carousel (with anti-misfire touch shield)
+                    BackdropPickerOverlayView()
+                        .zIndex(10)
                 }
                 
             case .capture:

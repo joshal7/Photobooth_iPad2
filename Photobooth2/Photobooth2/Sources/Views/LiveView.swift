@@ -14,8 +14,6 @@ struct LiveView: View {
                         .aspectRatio(contentMode: .fill)
                         .frame(width: geometry.size.width, height: geometry.size.height)
                         .clipped()
-                        // Mirror if using local camera for natural feel
-                        .scaleEffect(x: ConfigManager.shared.useLocalCamera ? -1 : 1, y: 1)
                 } else {
                     // Placeholder or loading indicator
                     ZStack {

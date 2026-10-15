@@ -21,8 +21,17 @@ final class GIFService: Sendable {
     ///   - imagePaths: List of file paths or file:// URL strings to source images.
     ///   - frameDuration: Duration for each frame in seconds.
     ///   - resolution: Unused legacy parameter (defaults to 1080p).
+    ///   - backdrop: Optional background/foreground preset to composite onto each equalized frame.
+    ///   - customMaskProvider: Optional custom person-mask provider for deterministic QA tests.
     /// - Returns: URL to the created GIF file, or nil if failed.
-    nonisolated static func createGIF(from imagePaths: [String], frameDuration: Double, resolution: Int = 0) -> URL? {
+    nonisolated static func createGIF(
+        from imagePaths: [String],
+        frameDuration: Double,
+        resolution: Int = 0,
+        backdrop: BackdropItem = .none,
+        additionalSearchDirectories: [URL] = [],
+        customMaskProvider: ((CIImage) -> CIImage?)? = nil
+    ) -> URL? {
         let fileProperties: [String: Any] = [
             kCGImagePropertyGIFDictionary as String: [
                 kCGImagePropertyGIFLoopCount as String: 0 // 0 = infinite loop
@@ -61,15 +70,9 @@ final class GIFService: Sendable {
                 
                 if height > 0 {
                     let aspectRatio = width / height
-                    // If Landscape (AR > 1), we must scale Width such that Height = targetHeight.
-                    // MaxPixelSize limits the longest edge.
                     if width >= height {
-                        // Landscape: Longest edge is Width.
-                        // Width = Height * AR
                         computedMaxPixelSize = Int(targetHeight * aspectRatio)
                     } else {
-                        // Portrait: Longest edge is Height.
-                        // Height = targetHeight
                         computedMaxPixelSize = Int(targetHeight)
                     }
                 }
@@ -102,11 +105,11 @@ final class GIFService: Sendable {
                 continue
             }
             
-            // Frames captured by SonyUSBCameraClient.takePicture() ("sony_<UUID>.jpg") are already
-            // normalized and single-pass auto-exposed once when written to /tmp. Do not auto-expose
-            // them a second time (which would double the gain and clip colors/highlights).
-            let isAlreadyNormalizedSonyFrame = url.lastPathComponent.hasPrefix("sony_")
-            let baseCG = isAlreadyNormalizedSonyFrame
+            // Frames captured by SonyUSBCameraClient.takePicture() ("sony_<UUID>.jpg") or LocalCameraClient
+            // ("local_<UUID>.jpg") are already normalized and single-pass auto-exposed once when written to /tmp.
+            let fileName = url.lastPathComponent
+            let isAlreadyNormalizedFrame = fileName.hasPrefix("sony_") || fileName.hasPrefix("local_")
+            let baseCG = isAlreadyNormalizedFrame
                 ? rawCG
                 : SonyUSBCameraClient.autoExposeCapturedCGImage(rawCG, ciContext: ciContext)
             let (luma, _) = SonyUSBCameraClient.measureSceneLuminance(baseCG)
@@ -117,9 +120,8 @@ final class GIFService: Sendable {
             return nil
         }
         
-        // Compute the median scene luminance across all frames in the GIF burst so that if any
-        // single frame (e.g. the 4th frame in Aperture Priority mode) varied slightly in exposure,
-        // all frames are smoothly equalized to the burst's median brightness.
+        // 1. Compute the median scene luminance across all raw subject frames in the GIF burst
+        //    so any single frame that drifted in exposure is equalized BEFORE the static backdrop/frame is applied.
         let sortedLumas = loadedFrames.map(\.luma).sorted()
         let mid = sortedLumas.count / 2
         let medianLuma: Double = (sortedLumas.count % 2 == 0 && sortedLumas.count >= 2)
@@ -127,10 +129,9 @@ final class GIFService: Sendable {
             : sortedLumas[mid]
         
         for entry in loadedFrames {
-            // Convert sRGB luminance ratio to linear stops (sRGB ~ linear^(1/2.2)) for CIExposureAdjust
             let deltaEV = 2.2 * log2(medianLuma / entry.luma)
             let clampedDeltaEV = min(max(deltaEV, -1.20), 1.20)
-            let finalCG: CGImage
+            let equalizedSubjectCG: CGImage
             if abs(clampedDeltaEV) > 0.04,
                let exposureFilter = CIFilter(name: "CIExposureAdjust") {
                 let ciInput = CIImage(cgImage: entry.cgImage)
@@ -138,13 +139,30 @@ final class GIFService: Sendable {
                 exposureFilter.setValue(clampedDeltaEV, forKey: kCIInputEVKey)
                 if let outCI = exposureFilter.outputImage,
                    let equalizedCG = ciContext.createCGImage(outCI, from: ciInput.extent) {
-                    finalCG = equalizedCG
+                    equalizedSubjectCG = equalizedCG
                 } else {
-                    finalCG = entry.cgImage
+                    equalizedSubjectCG = entry.cgImage
                 }
             } else {
-                finalCG = entry.cgImage
+                equalizedSubjectCG = entry.cgImage
             }
+            
+            // 2. Apply high-quality (.captureAccurate) Background / Foreground compositing AFTER subject equalization
+            //    so static backgrounds and foreground frames remain 100% constant in brightness across all frames.
+            let finalCG: CGImage
+            if !backdrop.isNone {
+                finalCG = BackdropCompositorService.composite(
+                    cgImage: equalizedSubjectCG,
+                    backdrop: backdrop,
+                    quality: .captureAccurate,
+                    ciContext: ciContext,
+                    additionalSearchDirectories: additionalSearchDirectories,
+                    customMaskProvider: customMaskProvider
+                )
+            } else {
+                finalCG = equalizedSubjectCG
+            }
+            
             CGImageDestinationAddImage(destination, finalCG, frameProperties as CFDictionary)
         }
         

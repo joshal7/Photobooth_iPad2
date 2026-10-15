@@ -877,6 +877,393 @@ enum AutomatedVerificationSuite {
             assertTrue(false, "Failed to verify low-light GIF non-duplication")
         }
         try? FileManager.default.removeItem(at: sonyLowURL)
+        
+        try runBackdropAndForegroundQATests(ciContext: ciContext)
+    }
+    
+    // MARK: - AI Background & Foreground Overlays + Mac Post-Event Workflow QA Suite
+    
+    private static func makeSolidOrBorderCGImage(
+        width: Int,
+        height: Int,
+        fillRGBA: (UInt8, UInt8, UInt8, UInt8),
+        borderThickness: Int = 0,
+        borderRGBA: (UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0),
+        rightMarkerRGBA: (UInt8, UInt8, UInt8, UInt8)? = nil
+    ) -> CGImage {
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            for x in 0..<width {
+                let isBorder = borderThickness > 0 && (
+                    x < borderThickness || x >= (width - borderThickness) ||
+                    y < borderThickness || y >= (height - borderThickness)
+                )
+                var c = isBorder ? borderRGBA : fillRGBA
+                if let marker = rightMarkerRGBA, x >= (width - 16) && x < (width - 4) && y >= (height / 2 - 8) && y < (height / 2 + 8) {
+                    c = marker
+                }
+                let idx = (y * width + x) * 4
+                // Premultiplied alpha
+                let a = UInt16(c.3)
+                pixels[idx]     = UInt8((UInt16(c.0) * a) / 255)
+                pixels[idx + 1] = UInt8((UInt16(c.1) * a) / 255)
+                pixels[idx + 2] = UInt8((UInt16(c.2) * a) / 255)
+                pixels[idx + 3] = c.3
+            }
+        }
+        let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: cs,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        return ctx.makeImage()!
+    }
+    
+    private static func encodePNG(_ cgImage: CGImage) -> Data {
+        let data = NSMutableData()
+        let dest = CGImageDestinationCreateWithData(data, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(dest, cgImage, nil)
+        CGImageDestinationFinalize(dest)
+        return data as Data
+    }
+    
+    private static func encodeJPEGWithEXIF(_ cgImage: CGImage, dateTimeOriginal: String) -> Data {
+        let data = NSMutableData()
+        let dest = CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil)!
+        let props: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: 0.95,
+            kCGImagePropertyExifDictionary: [
+                kCGImagePropertyExifDateTimeOriginal: dateTimeOriginal
+            ]
+        ]
+        CGImageDestinationAddImage(dest, cgImage, props as CFDictionary)
+        CGImageDestinationFinalize(dest)
+        return data as Data
+    }
+    
+    private static func runBackdropAndForegroundQATests(ciContext: CIContext) throws {
+        print("\n--- AI BACKDROP & FOREGROUND + MAC BATCH WORKFLOW QA SUITE ---")
+        let fm = FileManager.default
+        let qaRoot = fm.temporaryDirectory.appendingPathComponent("pb2_backdrop_qa_\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: qaRoot, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: qaRoot) }
+        
+        // 1. Zero-Code Folder Auto-Discovery & Pairing (`_bg` + `_fg` -> Combo)
+        let sampleBackdropsDir = qaRoot.appendingPathComponent("SampleBackdrops", isDirectory: true)
+        try fm.createDirectory(at: sampleBackdropsDir, withIntermediateDirectories: true)
+        
+        let redBgCG = makeSolidOrBorderCGImage(width: 120, height: 180, fillRGBA: (220, 30, 30, 255))
+        let greenFrameCG = makeSolidOrBorderCGImage(
+            width: 100,
+            height: 100,
+            fillRGBA: (0, 0, 0, 0),
+            borderThickness: 12,
+            borderRGBA: (20, 210, 60, 255)
+        )
+        try encodeJPEGWithEXIF(redBgCG, dateTimeOriginal: "2026:10:15 12:00:00")
+            .write(to: sampleBackdropsDir.appendingPathComponent("Eiffel Tower_bg.jpg"))
+        try encodeJPEGWithEXIF(redBgCG, dateTimeOriginal: "2026:10:15 12:00:00")
+            .write(to: sampleBackdropsDir.appendingPathComponent("Magazine_bg.jpg"))
+        try encodePNG(greenFrameCG)
+            .write(to: sampleBackdropsDir.appendingPathComponent("Magazine_fg.png"))
+        try encodePNG(greenFrameCG)
+            .write(to: sampleBackdropsDir.appendingPathComponent("Evans Bar Mitzvah_fg.png"))
+        
+        let discovered = BackdropManager.discoverBackdrops(in: [sampleBackdropsDir])
+        assertEqual(discovered.count, 3, "BackdropManager.discoverBackdrops auto-discovers and pairs 3 items from 4 files")
+        let eiffel = discovered.first(where: { $0.id == "eiffel_tower" })
+        let magazine = discovered.first(where: { $0.id == "magazine" })
+        let mitzvah = discovered.first(where: { $0.id == "evans_bar_mitzvah" })
+        assertTrue(
+            eiffel != nil && eiffel!.hasBackground && !eiffel!.hasForeground && eiffel!.displayName == "Eiffel Tower",
+            "Discovered Background-only item ('Eiffel Tower')"
+        )
+        assertTrue(
+            magazine != nil && magazine!.isCombo && magazine!.displayName == "Magazine",
+            "Discovered paired Background + Foreground Combo ('Magazine')"
+        )
+        assertTrue(
+            mitzvah != nil && !mitzvah!.hasBackground && mitzvah!.hasForeground && mitzvah!.displayName == "Evans Bar Mitzvah",
+            "Discovered Foreground-only transparent frame ('Evans Bar Mitzvah')"
+        )
+        
+        // 2. Resolution Auto-Scaling & 3-Layer Compositing Order (Background -> Subject -> Foreground)
+        let subjectCG = makeSolidOrBorderCGImage(width: 240, height: 160, fillRGBA: (30, 90, 230, 255))
+        let maskCG = makeSolidOrBorderCGImage(
+            width: 240,
+            height: 160,
+            fillRGBA: (255, 255, 255, 255),
+            borderThickness: 50,
+            borderRGBA: (0, 0, 0, 255)
+        )
+        let maskCI = CIImage(cgImage: maskCG)
+        
+        if let comboItem = magazine {
+            let compositedCG = BackdropCompositorService.composite(
+                cgImage: subjectCG,
+                backdrop: comboItem,
+                quality: .captureAccurate,
+                ciContext: ciContext,
+                additionalSearchDirectories: [sampleBackdropsDir],
+                customMaskProvider: { _ in maskCI }
+            )
+            assertEqual(compositedCG.width, 240, "Composited output preserves exact subject width (240)")
+            assertEqual(compositedCG.height, 160, "Composited output preserves exact subject height (160)")
+            
+            let borderPx = readPixelRGB(compositedCG, x: 4, y: 4)       // Outer frame border -> Green Foreground
+            let bgRingPx = readPixelRGB(compositedCG, x: 36, y: 36)     // Outside mask, inside frame -> Red Background
+            let centerPx = readPixelRGB(compositedCG, x: 120, y: 80)    // Inside mask, inside frame hole -> Blue Subject
+            
+            assertTrue(
+                borderPx.g > 170 && borderPx.r < 60 && borderPx.b < 90,
+                "Layer 3 (Foreground Frame) stretches to all 4 edges on top of background & subject: RGB=(\(borderPx.r),\(borderPx.g),\(borderPx.b))"
+            )
+            assertTrue(
+                bgRingPx.r > 170 && bgRingPx.g < 70 && bgRingPx.b < 70,
+                "Layer 1 (Background) replaces physical background outside person mask: RGB=(\(bgRingPx.r),\(bgRingPx.g),\(bgRingPx.b))"
+            )
+            assertTrue(
+                centerPx.b > 180 && centerPx.r < 70,
+                "Layer 2 (Segmented Subject) remains intact in front of background and behind frame hole: RGB=(\(centerPx.r),\(centerPx.g),\(centerPx.b))"
+            )
+        }
+        
+        // 3. Foreground-Only Fast Path (Bypasses Vision Segmentation Completely)
+        var maskProviderCallCount = 0
+        if let frameOnlyItem = mitzvah {
+            let framedCG = BackdropCompositorService.composite(
+                cgImage: subjectCG,
+                backdrop: frameOnlyItem,
+                quality: .captureAccurate,
+                ciContext: ciContext,
+                additionalSearchDirectories: [sampleBackdropsDir],
+                customMaskProvider: { _ in
+                    maskProviderCallCount += 1
+                    return maskCI
+                }
+            )
+            let edgePx = readPixelRGB(framedCG, x: 4, y: 4)
+            let centerPx = readPixelRGB(framedCG, x: 120, y: 80)
+            assertEqual(maskProviderCallCount, 0, "Foreground-only frame bypasses person segmentation (0 mask evaluations)")
+            assertTrue(
+                edgePx.g > 170 && centerPx.b > 180,
+                "Foreground-only frame composites green border over untouched blue subject"
+            )
+        }
+        
+        // 4. GIF 4-Frame Luminance Equalization BEFORE Backdrop Compositing (Zero Static Border Flicker)
+        var gifBurstURLs: [URL] = []
+        let rawLumas: [UInt8] = [102, 105, 104, 136]
+        for (idx, val) in rawLumas.enumerated() {
+            let rawFrameCG = makeSyntheticLightingScene(
+                bgRGB: (val, val, val),
+                subjectSkinRGB: (val &+ 10, val, val &- 8),
+                shirtRGB: (val &- 10, val, val &+ 8)
+            )
+            let url = qaRoot.appendingPathComponent("sony_gif_bd_\(idx).jpg")
+            try UIImage(cgImage: rawFrameCG).jpegData(compressionQuality: 0.92)!.write(to: url)
+            gifBurstURLs.append(url)
+        }
+        if let frameOnlyItem = mitzvah,
+           let compiledGIF = GIFService.createGIF(
+               from: gifBurstURLs.map(\.absoluteString),
+               frameDuration: 0.25,
+               resolution: 0,
+               backdrop: frameOnlyItem,
+               additionalSearchDirectories: [sampleBackdropsDir]
+           ),
+           let gifSrc = CGImageSourceCreateWithURL(compiledGIF as CFURL, nil) {
+            let count = CGImageSourceGetCount(gifSrc)
+            var borderGreens: [Int] = []
+            for i in 0..<count {
+                if let fCG = CGImageSourceCreateImageAtIndex(gifSrc, i, nil) {
+                    borderGreens.append(readPixelRGB(fCG, x: 2, y: 2).g)
+                }
+            }
+            if let minG = borderGreens.min(), let maxG = borderGreens.max() {
+                assertTrue(
+                    minG > 160 && (maxG - minG) <= 4,
+                    "GIFService equalizes raw frames BEFORE compositing foreground frame (border G spread across 4 frames = \(maxG - minG))"
+                )
+            }
+            try? fm.removeItem(at: compiledGIF)
+        } else {
+            assertTrue(false, "Failed to compile GIF with backdrop")
+        }
+        
+        // 5. Triple-Lock Manifest Matching (PTP 0x1008 Filename + EXIF Timestamp + 8x8 RGB Signature) & SmugMug-Clean Mac Batch Application
+        let partyFolder = qaRoot.appendingPathComponent("2026_Party", isDirectory: true)
+        try fm.createDirectory(at: partyFolder, withIntermediateDirectories: true)
+        
+        // Create 3 full-res SD card JPEGs:
+        // DSC00001.JPG & DSC00002.JPG have the EXACT SAME second ("2026:10:15 20:15:30") but different subject colors:
+        let dsc1Subject = makeSolidOrBorderCGImage(width: 200, height: 150, fillRGBA: (30, 80, 220, 255)) // Blue subject
+        let dsc2Subject = makeSolidOrBorderCGImage(width: 200, height: 150, fillRGBA: (220, 180, 30, 255)) // Gold subject
+        let dsc3Subject = makeSolidOrBorderCGImage(width: 200, height: 150, fillRGBA: (90, 90, 90, 255))   // Untouched photo (Original)
+        
+        let dsc1URL = partyFolder.appendingPathComponent("DSC00001.JPG")
+        let dsc2URL = partyFolder.appendingPathComponent("DSC00002.JPG")
+        let dsc3URL = partyFolder.appendingPathComponent("DSC00003.JPG")
+        
+        let dsc1Data = encodeJPEGWithEXIF(dsc1Subject, dateTimeOriginal: "2026:10:15 20:15:30")
+        let dsc2Data = encodeJPEGWithEXIF(dsc2Subject, dateTimeOriginal: "2026:10:15 20:15:30")
+        let dsc3Data = encodeJPEGWithEXIF(dsc3Subject, dateTimeOriginal: "2026:10:15 20:16:10")
+        try dsc1Data.write(to: dsc1URL)
+        try dsc2Data.write(to: dsc2URL)
+        try dsc3Data.write(to: dsc3URL)
+        
+        // Verify PTP 0x1008 ObjectInfo parser extracts "DSC00001.JPG"
+        var mockObjectInfo = Data(count: 52)
+        let fnameUTF16 = Array("DSC00001.JPG".utf16) + [0]
+        mockObjectInfo.append(UInt8(fnameUTF16.count))
+        for unit in fnameUTF16 {
+            mockObjectInfo.append(UInt8(unit & 0xFF))
+            mockObjectInfo.append(UInt8((unit >> 8) & 0xFF))
+        }
+        assertEqual(
+            BackdropCompositorService.parsePTPObjectInfoFilename(from: mockObjectInfo),
+            "DSC00001.JPG",
+            "PTP 0x1008 GetObjectInfo parser extracts exact camera filename ('DSC00001.JPG')"
+        )
+        
+        // Build manifest with 2 entries:
+        // Entry 1: Matches DSC00002.JPG via EXIF + 8x8 RGB signature (even without PTP filename) -> applies custom embedded Red Background
+        // Entry 2: Matches DSC00001.JPG via PTP filename + EXIF -> applies Green Foreground Frame
+        let customRedBgBytes = encodeJPEGWithEXIF(redBgCG, dateTimeOriginal: "2026:10:15 12:00:00")
+        let customGreenFgBytes = encodePNG(greenFrameCG)
+        
+        let entryForDSC2 = PhotoBackdropManifestEntry(
+            id: UUID(),
+            captureTimestampUTC: Date(),
+            ptpFilename: nil, // Force Lock 2 (EXIF) + Lock 3 (8x8 RGB Signature) disambiguation!
+            exifDateTimeOriginal: "2026:10:15 20:15:30",
+            exifSubSecOriginal: nil,
+            rgbSignature8x8: BackdropCompositorService.computeRGBSignature8x8(from: dsc2Subject),
+            backdropID: "custom_red",
+            backdropDisplayName: "Custom Red",
+            backgroundFilename: "CustomRed_bg.jpg",
+            foregroundFilename: nil,
+            foregroundFitMode: .stretchToEdges,
+            customBackgroundData: customRedBgBytes,
+            customForegroundData: nil
+        )
+        let entryForDSC1 = PhotoBackdropManifestEntry(
+            id: UUID(),
+            captureTimestampUTC: Date(),
+            ptpFilename: "DSC00001.JPG",
+            exifDateTimeOriginal: "2026:10:15 20:15:30",
+            exifSubSecOriginal: nil,
+            rgbSignature8x8: BackdropCompositorService.computeRGBSignature8x8(from: dsc1Subject),
+            backdropID: "evans_bar_mitzvah",
+            backdropDisplayName: "Evans Bar Mitzvah",
+            backgroundFilename: nil,
+            foregroundFilename: "Evans Bar Mitzvah_fg.png",
+            foregroundFitMode: .stretchToEdges,
+            customBackgroundData: nil,
+            customForegroundData: customGreenFgBytes
+        )
+        
+        let manifestDoc = BackdropManifestDocument(entries: [entryForDSC2, entryForDSC1])
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let manifestJSONURL = partyFolder.appendingPathComponent(BackdropManifestDocument.defaultFilename)
+        try encoder.encode(manifestDoc).write(to: manifestJSONURL)
+        
+        let report1 = try BackdropManifestStore.applyBackdropsToFolder(
+            folderURL: partyFolder,
+            customMaskProvider: { _ in maskCI }
+        )
+        assertEqual(report1.newlyAppliedCount, 2, "Mac batch processor applied backdrops to 2 matched full-res photos in-place")
+        assertEqual(report1.unmatchedCount, 0, "Mac batch processor had 0 unmatched manifest entries")
+        
+        // Check SmugMug-clean file count: ONLY DSC00001.JPG, DSC00002.JPG, DSC00003.JPG, and photobooth_backdrop_manifest.json exist!
+        let postFiles = try fm.contentsOfDirectory(at: partyFolder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+        let imageFiles = postFiles.filter { ["jpg", "jpeg", "png"].contains($0.pathExtension.lowercased()) }
+        assertEqual(imageFiles.count, 3, "SmugMug-safe: zero duplicate photos and zero extra .jpg/.png backdrop asset files created in folder")
+        
+        // Verify DSC00001.JPG got the Green Frame border, DSC00002.JPG got the Red Background, and DSC00003.JPG was untouched
+        if let src1 = CGImageSourceCreateWithURL(dsc1URL as CFURL, nil),
+           let cg1 = CGImageSourceCreateImageAtIndex(src1, 0, nil),
+           let src2 = CGImageSourceCreateWithURL(dsc2URL as CFURL, nil),
+           let cg2 = CGImageSourceCreateImageAtIndex(src2, 0, nil),
+           let src3 = CGImageSourceCreateWithURL(dsc3URL as CFURL, nil),
+           let cg3 = CGImageSourceCreateImageAtIndex(src3, 0, nil) {
+            let dsc1Border = readPixelRGB(cg1, x: 3, y: 3)
+            let dsc2Bg = readPixelRGB(cg2, x: 10, y: 10)
+            let dsc3Px = readPixelRGB(cg3, x: 10, y: 10)
+            assertTrue(dsc1Border.g > 170, "DSC00001.JPG received green foreground border in-place")
+            assertTrue(dsc2Bg.r > 170 && dsc2Bg.b < 60, "DSC00002.JPG (same-second shot) was disambiguated by 8x8 RGB signature and received red background")
+            assertTrue(abs(dsc3Px.r - 90) <= 5 && abs(dsc3Px.g - 90) <= 5, "DSC00003.JPG (Original / no backdrop) remained untouched")
+        }
+        
+        // Run a second time to verify idempotency (PB2_BACKDROP EXIF tag + appliedToFullRes flag)
+        let report2 = try BackdropManifestStore.applyBackdropsToFolder(
+            folderURL: partyFolder,
+            customMaskProvider: { _ in maskCI }
+        )
+        assertEqual(report2.newlyAppliedCount, 0, "Idempotency: re-running applyBackdropsToFolder applies 0 times")
+        assertEqual(report2.skippedAlreadyAppliedCount, 2, "Idempotency: re-running skips all 2 already-applied photos")
+        
+        // 6. Front-Camera Pre-Mirroring Orientation (Subject Mirrors Horizontally, Foreground Text Stays Un-Mirrored)
+        let rawFrontSubj = makeSolidOrBorderCGImage(
+            width: 160,
+            height: 120,
+            fillRGBA: (40, 40, 40, 255),
+            rightMarkerRGBA: (250, 250, 20, 255) // Bright yellow marker on right side of raw image
+        )
+        let asymmetricFrame = makeSolidOrBorderCGImage(
+            width: 160,
+            height: 120,
+            fillRGBA: (0, 0, 0, 0),
+            rightMarkerRGBA: (20, 240, 240, 255) // Cyan marker on right side of foreground frame
+        )
+        let mirroredSubjCG = BackdropCompositorService.mirrorCGImageHorizontally(rawFrontSubj, ciContext: ciContext)
+        let asymFrameURL = sampleBackdropsDir.appendingPathComponent("Asym_fg.png")
+        try encodePNG(asymmetricFrame).write(to: asymFrameURL)
+        let asymItem = BackdropItem(
+            id: "asym",
+            displayName: "Asym",
+            backgroundFilename: nil,
+            foregroundFilename: "Asym_fg.png",
+            foregroundFitMode: .stretchToEdges,
+            isBundled: true,
+            isEnabled: true
+        )
+        let preMirroredComposite = BackdropCompositorService.composite(
+            cgImage: mirroredSubjCG,
+            backdrop: asymItem,
+            quality: .captureAccurate,
+            ciContext: ciContext,
+            additionalSearchDirectories: [sampleBackdropsDir]
+        )
+        let leftSubjCheck = readPixelRGB(preMirroredComposite, x: 10, y: 60)   // Mirrored subject marker is now on the LEFT
+        let rightFrameCheck = readPixelRGB(preMirroredComposite, x: 150, y: 60) // Foreground frame marker stays on the RIGHT
+        assertTrue(
+            leftSubjCheck.r > 200 && leftSubjCheck.g > 200 && rightFrameCheck.g > 200 && rightFrameCheck.b > 200,
+            "iPad Front-Camera Pre-Mirroring: subject mirrors horizontally while foreground frame text stays un-reversed"
+        )
+        
+        // 7. Touch-Shield Hit-Testing Verification (`BackdropPickerOverlayView.isPointInsideShield`)
+        let iPadScreen = CGSize(width: 1194, height: 834)
+        let bottomCenterTap = CGPoint(x: 597, y: 800)
+        let slightlyMissedPillTap = CGPoint(x: 450, y: 745)
+        let upperGIFButtonTap = CGPoint(x: 597, y: 200)
+        let middlePhotoButtonTap = CGPoint(x: 597, y: 520)
+        assertTrue(
+            BackdropPickerOverlayView.isPointInsideShield(bottomCenterTap, screenSize: iPadScreen, isExpanded: false) &&
+            BackdropPickerOverlayView.isPointInsideShield(slightlyMissedPillTap, screenSize: iPadScreen, isExpanded: false),
+            "Bottom touch-absorbing shield intercepts taps on and around the collapsed backdrop pill"
+        )
+        assertTrue(
+            !BackdropPickerOverlayView.isPointInsideShield(upperGIFButtonTap, screenSize: iPadScreen, isExpanded: true) &&
+            !BackdropPickerOverlayView.isPointInsideShield(middlePhotoButtonTap, screenSize: iPadScreen, isExpanded: true),
+            "Upper GIF and middle Photo capture tap areas remain unobstructed when carousel is expanded"
+        )
     }
 }
 #endif

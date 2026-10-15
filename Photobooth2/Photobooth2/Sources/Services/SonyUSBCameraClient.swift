@@ -119,6 +119,28 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     private var controlAuthSummary: String = "pending"
     private var contentsAuthSummary: String = "pending"
     
+    private let backdropLock = NSLock()
+    private nonisolated(unsafe) var currentBackdrop: BackdropItem = .none
+    private nonisolated(unsafe) var activeCaptureMode: CaptureMode = .standard
+    
+    nonisolated func updateSelectedBackdrop(_ backdrop: BackdropItem) {
+        backdropLock.lock()
+        currentBackdrop = backdrop
+        backdropLock.unlock()
+    }
+    
+    nonisolated private func setActiveCaptureMode(_ mode: CaptureMode) {
+        backdropLock.lock()
+        activeCaptureMode = mode
+        backdropLock.unlock()
+    }
+    
+    nonisolated private func currentBackdropAndMode() -> (BackdropItem, CaptureMode) {
+        backdropLock.lock()
+        defer { backdropLock.unlock() }
+        return (currentBackdrop, activeCaptureMode)
+    }
+    
     /// Continuously monitors USB discovery every 2.5s while disconnected so that if the camera was already
     /// plugged in when the app was sideloaded/launched (while iPadOS's `icdd` daemon is still releasing the
     /// prior process's USB session), it automatically re-polls and connects without needing a physical replug.
@@ -430,6 +452,8 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     // MARK: - Dual Storage Routing & Zero-Lag MF Shutter
     
     func prepareForCapture(mode: CaptureMode) async throws {
+        setActiveCaptureMode(mode)
+        
         guard let transport = ptpTransport, isConnected else {
             throw CameraError.connectionFailed
         }
@@ -462,6 +486,8 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     }
     
     func finishCaptureSequence(mode: CaptureMode) async {
+        setActiveCaptureMode(.standard)
+        
         guard let transport = ptpTransport else { return }
         await commandQueue.beginCaptureScope()
         if mode == .gif {
@@ -522,16 +548,18 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     private func downloadCapturedJPEGFromRAM(
         initialObjState: UInt16,
         using transport: PTPTransport
-    ) async throws -> Data? {
+    ) async throws -> (jpegData: Data, objectInfoData: Data?)? {
         var bestJPEGData: Data? = nil
+        var bestObjectInfoData: Data? = nil
         var currentObjState = initialObjState
         var safetyCount = 0
         
         while currentObjState >= 0x8000, safetyCount < 4 {
             safetyCount += 1
             
-            // Query object info first (required by Sony firmware before GetObject on 0xFFFFC001)
-            _ = try? await commandQueue.execute(
+            // Query object info first (required by Sony firmware before GetObject on 0xFFFFC001,
+            // and provides the ISO 15740 ObjectInfo dataset containing the camera filename for Lock 1)
+            let objInfoResult = try? await commandQueue.execute(
                 on: transport,
                 opcode: .getObjectInfo,
                 params: [SonyPTPHostHandle.capturedImageRAM.rawValue]
@@ -548,9 +576,11 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 if let extractedJPEG = SonyPTPPacket.extractCapturedJPEG(from: objData) {
                     if startsWithJPEG || bestJPEGData == nil {
                         bestJPEGData = extractedJPEG
+                        bestObjectInfoData = objInfoResult?.0
                     }
                 } else if bestJPEGData == nil {
                     bestJPEGData = objData
+                    bestObjectInfoData = objInfoResult?.0
                 }
             } else {
                 break
@@ -566,7 +596,8 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             }
         }
         
-        return bestJPEGData
+        guard let finalJPEG = bestJPEGData else { return nil }
+        return (finalJPEG, bestObjectInfoData)
     }
     
     func takePicture() async throws -> [String] {
@@ -583,8 +614,6 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             await drainStaleRAMObjectIfNeeded(using: transport)
             
             // 2. Trigger shutter with S1 settle + S2 hold until capture starts (0xD215 > 0)
-            //    120ms S1 half-press settle allows the Sony sensor's Auto-ISO / AE meter to converge
-            //    when transitioning from Setting Effect OFF Live View to actual exposure.
             var observedObjState = try await triggerShutterAndConfirmStart(
                 using: transport,
                 s1SettleNs: 120_000_000,  // 120ms S1 half-press settle for Auto-ISO / AE convergence
@@ -593,20 +622,23 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             )
             
             // 3. Poll 0xD215 (ObjectInMemory):
-            //    - 0x0000: shutter hasn't fired yet
-            //    - 0x0001..<0x8000: shutter HAS fired; exposure/encoding in progress
-            //    - >= 0x8000 (0x8001+): image ready in RAM at 0xFFFFC001
             let startWait = Date()
             let maxExposureWaitSec: TimeInterval = 10.0
             var didRetriggerShutter = false
             
             while Date().timeIntervalSince(startWait) < maxExposureWaitSec {
                 if observedObjState >= 0x8000 {
-                    if let rawJPEGData = try await downloadCapturedJPEGFromRAM(
+                    if let downloaded = try await downloadCapturedJPEGFromRAM(
                         initialObjState: observedObjState,
                         using: transport
                     ) {
-                        let normalizedData = Self.normalizeAndAutoExposeCapturedJPEG(rawJPEGData)
+                        let (backdrop, mode) = currentBackdropAndMode()
+                        let normalizedData = Self.normalizeAndAutoExposeCapturedJPEG(
+                            downloaded.jpegData,
+                            objectInfoData: downloaded.objectInfoData,
+                            backdrop: backdrop,
+                            captureMode: mode
+                        )
                         let tempURL = FileManager.default.temporaryDirectory
                             .appendingPathComponent("sony_\(UUID().uuidString).jpg")
                         try normalizedData.write(to: tempURL, options: .atomic)
@@ -616,8 +648,6 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 }
                 
                 // Fast re-trigger: if 0.40s has passed since S2 release and 0xD215 is STILL 0x0000
-                // (meaning the camera ignored the first shutter pulse because it was busy with SD card / Live View),
-                // re-pulse S1/S2 immediately instead of waiting 6+ seconds to time out!
                 if !didRetriggerShutter,
                    observedObjState == 0,
                    Date().timeIntervalSince(startWait) >= 0.40 {
@@ -646,17 +676,70 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         }
     }
     
-    /// Re-encodes the downloaded 2MP Sony transfer payload as a clean, standard iOS JFIF JPEG
-    /// (stripping Sony MPF multi-stream trailers that stall iOS `sharingd` / AirDrop preview generation)
-    /// and automatically exposes dark or dim captures for Photo Review, AirDrop, and GIF creation.
-    nonisolated private static func normalizeAndAutoExposeCapturedJPEG(_ rawData: Data) -> Data {
+    /// Re-encodes the downloaded 2MP Sony transfer payload as a clean, standard iOS JFIF JPEG:
+    /// 1. Auto-exposes dark or dim captures on the raw subject image FIRST.
+    /// 2. In `.standard` Photo Mode with an active backdrop:
+    ///    - Records the Triple-Lock metadata (`ptpFilename`, EXIF `DateTimeOriginal`, `8x8` RGB signature) in `BackdropManifestStore`.
+    ///    - Composites the Background + Foreground with `.captureAccurate` segmentation.
+    /// 3. In `.gif` Mode, saves the raw auto-exposed frame so `GIFService.createGIF` can equalize burst luminance
+    ///    first before applying `.captureAccurate` backdrop compositing (preventing any border/backdrop brightness flicker).
+    nonisolated private static func normalizeAndAutoExposeCapturedJPEG(
+        _ rawData: Data,
+        objectInfoData: Data? = nil,
+        backdrop: BackdropItem = .none,
+        captureMode: CaptureMode = .standard
+    ) -> Data {
         return autoreleasepool {
             let extracted = SonyPTPPacket.extractCapturedJPEG(from: rawData) ?? rawData
-            guard let uiImage = UIImage(data: extracted) else {
+            
+            // Decode with kCGImageSourceCreateThumbnailWithTransform: true so EXIF orientation is baked upright
+            // before computing the 8x8 RGB signature, auto-exposing, and compositing foreground frames.
+            let uprightRawCG: CGImage? = {
+                if let src = CGImageSourceCreateWithData(extracted as CFData, nil) {
+                    let opts: [CFString: Any] = [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceShouldCache: false
+                    ]
+                    if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
+                        return cg
+                    }
+                }
+                return UIImage(data: extracted)?.cgImage
+            }()
+            
+            guard let rawCG = uprightRawCG else {
                 return extracted
             }
+            
             let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
-            let processedImage = autoExposeCapturedUIImage(uiImage, ciContext: ciContext)
+            
+            // Record Triple-Lock manifest entry using `rawCG` (upright, pre-exposure boost) so its 8x8 RGB signature
+            // matches the un-boosted SD card DSC0xxxx.JPG file even in dim lighting conditions.
+            if captureMode == .standard && !backdrop.isNone {
+                BackdropManifestStore.shared.recordCapture(
+                    uncompositedCGImage: rawCG,
+                    rawJPEGData: extracted,
+                    ptpObjectInfoData: objectInfoData,
+                    backdrop: backdrop
+                )
+            }
+            
+            let exposedCG = autoExposeCapturedCGImage(rawCG, ciContext: ciContext)
+            
+            let finalCG: CGImage
+            if captureMode == .standard && !backdrop.isNone {
+                finalCG = BackdropCompositorService.composite(
+                    cgImage: exposedCG,
+                    backdrop: backdrop,
+                    quality: .captureAccurate,
+                    ciContext: ciContext
+                )
+            } else {
+                finalCG = exposedCG
+            }
+            
+            let processedImage = UIImage(cgImage: finalCG, scale: 1.0, orientation: .up)
             return processedImage.jpegData(compressionQuality: 0.92) ?? extracted
         }
     }
@@ -674,11 +757,6 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     }
     
     /// Auto-exposes a captured `CGImage` in a single, continuous pass:
-    /// - Very dark manual captures (Mode "1" / ISO 200 without flash) receive up to +3.8 EV + gentle shadow
-    ///   & gamma lift with color-saturation preservation so they brighten cleanly without clipping into
-    ///   1-bit black-and-white JPEG macroblocks.
-    /// - Slightly dim Auto-ISO 12800 captures receive a gentle +0.4..+0.8 EV lift with 90th-percentile
-    ///   highlight protection so faces and walls never blow out.
     nonisolated static func autoExposeCapturedCGImage(_ cgImage: CGImage, ciContext: CIContext) -> CGImage {
         let (boostedCG, _) = adjustCGImageExposureIfNeeded(
             cgImage,
@@ -720,12 +798,24 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                     highPriority: false
                 ), rc == SonyPTPResponseCode.ok.rawValue {
                     
+                    let (activeBackdrop, _) = self.currentBackdropAndMode()
                     let result: (UIImage, Double)? = autoreleasepool {
                         guard let jpegData = SonyPTPPacket.extractLiveViewJPEG(from: payload),
                               let rawImage = UIImage(data: jpegData) else {
                             return nil
                         }
-                        return Self.autoExposeLiveViewIfNeeded(rawImage, ciContext: ciContext)
+                        let (exposedImage, rawLuma) = Self.autoExposeLiveViewIfNeeded(rawImage, ciContext: ciContext)
+                        guard !activeBackdrop.isNone, let exposedCG = exposedImage.cgImage else {
+                            return (exposedImage, rawLuma)
+                        }
+                        let compositedCG = BackdropCompositorService.composite(
+                            cgImage: exposedCG,
+                            backdrop: activeBackdrop,
+                            quality: .liveFast,
+                            ciContext: ciContext
+                        )
+                        let finalUI = UIImage(cgImage: compositedCG, scale: exposedImage.scale, orientation: exposedImage.imageOrientation)
+                        return (finalUI, rawLuma)
                     }
                     
                     if let (image, meanLuma) = result {

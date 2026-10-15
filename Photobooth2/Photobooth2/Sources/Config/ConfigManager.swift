@@ -31,6 +31,9 @@ class ConfigManager: ObservableObject {
     @Published var isQRCodeEnabled: Bool { didSet { save() } }
     @Published var qrCodeURLString: String { didSet { save() } }
     @Published var daysUntilPhotosAvailable: Int { didSet { save() } }
+    
+    // Backdrop / Foreground Frame Configuration
+    @Published var defaultBackdropID: String { didSet { save() } }
 
     private init() {
         self.initialCountdownSec = UserDefaults.standard.object(forKey: "initialCountdownSec") as? Int ?? 5
@@ -57,6 +60,7 @@ class ConfigManager: ObservableObject {
         let currentYear = Calendar.current.component(.year, from: Date())
         self.qrCodeURLString = UserDefaults.standard.string(forKey: "qrCodeURLString") ?? "https://www.joshal.com/\(currentYear)"
         self.daysUntilPhotosAvailable = UserDefaults.standard.object(forKey: "daysUntilPhotosAvailable") as? Int ?? 2
+        self.defaultBackdropID = UserDefaults.standard.string(forKey: "defaultBackdropID") ?? BackdropItem.noneID
     }
     
     func save() {
@@ -80,6 +84,7 @@ class ConfigManager: ObservableObject {
         UserDefaults.standard.set(isQRCodeEnabled, forKey: "isQRCodeEnabled_v2")
         UserDefaults.standard.set(qrCodeURLString, forKey: "qrCodeURLString")
         UserDefaults.standard.set(daysUntilPhotosAvailable, forKey: "daysUntilPhotosAvailable")
+        UserDefaults.standard.set(defaultBackdropID, forKey: "defaultBackdropID")
     }
     
     func resetToDefaults() {
@@ -104,6 +109,7 @@ class ConfigManager: ObservableObject {
         let currentYear = Calendar.current.component(.year, from: Date())
         self.qrCodeURLString = "https://www.joshal.com/\(currentYear)"
         self.daysUntilPhotosAvailable = 2
+        self.defaultBackdropID = BackdropItem.noneID
         save()
     }
 }

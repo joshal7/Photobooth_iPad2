@@ -1,9 +1,22 @@
 import SwiftUI
+import PhotosUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @ObservedObject var config = ConfigManager.shared
+    @ObservedObject var backdropManager = BackdropManager.shared
+    @ObservedObject var manifestStore = BackdropManifestStore.shared
     @Environment(\.presentationMode) var presentationMode
     @EnvironmentObject var stateMachine: StateMachine
+    
+    @State private var showAddCustomBackdropSheet = false
+    @State private var showEventFolderImporter = false
+    @State private var isBatchApplying = false
+    @State private var batchProgressText: String = ""
+    @State private var batchProgressFraction: Double = 0.0
+    @State private var batchTask: Task<Void, Never>? = nil
+    @State private var batchReportAlert: BatchApplyReport? = nil
+    @State private var statusAlertMessage: String? = nil
     
     var body: some View {
         NavigationView {
@@ -47,6 +60,176 @@ struct SettingsView: View {
                     }
                 }
                 
+                Section(
+                    header: Text("Backdrops & Frames"),
+                    footer: Text("Drop *_bg.jpg and/or *_fg.png files into Photobooth2/Backdrops/ in Finder and build in Xcode, or add custom backdrops directly below. During AirDrop, only .gif files and photobooth_backdrop_manifest.json are sent so SmugMug never uploads extra asset images.")
+                ) {
+                    Picker("Default at Session Start", selection: $config.defaultBackdropID) {
+                        ForEach(backdropManager.enabledBackdrops) { item in
+                            Text(item.isNone ? "Original (Real Room)" : item.displayName)
+                                .tag(item.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    
+                    let configurableItems = backdropManager.availableBackdrops.filter { !$0.isNone }
+                    if configurableItems.isEmpty {
+                        Text("No backdrops found. Add *_bg.jpg or *_fg.png files to Backdrops/ or tap '+ Add Custom Backdrop / Frame' below.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        ForEach(configurableItems) { item in
+                            HStack(spacing: 12) {
+                                if let thumb = backdropManager.thumbnail(for: item) {
+                                    Image(uiImage: thumb)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fill)
+                                        .frame(width: 54, height: 36)
+                                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                                .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                                        )
+                                }
+                                
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack(spacing: 6) {
+                                        Text(item.displayName)
+                                            .font(.subheadline)
+                                            .fontWeight(.medium)
+                                        if item.isCustom {
+                                            Text("CUSTOM")
+                                                .font(.system(size: 9, weight: .bold))
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 1)
+                                                .background(Capsule().fill(Color.blue.opacity(0.2)))
+                                                .foregroundColor(.blue)
+                                        }
+                                    }
+                                    Text(layerDescription(for: item))
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                                
+                                Spacer()
+                                
+                                if item.hasForeground {
+                                    Menu {
+                                        ForEach(ForegroundFitMode.allCases, id: \.self) { fitMode in
+                                            Button(action: {
+                                                backdropManager.setForegroundFitMode(id: item.id, mode: fitMode)
+                                            }) {
+                                                HStack {
+                                                    Text(fitMode.displayName)
+                                                    if item.foregroundFitMode == fitMode {
+                                                        Image(systemName: "checkmark")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } label: {
+                                        Image(systemName: "aspectratio")
+                                            .font(.system(size: 15))
+                                            .foregroundColor(.secondary)
+                                            .padding(.horizontal, 4)
+                                    }
+                                }
+                                
+                                if item.isCustom {
+                                    Button(role: .destructive, action: {
+                                        backdropManager.deleteCustomBackdrop(id: item.id)
+                                    }) {
+                                        Image(systemName: "trash")
+                                            .font(.system(size: 14))
+                                            .foregroundColor(.red)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .padding(.trailing, 4)
+                                }
+                                
+                                Toggle("", isOn: Binding(
+                                    get: { item.isEnabled },
+                                    set: { newVal in
+                                        backdropManager.setBackdropEnabled(id: item.id, isEnabled: newVal)
+                                    }
+                                ))
+                                .labelsHidden()
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                    
+                    Button(action: {
+                        showAddCustomBackdropSheet = true
+                    }) {
+                        HStack {
+                            Image(systemName: "plus.circle.fill")
+                            Text("Add Custom Backdrop / Frame...")
+                        }
+                    }
+                    
+                    Button(action: {
+                        backdropManager.reloadBackdrops()
+                    }) {
+                        HStack {
+                            Image(systemName: "arrow.clockwise")
+                            Text("Rescan Backdrops Folder")
+                        }
+                    }
+                }
+                
+                Section(
+                    header: Text("Post-Event Mac Backdrop Workflow"),
+                    footer: Text("1. Tap 'AirDrop GIFs + Backdrop Manifest' on iPad to send GIFs and photobooth_backdrop_manifest.json to your Mac.\n2. Drag them into your event photo folder (with your SD card DSC0xxxx.JPG files).\n3. Open Photobooth2 on your Mac and tap 'Apply Backdrops to Event Folder...' to update matching full-res photos in-place.")
+                ) {
+                    Button(action: {
+                        bulkAirDropGIFs()
+                    }) {
+                        HStack {
+                            Image(systemName: "square.and.arrow.up")
+                            Text("AirDrop GIFs + Backdrop Manifest (\(manifestStore.entries.count) photo records)")
+                        }
+                    }
+                    
+                    if isBatchApplying {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                ProgressView()
+                                    .padding(.trailing, 6)
+                                Text(batchProgressText)
+                                    .font(.subheadline)
+                                Spacer()
+                                Button("Cancel", role: .destructive) {
+                                    batchTask?.cancel()
+                                }
+                            }
+                            ProgressView(value: batchProgressFraction)
+                        }
+                        .padding(.vertical, 4)
+                    } else {
+                        Button(action: {
+                            showEventFolderImporter = true
+                        }) {
+                            HStack {
+                                Image(systemName: "wand.and.stars")
+                                Text("Apply Backdrops to Event Folder...")
+                                    .fontWeight(.semibold)
+                            }
+                        }
+                    }
+                    
+                    if !manifestStore.entries.isEmpty {
+                        Button(role: .destructive, action: {
+                            manifestStore.clearManifest()
+                        }) {
+                            HStack {
+                                Image(systemName: "trash")
+                                Text("Clear Saved Backdrop Manifest (\(manifestStore.entries.count) entries)")
+                            }
+                        }
+                    }
+                }
+                
                 Section(header: Text("Timers & Counts")) {
                     Stepper("Initial Countdown: \(config.initialCountdownSec)s", value: $config.initialCountdownSec, in: 1...10)
                     Stepper("Between Shots: \(config.interShotCountdownSec)s", value: $config.interShotCountdownSec, in: 1...10)
@@ -78,13 +261,13 @@ struct SettingsView: View {
                         // GIF Retrieval Window
                         Stepper("GIF Retrieval Window: \(config.gifRetrievalWindowHours) hrs", value: $config.gifRetrievalWindowHours, in: 1...72)
                         
-                        // Bulk AirDrop Button
+                        // Bulk AirDrop Button (GIFs + Manifest JSON)
                         Button(action: {
                             bulkAirDropGIFs()
                         }) {
                             HStack {
                                 Image(systemName: "square.and.arrow.up")
-                                Text("Airdrop GIFs")
+                                Text("AirDrop GIFs + Backdrop Manifest")
                             }
                         }
                     }
@@ -186,6 +369,78 @@ struct SettingsView: View {
                     }
                 }
             }
+            .sheet(isPresented: $showAddCustomBackdropSheet) {
+                AddCustomBackdropSheet()
+            }
+            .fileImporter(
+                isPresented: $showEventFolderImporter,
+                allowedContentTypes: [.folder],
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    if let folderURL = urls.first {
+                        runBatchApply(on: folderURL)
+                    }
+                case .failure(let error):
+                    statusAlertMessage = "Folder selection failed: \(error.localizedDescription)"
+                }
+            }
+            .alert(
+                "Batch Backdrop Processing Complete",
+                isPresented: Binding(
+                    get: { batchReportAlert != nil },
+                    set: { if !$0 { batchReportAlert = nil } }
+                ),
+                presenting: batchReportAlert
+            ) { _ in
+                Button("OK", role: .cancel) { batchReportAlert = nil }
+            } message: { report in
+                Text(report.summaryMessage)
+            }
+            .alert(
+                "Notice",
+                isPresented: Binding(
+                    get: { statusAlertMessage != nil },
+                    set: { if !$0 { statusAlertMessage = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) { statusAlertMessage = nil }
+            } message: {
+                Text(statusAlertMessage ?? "")
+            }
+        }
+    }
+    
+    private func layerDescription(for item: BackdropItem) -> String {
+        if item.isCombo {
+            return "Background + Foreground Combo (\(item.foregroundFitMode.displayName))"
+        } else if item.hasForeground {
+            return "Foreground Frame (\(item.foregroundFitMode.displayName))"
+        } else {
+            return "Background Image (Aspect Fill)"
+        }
+    }
+    
+    private func runBatchApply(on folderURL: URL) {
+        isBatchApplying = true
+        batchProgressFraction = 0.0
+        batchProgressText = "Scanning folder..."
+        
+        batchTask = Task {
+            let report = await BackdropManifestStore.shared.applyBackdropsToFolder(
+                folderURL: folderURL
+            ) { completed, total, filename in
+                Task { @MainActor in
+                    self.batchProgressFraction = total > 0 ? Double(completed) / Double(total) : 0.0
+                    self.batchProgressText = "Applying \(completed)/\(total): \(filename)"
+                }
+            }
+            await MainActor.run {
+                self.isBatchApplying = false
+                self.batchTask = nil
+                self.batchReportAlert = report
+            }
         }
     }
     
@@ -193,18 +448,22 @@ struct SettingsView: View {
         let hours = config.gifRetrievalWindowHours
         
         Task {
-            do {
-                let urls = try await GIFRetrievalService.fetchRecentGIFs(hours: hours)
-                
-                await MainActor.run {
-                    if urls.isEmpty {
-                        print("No GIFs found in the last \(hours) hours.")
-                    } else {
-                        presentShareSheet(items: urls)
-                    }
+            let manifestURL = BackdropManifestStore.shared.exportAirDropManifestFile()
+            var shareItems: [Any] = []
+            
+            if let recentGIFs = try? await GIFRetrievalService.fetchRecentGIFs(hours: hours) {
+                shareItems.append(contentsOf: recentGIFs)
+            }
+            if let manifestURL = manifestURL {
+                shareItems.append(manifestURL)
+            }
+            
+            await MainActor.run {
+                if shareItems.isEmpty {
+                    statusAlertMessage = "No GIFs or backdrop manifest records found in the last \(hours) hours."
+                } else {
+                    presentShareSheet(items: shareItems)
                 }
-            } catch {
-                print("Failed to retrieve GIFs: \(error)")
             }
         }
     }
@@ -232,5 +491,172 @@ struct SettingsView: View {
         }
         
         topController.present(activityVC, animated: true)
+    }
+}
+
+// MARK: - Add Custom Backdrop / Frame Sheet
+
+struct AddCustomBackdropSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var displayName: String = ""
+    @State private var backgroundData: Data? = nil
+    @State private var backgroundPreview: UIImage? = nil
+    @State private var foregroundData: Data? = nil
+    @State private var foregroundPreview: UIImage? = nil
+    @State private var showBackgroundFileImporter = false
+    @State private var showForegroundFileImporter = false
+    @State private var selectedBgPhotoItem: PhotosPickerItem? = nil
+    @State private var selectedFgPhotoItem: PhotosPickerItem? = nil
+    
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("Backdrop Name")) {
+                    TextField("e.g. Evan's Bar Mitzvah or Beach Sunset", text: $displayName)
+                }
+                
+                Section(
+                    header: Text("1. Background Image (Optional)"),
+                    footer: Text("Replaces the physical background behind guests using AI person segmentation. Auto-scaled to fill.")
+                ) {
+                    if let preview = backgroundPreview {
+                        HStack {
+                            Image(uiImage: preview)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                                .frame(width: 90, height: 60)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            Text("Background Selected")
+                                .font(.subheadline)
+                            Spacer()
+                            Button("Remove", role: .destructive) {
+                                backgroundData = nil
+                                backgroundPreview = nil
+                                selectedBgPhotoItem = nil
+                            }
+                        }
+                    }
+                    
+                    PhotosPicker(selection: $selectedBgPhotoItem, matching: .images) {
+                        Label("Choose Background from Photos...", systemImage: "photo.on.rectangle")
+                    }
+                    .onChange(of: selectedBgPhotoItem) { _, newItem in
+                        guard let newItem = newItem else { return }
+                        Task {
+                            if let data = try? await newItem.loadTransferable(type: Data.self),
+                               let uiImg = UIImage(data: data) {
+                                await MainActor.run {
+                                    self.backgroundData = uiImg.jpegData(compressionQuality: 0.92) ?? data
+                                    self.backgroundPreview = uiImg
+                                }
+                            }
+                        }
+                    }
+                    
+                    Button(action: {
+                        showBackgroundFileImporter = true
+                    }) {
+                        Label("Choose Background from Files...", systemImage: "folder")
+                    }
+                }
+                
+                Section(
+                    header: Text("2. Foreground Frame PNG (Optional)"),
+                    footer: Text("Transparent PNG border/logo rendered in front of guests. Auto-stretched to all 4 edges.")
+                ) {
+                    if let preview = foregroundPreview {
+                        HStack {
+                            Image(uiImage: preview)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 90, height: 60)
+                                .background(Color.gray.opacity(0.2))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                            Text("Foreground PNG Selected")
+                                .font(.subheadline)
+                            Spacer()
+                            Button("Remove", role: .destructive) {
+                                foregroundData = nil
+                                foregroundPreview = nil
+                                selectedFgPhotoItem = nil
+                            }
+                        }
+                    }
+                    
+                    Button(action: {
+                        showForegroundFileImporter = true
+                    }) {
+                        Label("Choose Transparent PNG from Files...", systemImage: "folder.badge.plus")
+                    }
+                    
+                    PhotosPicker(selection: $selectedFgPhotoItem, matching: .images) {
+                        Label("Choose Foreground from Photos...", systemImage: "photo")
+                    }
+                    .onChange(of: selectedFgPhotoItem) { _, newItem in
+                        guard let newItem = newItem else { return }
+                        Task {
+                            if let data = try? await newItem.loadTransferable(type: Data.self),
+                               let uiImg = UIImage(data: data) {
+                                await MainActor.run {
+                                    self.foregroundData = uiImg.pngData() ?? data
+                                    self.foregroundPreview = uiImg
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Add Backdrop / Frame")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Save") {
+                        _ = BackdropManager.shared.addCustomBackdrop(
+                            displayName: displayName,
+                            backgroundData: backgroundData,
+                            foregroundPNGData: foregroundData
+                        )
+                        dismiss()
+                    }
+                    .disabled(backgroundData == nil && foregroundData == nil)
+                }
+            }
+            .fileImporter(
+                isPresented: $showBackgroundFileImporter,
+                allowedContentTypes: [.image],
+                allowsMultipleSelection: false
+            ) { result in
+                if case .success(let urls) = result, let url = urls.first {
+                    let hasScope = url.startAccessingSecurityScopedResource()
+                    defer { if hasScope { url.stopAccessingSecurityScopedResource() } }
+                    if let data = try? Data(contentsOf: url), let img = UIImage(data: data) {
+                        backgroundData = img.jpegData(compressionQuality: 0.92) ?? data
+                        backgroundPreview = img
+                        if displayName.isEmpty {
+                            displayName = url.deletingPathExtension().lastPathComponent
+                        }
+                    }
+                }
+            }
+            .fileImporter(
+                isPresented: $showForegroundFileImporter,
+                allowedContentTypes: [.png, .image],
+                allowsMultipleSelection: false
+            ) { result in
+                if case .success(let urls) = result, let url = urls.first {
+                    let hasScope = url.startAccessingSecurityScopedResource()
+                    defer { if hasScope { url.stopAccessingSecurityScopedResource() } }
+                    if let data = try? Data(contentsOf: url), let img = UIImage(data: data) {
+                        foregroundData = img.pngData() ?? data
+                        foregroundPreview = img
+                        if displayName.isEmpty {
+                            displayName = url.deletingPathExtension().lastPathComponent
+                        }
+                    }
+                }
+            }
+        }
     }
 }

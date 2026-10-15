@@ -14,7 +14,7 @@ enum AppState: Equatable {
     case airDrop(images: [String])
 }
 
-enum CaptureMode: Equatable {
+nonisolated enum CaptureMode: Equatable, Sendable {
     case standard
     case gif
 }
@@ -37,6 +37,12 @@ class StateMachine: ObservableObject {
     @Published var isCameraConnected: Bool = false
     @Published var cameraStatusMessage: String? = nil
     @Published var lowStorageWarning: String? = nil
+    @Published var selectedBackdrop: BackdropItem = .none {
+        didSet {
+            cameraService.updateSelectedBackdrop(selectedBackdrop)
+        }
+    }
+    @Published var isBackdropPickerExpanded: Bool = false
     
     private var cameraService: CameraService
     private let config: ConfigManager
@@ -58,6 +64,10 @@ class StateMachine: ObservableObject {
             self.cameraService = SonyUSBCameraClient()
         }
         
+        let initialBackdrop = BackdropManager.shared.backdrop(forID: resolvedConfig.defaultBackdropID)
+        self.selectedBackdrop = initialBackdrop
+        self.cameraService.updateSelectedBackdrop(initialBackdrop)
+        
         setupBindings()
     }
     
@@ -72,7 +82,40 @@ class StateMachine: ObservableObject {
             }
             .store(in: &cancellables)
             
+        config.$defaultBackdropID
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] newDefaultID in
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    if case .idle = self.state {
+                        self.selectedBackdrop = BackdropManager.shared.backdrop(forID: newDefaultID)
+                    }
+                }
+            }
+            .store(in: &cancellables)
+            
+        BackdropManager.shared.$availableBackdrops
+            .dropFirst()
+            .sink { [weak self] available in
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    if let updated = available.first(where: { $0.id == self.selectedBackdrop.id }) {
+                        if updated != self.selectedBackdrop {
+                            self.selectedBackdrop = updated
+                        }
+                    } else {
+                        self.selectedBackdrop = BackdropManager.shared.backdrop(forID: self.config.defaultBackdropID)
+                    }
+                }
+            }
+            .store(in: &cancellables)
+            
         bindCameraStreams()
+    }
+    
+    func selectBackdrop(_ backdrop: BackdropItem) {
+        self.selectedBackdrop = backdrop
     }
     
     private func bindCameraStreams() {
@@ -145,6 +188,7 @@ class StateMachine: ObservableObject {
             self.cameraService = SonyUSBCameraClient()
         }
         
+        self.cameraService.updateSelectedBackdrop(self.selectedBackdrop)
         bindCameraStreams()
         transition(to: .initialization)
     }
@@ -189,6 +233,10 @@ class StateMachine: ObservableObject {
             Task { await initializeCamera() }
             
         case .idle:
+            // Reset backdrop selection to configured default and collapse the bottom picker between sessions
+            self.isBackdropPickerExpanded = false
+            self.selectedBackdrop = BackdropManager.shared.backdrop(forID: config.defaultBackdropID)
+            
             if case .airDrop = previousState {
                 // Keep temporary .jpg files alive on disk for 90s after the AirDrop sheet closes
                 // so iPadOS's background `sharingd` daemon can finish transmitting them to the iPhone.
@@ -200,6 +248,7 @@ class StateMachine: ObservableObject {
             Task { await startLiveView() }
             
         case .capture:
+            self.isBackdropPickerExpanded = false
             Task {
                 if self.captureMode == .gif {
                     await startGIFCaptureSequence()
@@ -283,6 +332,7 @@ class StateMachine: ObservableObject {
     
     func triggerCapture(mode: CaptureMode = .standard) {
         guard case .idle = state else { return }
+        self.isBackdropPickerExpanded = false
         self.captureMode = mode
         transition(to: .capture(count: 0))
     }
@@ -570,13 +620,19 @@ class StateMachine: ObservableObject {
         
         // 3. Zero-Copy GIF Creation (source frames are already local files in /tmp)
         let sourceFrameURLs = self.capturedImages
+        let activeBackdrop = self.selectedBackdrop
         transition(to: .processing(message: "Creating GIF..."))
         
         let gifDuration = config.gifFrameDuration
         let gifResolution = config.gifResolution
         
         let gifURL = await Task.detached(priority: .userInitiated) {
-            return GIFService.createGIF(from: sourceFrameURLs, frameDuration: gifDuration, resolution: gifResolution)
+            return GIFService.createGIF(
+                from: sourceFrameURLs,
+                frameDuration: gifDuration,
+                resolution: gifResolution,
+                backdrop: activeBackdrop
+            )
         }.value
         
         // 4. Immediately delete all individual source .jpg frames from disk
@@ -616,13 +672,14 @@ class StateMachine: ObservableObject {
             }
             
             // Decode UIImage BEFORE updating state/currentReviewImage to prevent 1-frame spinner flicker.
-            // Note: Sony captures ("sony_<UUID>.jpg") are already normalized & single-pass auto-exposed
-            // once in SonyUSBCameraClient.takePicture(), so do not re-apply auto-exposure a second time.
+            // Note: Both Sony captures ("sony_<UUID>.jpg") and Local captures ("local_<UUID>.jpg")
+            // already run single-pass subject auto-exposure BEFORE backdrop compositing, so do not
+            // re-apply auto-exposure a second time on top of a composited backdrop.
             do {
                 let data = try await cameraService.fetchImage(url: images[i])
                 if let image = UIImage(data: data) {
-                    let isAlreadyNormalizedSonyFile = images[i].contains("sony_")
-                    self.currentReviewImage = isAlreadyNormalizedSonyFile
+                    let isAlreadyNormalizedFile = images[i].contains("sony_") || images[i].contains("local_")
+                    self.currentReviewImage = isAlreadyNormalizedFile
                         ? image
                         : SonyUSBCameraClient.autoExposeCapturedUIImage(image)
                     self.state = .review(images: images, index: i)
