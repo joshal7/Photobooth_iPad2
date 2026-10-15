@@ -388,17 +388,17 @@ if let lowGIFURL = createEqualizedGIF(from: [sonyLowURL, sonyLowURL], frameDurat
 }
 try? FileManager.default.removeItem(at: sonyLowURL)
 
-// 6. GIF Perimeter Sweep Opacity (5% track, 10% trailing -> 20% leading) & Progress Dot State Verification
+// 6. GIF Perimeter Sweep Opacity (5% track, 10% trailing -> 30% leading) & Progress Dot State Verification
 func computeTrailingOpacity(progress: Double) -> Double {
     let clamped = min(max(progress, 0.0), 1.0)
     let endCharge = max(0.0, (clamped - 0.85) / 0.15)
-    return 0.10 + (0.10 * endCharge)
+    return 0.10 + (0.20 * endCharge)
 }
 let midSweepTrailing = computeTrailingOpacity(progress: 0.50)
 let finalSweepTrailing = computeTrailingOpacity(progress: 1.00)
 let leftCapNubLocation = (-91.5 - (-94.0)) / 360.0 // ~0.00694, safely inside [0.0, 0.012] trailingOpacity plateau
 assertTrue(
-    abs(midSweepTrailing - 0.10) < 0.001 && abs(finalSweepTrailing - 0.20) < 0.001 && leftCapNubLocation > 0.0 && leftCapNubLocation < 0.012,
+    abs(midSweepTrailing - 0.10) < 0.001 && abs(finalSweepTrailing - 0.30) < 0.001 && leftCapNubLocation > 0.0 && leftCapNubLocation < 0.012,
     String(format: "GIF 22pt perimeter sweep trailing opacity stays at %.2f (including left start-cap nub at loc=%.4f) and unifies to %.2f at 12 o'clock", midSweepTrailing, leftCapNubLocation, finalSweepTrailing)
 )
 

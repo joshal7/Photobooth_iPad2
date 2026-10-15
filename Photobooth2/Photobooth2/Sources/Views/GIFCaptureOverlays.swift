@@ -57,7 +57,7 @@ struct TopCenterPerimeterRoundedRect: Shape {
 }
 
 /// Animatable clockwise screen-perimeter bezel trace (22pt thickness) with a 5% guide track and
-/// a 10% trailing -> 20% leading opacity gradient that blends into the 0.2s vignette flash.
+/// a 10% trailing -> 30% leading opacity gradient that blends into the 0.2s vignette flash.
 struct GIFPerimeterSweepOverlay: View, Animatable {
     var progress: CGFloat
     
@@ -77,14 +77,14 @@ struct GIFPerimeterSweepOverlay: View, Animatable {
                     .inset(by: strokeWidth * 0.5)
                     .stroke(Color.white.opacity(0.05), lineWidth: strokeWidth)
                 
-                // 2. Clockwise filled sweep with 10% trailing -> 20% leading angular gradient.
+                // 2. Clockwise filled sweep with 10% trailing -> 30% leading angular gradient.
                 //    During the final 15% of the sweep (0.85 -> 1.0), the trailing opacity rises
-                //    from 10% to 20% so the perimeter unifies cleanly right as the flash fires.
+                //    from 10% to 30% so the perimeter unifies cleanly right as the flash fires.
                 let clampedProgress = min(max(progress, 0.0), 1.0)
                 let endCharge = max(0.0, (clampedProgress - 0.85) / 0.15)
-                let trailingOpacity = 0.10 + (0.10 * Double(endCharge))
-                let midOpacity = 0.15 + (0.05 * Double(endCharge))
-                let leadingOpacity = 0.20
+                let trailingOpacity = 0.10 + (0.20 * Double(endCharge))
+                let midOpacity = 0.20 + (0.10 * Double(endCharge))
+                let leadingOpacity = 0.30
                 
                 TopCenterPerimeterRoundedRect(cornerRadius: cornerRadius)
                     .inset(by: strokeWidth * 0.5)
@@ -94,7 +94,7 @@ struct GIFPerimeterSweepOverlay: View, Animatable {
                             gradient: Gradient(stops: [
                                 // Start the angular gradient 4° left of 12 o'clock (-94°) and hold trailingOpacity
                                 // through 12 o'clock (location 0.012) so the 11pt rounded start cap sticking out
-                                // slightly left of Top-Center gets trailingOpacity (10%) instead of wrapping to 20%.
+                                // slightly left of Top-Center gets trailingOpacity (10%) instead of wrapping to 30%.
                                 .init(color: Color.white.opacity(trailingOpacity), location: 0.0),
                                 .init(color: Color.white.opacity(trailingOpacity), location: 0.012),
                                 .init(color: Color.white.opacity(midOpacity), location: max(0.015, 0.012 + Double(clampedProgress) * 0.55)),
@@ -106,7 +106,7 @@ struct GIFPerimeterSweepOverlay: View, Animatable {
                         ),
                         style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round, lineJoin: .round)
                     )
-                    .shadow(color: Color.white.opacity(0.08), radius: 6)
+                    .shadow(color: Color.white.opacity(0.12), radius: 6)
             }
         }
         .edgesIgnoringSafeArea(.all)
