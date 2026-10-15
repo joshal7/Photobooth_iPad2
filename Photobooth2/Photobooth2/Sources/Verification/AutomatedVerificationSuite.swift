@@ -1300,6 +1300,35 @@ enum AutomatedVerificationSuite {
             !BackdropPickerOverlayView.isPointInsideShield(middlePhotoButtonTap, screenSize: iPadScreen, isExpanded: true),
             "Upper GIF and middle Photo capture tap areas remain unobstructed when carousel is expanded"
         )
+        
+        // 8. Missing-Asset Pre-Check Protection (Prevents False Overwrite / PB2_BACKDROP Stamp When Asset Is Missing)
+        let missingAssetItem = BackdropItem(
+            id: "deleted_backdrop",
+            displayName: "Deleted Backdrop",
+            backgroundFilename: "MissingAsset_bg.jpg",
+            foregroundFilename: nil,
+            foregroundFitMode: .stretchToEdges,
+            isBundled: false,
+            isEnabled: true
+        )
+        assertTrue(
+            !BackdropCompositorService.hasResolvableAssets(
+                for: missingAssetItem,
+                customBackgroundData: nil,
+                customForegroundData: nil,
+                additionalSearchDirectories: [sampleBackdropsDir]
+            ),
+            "BackdropCompositorService.hasResolvableAssets returns false when referenced asset is missing from disk and manifest"
+        )
+        assertTrue(
+            BackdropCompositorService.hasResolvableAssets(
+                for: missingAssetItem,
+                customBackgroundData: customRedBgBytes,
+                customForegroundData: nil,
+                additionalSearchDirectories: [sampleBackdropsDir]
+            ),
+            "BackdropCompositorService.hasResolvableAssets returns true when custom asset bytes are embedded in manifest JSON"
+        )
     }
 }
 #endif

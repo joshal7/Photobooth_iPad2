@@ -777,6 +777,48 @@ assertTrue(
     "Single-pass CIImage normalization preserves exact extent and pixels for mirrored non-zero-origin Live View frames"
 )
 
+// 7K. Missing-Asset Pre-Check Guard (Prevents False Overwrite / PB2_BACKDROP Stamp When Asset Is Missing)
+func hasResolvableAssets(
+    bgFilename: String?,
+    fgFilename: String?,
+    customBgData: Data?,
+    customFgData: Data?,
+    searchDirs: [URL]
+) -> Bool {
+    if let bg = bgFilename {
+        let found = (customBgData != nil && !customBgData!.isEmpty) ||
+            searchDirs.contains { FileManager.default.fileExists(atPath: $0.appendingPathComponent(bg).path) }
+        if !found { return false }
+    }
+    if let fg = fgFilename {
+        let found = (customFgData != nil && !customFgData!.isEmpty) ||
+            searchDirs.contains { FileManager.default.fileExists(atPath: $0.appendingPathComponent(fg).path) }
+        if !found { return false }
+    }
+    return bgFilename != nil || fgFilename != nil
+}
+assertTrue(
+    !hasResolvableAssets(bgFilename: "NonExistent_bg.jpg", fgFilename: nil, customBgData: nil, customFgData: nil, searchDirs: [projectBackdropsURL]) &&
+    hasResolvableAssets(bgFilename: "Eiffel Tower_bg.jpg", fgFilename: nil, customBgData: nil, customFgData: nil, searchDirs: [projectBackdropsURL]),
+    "Pre-check guard rejects missing backdrop assets before decoding/overwriting full-res JPEGs"
+)
+
+// 7L. Auto-Incrementing Default Custom Backdrop Naming ("Custom Backdrop", "Custom Backdrop 2", ...)
+func nextDefaultCustomBackdropName(existingIDs: Set<String>) -> String {
+    var candidate = "Custom Backdrop"
+    var counter = 2
+    while existingIDs.contains(candidate.lowercased().replacingOccurrences(of: " ", with: "_")) {
+        candidate = "Custom Backdrop \(counter)"
+        counter += 1
+    }
+    return candidate
+}
+assertEqual(
+    nextDefaultCustomBackdropName(existingIDs: ["custom_backdrop", "custom_backdrop_2"]),
+    "Custom Backdrop 3",
+    "Unnamed custom backdrops auto-increment ('Custom Backdrop 3') instead of overwriting previous custom backdrops"
+)
+
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")
 print("========================================================")

@@ -461,6 +461,7 @@ class StateMachine: ObservableObject {
             
             // Wait for the 1.0s flash fade to complete before advancing to the next photo countdown
             try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard case .capture = state else { break }
             
             withAnimation(.spring(response: 0.25, dampingFraction: 0.78)) {
                 self.currentPhotoNumber = i + 2

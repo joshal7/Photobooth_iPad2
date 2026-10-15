@@ -140,9 +140,21 @@ final class BackdropManager: ObservableObject {
         fitMode: ForegroundFitMode = .stretchToEdges
     ) -> BackdropItem? {
         ensureDocumentsBackdropsDirectoryExists()
-        let stripped = Self.stripRoleSuffix(from: displayName).trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmed = stripped.isEmpty ? "Custom Backdrop" : stripped
         guard backgroundData != nil || foregroundPNGData != nil else { return nil }
+        let stripped = Self.stripRoleSuffix(from: displayName).trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed: String
+        if stripped.isEmpty {
+            let existingIDs = Set(availableBackdrops.map(\.id))
+            var candidate = "Custom Backdrop"
+            var counter = 2
+            while existingIDs.contains(Self.normalizedID(from: candidate)) {
+                candidate = "Custom Backdrop \(counter)"
+                counter += 1
+            }
+            trimmed = candidate
+        } else {
+            trimmed = stripped
+        }
         
         let safeStem = trimmed
             .replacingOccurrences(of: "/", with: "-")

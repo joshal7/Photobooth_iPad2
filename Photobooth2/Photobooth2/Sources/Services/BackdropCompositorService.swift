@@ -286,6 +286,35 @@ final class BackdropCompositorService: Sendable {
         return nil
     }
     
+    /// Returns `true` only if all declared layers (`backgroundFilename` and/or `foregroundFilename`)
+    /// of `backdrop` can be resolved either via embedded `Data` or on disk.
+    nonisolated static func hasResolvableAssets(
+        for backdrop: BackdropItem,
+        customBackgroundData: Data? = nil,
+        customForegroundData: Data? = nil,
+        additionalSearchDirectories: [URL] = []
+    ) -> Bool {
+        if backdrop.isNone { return false }
+        var hasAnyLayer = false
+        if let bgName = backdrop.backgroundFilename, !bgName.isEmpty {
+            hasAnyLayer = true
+            let hasBgData = (customBackgroundData != nil && !(customBackgroundData?.isEmpty ?? true))
+            let hasBgFile = BackdropManager.resolveAssetURL(filename: bgName, additionalSearchDirectories: additionalSearchDirectories) != nil
+            if !hasBgData && !hasBgFile {
+                return false
+            }
+        }
+        if let fgName = backdrop.foregroundFilename, !fgName.isEmpty {
+            hasAnyLayer = true
+            let hasFgData = (customForegroundData != nil && !(customForegroundData?.isEmpty ?? true))
+            let hasFgFile = BackdropManager.resolveAssetURL(filename: fgName, additionalSearchDirectories: additionalSearchDirectories) != nil
+            if !hasFgData && !hasFgFile {
+                return false
+            }
+        }
+        return hasAnyLayer
+    }
+    
     nonisolated private static func loadLayerCIImage(
         filename: String?,
         customData: Data?,
@@ -293,7 +322,7 @@ final class BackdropCompositorService: Sendable {
         additionalSearchDirectories: [URL]
     ) -> CIImage? {
         if let data = customData, !data.isEmpty {
-            let key = "\(cachePrefix)_data_\(data.count)"
+            let key = "\(cachePrefix)_data_\(data.count)_\(data.hashValue)"
             return AssetImageCache.shared.image(forKey: key) {
                 if let src = CGImageSourceCreateWithData(data as CFData, nil),
                    let decoded = decodeBitmapBackedCIImage(from: src) {
@@ -303,7 +332,10 @@ final class BackdropCompositorService: Sendable {
             }
         }
         guard let filename = filename, !filename.isEmpty else { return nil }
-        let key = "\(cachePrefix)_file_\(filename)"
+        let dirScope = additionalSearchDirectories.first?.path ?? ""
+        let key = dirScope.isEmpty
+            ? "\(cachePrefix)_file_\(filename)"
+            : "\(cachePrefix)_dir_\(dirScope)_file_\(filename)"
         return AssetImageCache.shared.image(forKey: key) {
             guard let url = BackdropManager.resolveAssetURL(
                 filename: filename,

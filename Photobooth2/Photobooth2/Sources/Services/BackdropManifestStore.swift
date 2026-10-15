@@ -135,6 +135,24 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
         return storage.document.entries
     }
     
+    nonisolated func currentDocument() -> BackdropManifestDocument {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        return storage.document
+    }
+    
+    nonisolated func updateDocument(_ updatedDoc: BackdropManifestDocument) {
+        storage.lock.lock()
+        storage.document = updatedDoc
+        saveLocked()
+        let snapshot = storage.document.entries
+        storage.lock.unlock()
+        
+        Task { @MainActor [weak self] in
+            self?.entries = snapshot
+        }
+    }
+    
     nonisolated func clearAllEntries() {
         storage.lock.lock()
         storage.document.entries.removeAll()
@@ -273,7 +291,7 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
            let decoded = try? makeJSONDecoder().decode(BackdropManifestDocument.self, from: data) {
             manifestDoc = decoded
         } else {
-            manifestDoc = BackdropManifestDocument(entries: fallbackStore.allEntries())
+            manifestDoc = fallbackStore.currentDocument()
         }
         
         guard !manifestDoc.entries.isEmpty else {
@@ -436,12 +454,34 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
                 continue
             }
             
-            progressCallback?(entryIndex + 1, totalCount, candidate.url.lastPathComponent)
-            
             let resolvedCustomBgData = entry.customBackgroundData
                 ?? entry.backgroundFilename.flatMap { manifestDoc.customAssetsByFilename?[$0] }
             let resolvedCustomFgData = entry.customForegroundData
                 ?? entry.foregroundFilename.flatMap { manifestDoc.customAssetsByFilename?[$0] }
+            
+            let backdropItem = BackdropItem(
+                id: entry.backdropID,
+                displayName: entry.backdropDisplayName,
+                backgroundFilename: entry.backgroundFilename,
+                foregroundFilename: entry.foregroundFilename,
+                foregroundFitMode: entry.foregroundFitMode,
+                isBundled: false,
+                isEnabled: true
+            )
+            
+            // Safety Guard: Verify that the required backdrop/foreground asset(s) actually exist on disk or in embedded JSON
+            // BEFORE modifying the full-res JPEG or stamping `PB2_BACKDROP:` in its EXIF metadata.
+            guard BackdropCompositorService.hasResolvableAssets(
+                for: backdropItem,
+                customBackgroundData: resolvedCustomBgData,
+                customForegroundData: resolvedCustomFgData,
+                additionalSearchDirectories: [folderURL]
+            ) else {
+                unmatched += 1
+                continue
+            }
+            
+            progressCallback?(entryIndex + 1, totalCount, candidate.url.lastPathComponent)
             
             // 3. Apply Full-Resolution Auto-Exposure + .captureAccurate Backdrop Compositing inside autoreleasepool
             let didApply: Bool = autoreleasepool {
@@ -462,17 +502,7 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
                 // Step A: Run single-pass highlight-protected auto-exposure on the raw subject FIRST
                 let exposedFullCG = SonyUSBCameraClient.autoExposeCapturedCGImage(rawFullCG, ciContext: ciContext)
                 
-                // Step B: Construct BackdropItem and composite at full native resolution
-                let backdropItem = BackdropItem(
-                    id: entry.backdropID,
-                    displayName: entry.backdropDisplayName,
-                    backgroundFilename: entry.backgroundFilename,
-                    foregroundFilename: entry.foregroundFilename,
-                    foregroundFitMode: entry.foregroundFitMode,
-                    isBundled: false,
-                    isEnabled: true
-                )
-                
+                // Step B: Composite BackdropItem at full native resolution
                 let compositedFullCG = BackdropCompositorService.composite(
                     cgImage: exposedFullCG,
                     backdrop: backdropItem,
@@ -520,10 +550,13 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             }
         }
         
-        // Save updated manifest (with `appliedToFullRes = true` flags) back to the folder so re-running is idempotent
-        if let mURL = manifestURLInFolder,
-           let updatedData = try? makeJSONEncoder().encode(manifestDoc) {
-            try? updatedData.write(to: mURL, options: .atomic)
+        // Save updated manifest (with `appliedToFullRes = true` flags) back to the folder (or fallbackStore) so re-running is idempotent
+        if let mURL = manifestURLInFolder {
+            if let updatedData = try? makeJSONEncoder().encode(manifestDoc) {
+                try? updatedData.write(to: mURL, options: .atomic)
+            }
+        } else {
+            fallbackStore.updateDocument(manifestDoc)
         }
         
         return BatchApplyReport(
