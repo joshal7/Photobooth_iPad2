@@ -447,8 +447,7 @@ class StateMachine: ObservableObject {
         withAnimation(.none) {
             self.gifPerimeterProgress = 0.0
         }
-        // Highlight Dot 1 (1.5x pulsing white core) right from the start of the GIF sequence
-        self.currentGIFFrameIndex = 1
+        self.currentGIFFrameIndex = 0
         
         do {
             try await cameraService.prepareForCapture(mode: .gif)
@@ -468,6 +467,9 @@ class StateMachine: ObservableObject {
             self.showGuidance = false
             countTime = min(3, max(1, config.initialCountdownSec))
         }
+        
+        // Show the Top-Center progress dots (highlighting Dot 1) once the "Look at Camera" arrow & message go away
+        self.currentGIFFrameIndex = 1
         
         if countTime > 0 {
             for t in (1...countTime).reversed() {

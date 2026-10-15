@@ -109,8 +109,8 @@ struct ContentView: View {
                         // Clockwise 22pt perimeter bezel sweep between GIF frames
                         GIFPerimeterSweepOverlay(progress: stateMachine.gifPerimeterProgress)
                         
-                        // Sleek Top-Center progress dots pill (1.5x pulsing active dot, solid completed, hollow future)
-                        if stateMachine.currentGIFFrameIndex > 0 {
+                        // Sleek Top-Center progress dots pill (shown after "Look at Camera" arrow & message go away)
+                        if !stateMachine.showGuidance && stateMachine.currentGIFFrameIndex > 0 {
                             VStack {
                                 GIFProgressDotsPillView(
                                     totalFrames: ConfigManager.shared.gifFrameCount,

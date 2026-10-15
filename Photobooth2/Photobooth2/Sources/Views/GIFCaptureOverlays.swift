@@ -56,8 +56,8 @@ struct TopCenterPerimeterRoundedRect: Shape {
     }
 }
 
-/// Animatable clockwise screen-perimeter bezel trace (22pt thickness) with a 30% trailing -> 95% leading
-/// opacity gradient that charges up in the final 15% of the sweep to blend seamlessly into the 0.2s vignette flash.
+/// Animatable clockwise screen-perimeter bezel trace (22pt thickness) with a 5% guide track and
+/// a 15% trailing -> 45% leading opacity gradient that blends into the 0.2s vignette flash.
 struct GIFPerimeterSweepOverlay: View, Animatable {
     var progress: CGFloat
     
@@ -72,19 +72,19 @@ struct GIFPerimeterSweepOverlay: View, Animatable {
     var body: some View {
         ZStack {
             if progress > 0.001 {
-                // 1. Faint 12% white background track showing the remaining perimeter path
+                // 1. Subtle 5% white background track showing the remaining perimeter path
                 TopCenterPerimeterRoundedRect(cornerRadius: cornerRadius)
                     .inset(by: strokeWidth * 0.5)
-                    .stroke(Color.white.opacity(0.12), lineWidth: strokeWidth)
+                    .stroke(Color.white.opacity(0.05), lineWidth: strokeWidth)
                 
-                // 2. Clockwise filled sweep with 30% trailing -> 95% leading angular gradient
-                //    During the final 15% of the sweep (0.85 -> 1.0), the trailing opacity charges up
-                //    toward 0.92 so the entire perimeter locks into a unified bright frame as the flash fires.
+                // 2. Clockwise filled sweep with 15% trailing -> 45% leading angular gradient.
+                //    During the final 15% of the sweep (0.85 -> 1.0), the trailing opacity rises
+                //    from 15% to 45% so the perimeter unifies cleanly right as the flash fires.
                 let clampedProgress = min(max(progress, 0.0), 1.0)
                 let endCharge = max(0.0, (clampedProgress - 0.85) / 0.15)
-                let trailingOpacity = 0.30 + (0.62 * Double(endCharge))
-                let midOpacity = 0.62 + (0.30 * Double(endCharge))
-                let leadingOpacity = 0.95
+                let trailingOpacity = 0.15 + (0.30 * Double(endCharge))
+                let midOpacity = 0.30 + (0.15 * Double(endCharge))
+                let leadingOpacity = 0.45
                 
                 TopCenterPerimeterRoundedRect(cornerRadius: cornerRadius)
                     .inset(by: strokeWidth * 0.5)
@@ -94,8 +94,7 @@ struct GIFPerimeterSweepOverlay: View, Animatable {
                             gradient: Gradient(stops: [
                                 .init(color: Color.white.opacity(trailingOpacity), location: 0.0),
                                 .init(color: Color.white.opacity(midOpacity), location: max(0.001, Double(clampedProgress) * 0.55)),
-                                .init(color: Color.white.opacity(leadingOpacity), location: max(0.002, Double(clampedProgress) * 0.96)),
-                                .init(color: Color.white, location: max(0.003, Double(clampedProgress)))
+                                .init(color: Color.white.opacity(leadingOpacity), location: max(0.002, Double(clampedProgress)))
                             ]),
                             center: .center,
                             startAngle: .degrees(-90),
@@ -103,7 +102,7 @@ struct GIFPerimeterSweepOverlay: View, Animatable {
                         ),
                         style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round, lineJoin: .round)
                     )
-                    .shadow(color: Color.white.opacity(0.55), radius: 10)
+                    .shadow(color: Color.white.opacity(0.20), radius: 8)
             }
         }
         .edgesIgnoringSafeArea(.all)
