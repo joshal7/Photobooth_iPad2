@@ -27,8 +27,11 @@ class StateMachine: ObservableObject {
     @Published var capturedImages: [String] = []
     @Published var countdown: Int = 0
     @Published var isFlashing: Bool = false
+    @Published var isVignetteFlashing: Bool = false
     @Published var showGuidance: Bool = false
     @Published var currentPhotoNumber: Int = 0
+    @Published var currentGIFFrameIndex: Int = 0
+    @Published var gifPerimeterProgress: CGFloat = 0.0
     @Published var captureMode: CaptureMode = .standard
     @Published var poseIndicator: String? = nil
     @Published var isCameraConnected: Bool = false
@@ -422,34 +425,54 @@ class StateMachine: ObservableObject {
         transition(to: .review(images: capturedImages, index: 0))
     }
     
+    private func triggerGIFVignetteFlash() {
+        withAnimation(.easeOut(duration: 0.03)) {
+            self.isVignetteFlashing = true
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 200_000_000) // 0.20s crisp hold
+            withAnimation(.easeOut(duration: 0.12)) {
+                self.isVignetteFlashing = false
+            }
+        }
+    }
+    
     // MARK: - Animated GIF Capture Sequence
     
     private func startGIFCaptureSequence() async {
         print("Starting GIF Capture Sequence")
         capturedImages.removeAll()
         self.poseIndicator = nil
+        self.isVignetteFlashing = false
+        withAnimation(.none) {
+            self.gifPerimeterProgress = 0.0
+        }
+        // Highlight Dot 1 (1.5x pulsing white core) right from the start of the GIF sequence
+        self.currentGIFFrameIndex = 1
         
         do {
             try await cameraService.prepareForCapture(mode: .gif)
         } catch {
+            self.currentGIFFrameIndex = 0
             transition(to: .error(message: "GIF Setup Failed: \(error.localizedDescription)"))
             return
         }
         
-        // 1. Initial Guidance & Countdown
-        var countTime: Int = config.initialCountdownSec
+        // 1. Initial Guidance & 3-Second Countdown (with "Get Ready to Move!" at bottom)
+        var countTime: Int = min(3, config.initialCountdownSec)
         if config.showGuidanceText {
             self.showGuidance = true
             for _ in 0..<3 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
             self.showGuidance = false
-            countTime = max(3, config.initialCountdownSec - 3)
+            countTime = min(3, max(1, config.initialCountdownSec))
         }
         
         if countTime > 0 {
             for t in (1...countTime).reversed() {
                 if case .error = state {
+                    self.currentGIFFrameIndex = 0
                     await cameraService.finishCaptureSequence(mode: .gif)
                     return
                 }
@@ -459,14 +482,6 @@ class StateMachine: ObservableObject {
         }
         self.countdown = 0
         
-        // Shortened Frame 1 White Screen Flash (0.25s hold + 0.20s fade = 0.45s total)
-        // so it clears before "Second Pose" appears and never overlaps Frame 2 even at 0.5s min interval.
-        withAnimation(.linear(duration: 0)) { self.isFlashing = true }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            withAnimation(.easeIn(duration: 0.20)) { self.isFlashing = false }
-        }
-        
         // 2. Multi-Pose GIF Capture Loop (Enforcing "Min Time Between GIFs", default 2.0s, min 0.5s)
         let frameCount = config.gifFrameCount
         let minInterval = max(0.5, config.gifCaptureInterval)
@@ -474,12 +489,20 @@ class StateMachine: ObservableObject {
         
         for i in 0..<frameCount {
             if case .error = state {
+                self.currentGIFFrameIndex = 0
+                withAnimation(.none) { self.gifPerimeterProgress = 0.0 }
                 await cameraService.finishCaptureSequence(mode: .gif)
                 return
             }
             
-            // Clear pose prompt right as the shutter fires
             self.poseIndicator = nil
+            self.currentGIFFrameIndex = i + 1
+            withAnimation(.none) {
+                self.gifPerimeterProgress = 0.0
+            }
+            
+            // Fire the 0.2s crisp perimeter vignette flash on every GIF frame
+            triggerGIFVignetteFlash()
             let shotStart = Date()
             
             do {
@@ -487,17 +510,30 @@ class StateMachine: ObservableObject {
                 capturedImages.append(fileURLString)
             } catch {
                 self.isFlashing = false
+                self.isVignetteFlashing = false
                 self.poseIndicator = nil
+                self.currentGIFFrameIndex = 0
+                withAnimation(.none) { self.gifPerimeterProgress = 0.0 }
                 await cameraService.finishCaptureSequence(mode: .gif)
                 transition(to: .error(message: "Capture Failed: \(error.localizedDescription)"))
                 return
             }
             
-            // Show "Second Pose" / "Third Pose" / "Fourth Pose" during the reposition window
-            // and wait until the full `minInterval` (shutter-to-shutter) has elapsed.
+            // Advance the active dot and sweep the 22pt clockwise perimeter trace across the reposition window
             if i < frameCount - 1 {
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.78)) {
+                    self.currentGIFFrameIndex = i + 2
+                }
+                
                 let elapsed = Date().timeIntervalSince(shotStart)
                 let remaining = max(0, minInterval - elapsed)
+                
+                if remaining > 0.05 {
+                    withAnimation(.linear(duration: remaining)) {
+                        self.gifPerimeterProgress = 1.0
+                    }
+                }
+                
                 let poseDisplayWindow = min(1.2, remaining)
                 let prePoseWait = max(0, remaining - poseDisplayWindow)
                 
@@ -512,10 +548,19 @@ class StateMachine: ObservableObject {
                 if poseDisplayWindow > 0 {
                     try? await Task.sleep(nanoseconds: UInt64(poseDisplayWindow * 1_000_000_000))
                 }
+            } else {
+                // Mark all dots completed (solid white) as the final frame finishes
+                withAnimation(.spring(response: 0.25, dampingFraction: 0.78)) {
+                    self.currentGIFFrameIndex = frameCount + 1
+                }
             }
         }
         
         self.poseIndicator = nil
+        self.currentGIFFrameIndex = 0
+        withAnimation(.none) {
+            self.gifPerimeterProgress = 0.0
+        }
         await cameraService.finishCaptureSequence(mode: .gif)
         
         // 3. Zero-Copy GIF Creation (source frames are already local files in /tmp)

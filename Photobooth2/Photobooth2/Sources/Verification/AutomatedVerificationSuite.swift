@@ -430,11 +430,27 @@ enum AutomatedVerificationSuite {
         assertEqual(sm.state, .idle, "StateMachine transitions to .idle once USB camera is connected")
         
         var observedPoses: [(String, Bool, Date)] = []
+        var observedDotIndices: [Int] = []
+        var vignetteFlashCount: Int = 0
         var cancellables = Set<AnyCancellable>()
         sm.$poseIndicator
             .compactMap { $0 }
             .sink { pose in
                 observedPoses.append((pose, sm.isFlashing, Date()))
+            }
+            .store(in: &cancellables)
+        sm.$currentGIFFrameIndex
+            .removeDuplicates()
+            .filter { $0 > 0 }
+            .sink { idx in
+                observedDotIndices.append(idx)
+            }
+            .store(in: &cancellables)
+        sm.$isVignetteFlashing
+            .removeDuplicates()
+            .filter { $0 }
+            .sink { _ in
+                vignetteFlashCount += 1
             }
             .store(in: &cancellables)
         
@@ -478,6 +494,8 @@ enum AutomatedVerificationSuite {
             }
         }
         
+        assertEqual(observedDotIndices, [1, 2, 3, 4, 5], "Top-center progress dots highlighted Frame 1 through Frame 4 and completed all 4 dots (5)")
+        assertEqual(vignetteFlashCount, 4, "0.2s perimeter vignette flash fired on all 4 GIF frames")
         let poseNames = observedPoses.map { $0.0 }
         assertEqual(poseNames, ["Second Pose", "Third Pose", "Fourth Pose"], "Observed exact pose prompt sequence: Second Pose, Third Pose, Fourth Pose")
         

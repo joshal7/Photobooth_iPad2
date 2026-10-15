@@ -15,7 +15,20 @@ struct CountdownView: View {
                     .shadow(color: .black, radius: 10, x: 0, y: 0)
                     .transition(.scale.combined(with: .opacity))
                     .id(stateMachine.countdown) // Force transition on change
+                
+                if stateMachine.captureMode == .gif {
+                    VStack {
+                        Spacer()
+                        Text("Get Ready to Move!")
+                            .font(.system(size: 56, weight: .heavy))
+                            .foregroundColor(.white)
+                            .shadow(color: .black, radius: 10, x: 0, y: 0)
+                            .padding(.bottom, 56)
+                    }
+                    .transition(.opacity)
+                }
             }
         }
     }
 }
+

@@ -105,33 +105,38 @@ struct ContentView: View {
                             .transition(.opacity)
                     }
                     
-                    // Pose indicator for GIF captures (external camera only)
-                    // Uses animation to fade in, providing visual break between pose changes
-                    if let pose = stateMachine.poseIndicator {
-                        Text(pose)
-                            .font(.system(size: 50, weight: .heavy))
-                            .foregroundColor(.white)
-                            .shadow(radius: 10)
-                            .transition(.asymmetric(
-                                insertion: .opacity.animation(.easeIn(duration: 0.5)),
-                                removal: .opacity.animation(.easeOut(duration: 0.1))
-                            ))
-                            .id(pose) // Force new view for each pose change, triggering animation
-                    }
-                    
-                    // Photo counter in upper right
-                    if stateMachine.currentPhotoNumber > 0 {
-                        VStack {
-                            HStack {
+                    if stateMachine.captureMode == .gif {
+                        // Clockwise 22pt perimeter bezel sweep between GIF frames
+                        GIFPerimeterSweepOverlay(progress: stateMachine.gifPerimeterProgress)
+                        
+                        // Sleek Top-Center progress dots pill (1.5x pulsing active dot, solid completed, hollow future)
+                        if stateMachine.currentGIFFrameIndex > 0 {
+                            VStack {
+                                GIFProgressDotsPillView(
+                                    totalFrames: ConfigManager.shared.gifFrameCount,
+                                    activeFrameIndex: stateMachine.currentGIFFrameIndex
+                                )
+                                .padding(.top, 26)
                                 Spacer()
-                                Text("\(stateMachine.currentPhotoNumber) of \(ConfigManager.shared.photoCount)")
-                                    .font(.system(size: 60, weight: .heavy))
-                                    .foregroundColor(.white)
-                                    .shadow(radius: 10)
-                                    .padding(.top, 50)
-                                    .padding(.trailing, 50)
                             }
-                            Spacer()
+                            .transition(.opacity)
+                            .zIndex(3)
+                        }
+                    } else {
+                        // Standard Photo Mode counter in upper right
+                        if stateMachine.currentPhotoNumber > 0 {
+                            VStack {
+                                HStack {
+                                    Spacer()
+                                    Text("\(stateMachine.currentPhotoNumber) of \(ConfigManager.shared.photoCount)")
+                                        .font(.system(size: 60, weight: .heavy))
+                                        .foregroundColor(.white)
+                                        .shadow(radius: 10)
+                                        .padding(.top, 50)
+                                        .padding(.trailing, 50)
+                                }
+                                Spacer()
+                            }
                         }
                     }
                 }
@@ -185,12 +190,19 @@ struct ContentView: View {
                 Spacer()
             }
             
-            // Flash Overlay
+            // Standard Photo Full-Screen Flash Overlay
             if stateMachine.isFlashing {
                 Color.white
                     .edgesIgnoringSafeArea(.all)
                     .transition(.opacity)
                     .zIndex(2) // Ensure it's on top
+            }
+            
+            // GIF Mode 0.2s Crisp Perimeter Vignette Flash Overlay
+            if stateMachine.isVignetteFlashing {
+                GIFVignetteFlashOverlay()
+                    .transition(.opacity)
+                    .zIndex(2)
             }
         }
         .statusBar(hidden: true)

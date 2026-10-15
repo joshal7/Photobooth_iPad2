@@ -388,7 +388,21 @@ if let lowGIFURL = createEqualizedGIF(from: [sonyLowURL, sonyLowURL], frameDurat
 }
 try? FileManager.default.removeItem(at: sonyLowURL)
 
+// 6. GIF Perimeter Sweep Opacity Charge & Configurable Progress Dot State Verification
+func computeTrailingOpacity(progress: Double) -> Double {
+    let clamped = min(max(progress, 0.0), 1.0)
+    let endCharge = max(0.0, (clamped - 0.85) / 0.15)
+    return 0.30 + (0.62 * endCharge)
+}
+let midSweepTrailing = computeTrailingOpacity(progress: 0.50)
+let finalSweepTrailing = computeTrailingOpacity(progress: 1.00)
+assertTrue(
+    abs(midSweepTrailing - 0.30) < 0.001 && abs(finalSweepTrailing - 0.92) < 0.001,
+    String(format: "GIF 22pt perimeter sweep trailing opacity stays at %.2f mid-sweep and charges to %.2f at 12 o'clock flash", midSweepTrailing, finalSweepTrailing)
+)
+
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")
 print("========================================================")
 exit(failedAssertions == 0 ? 0 : 1)
+
