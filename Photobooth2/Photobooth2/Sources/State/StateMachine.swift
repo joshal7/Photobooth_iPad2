@@ -41,6 +41,7 @@ class StateMachine: ObservableObject {
     private var serviceCancellables = Set<AnyCancellable>()
     private var disconnectDebounceTask: Task<Void, Never>?
     private var sharingPromptTimeoutTask: Task<Void, Never>?
+    private var errorAutoRetryTask: Task<Void, Never>?
     
     init(cameraService: CameraService? = nil, config: ConfigManager? = nil) {
         let resolvedConfig = config ?? ConfigManager.shared
@@ -131,6 +132,8 @@ class StateMachine: ObservableObject {
     private func switchCameraService(useLocal: Bool) {
         disconnectDebounceTask?.cancel()
         disconnectDebounceTask = nil
+        errorAutoRetryTask?.cancel()
+        errorAutoRetryTask = nil
         cameraService.stopLiveView()
         
         if useLocal {
@@ -174,6 +177,8 @@ class StateMachine: ObservableObject {
         let previousState = self.state
         sharingPromptTimeoutTask?.cancel()
         sharingPromptTimeoutTask = nil
+        errorAutoRetryTask?.cancel()
+        errorAutoRetryTask = nil
         self.state = newState
         
         switch newState {
@@ -214,6 +219,24 @@ class StateMachine: ObservableObject {
         case .error:
             cameraService.stopLiveView()
             cleanupSessionStillImages(afterDelay: 0)
+            errorAutoRetryTask = Task { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 3_000_000_000) // 3s auto-retry poll
+                    guard let self = self, !Task.isCancelled else { break }
+                    guard case .error = self.state else { break }
+                    if await self.cameraService.checkConnection() {
+                        self.transition(to: .idle)
+                        break
+                    }
+                    try? await self.cameraService.connect()
+                    if self.cameraService.isConnected {
+                        self.isCameraConnected = true
+                        self.cameraStatusMessage = self.cameraService.statusMessage
+                        self.transition(to: .idle)
+                        break
+                    }
+                }
+            }
             
         case .sharingPrompt:
             cameraService.stopLiveView()
@@ -535,16 +558,23 @@ class StateMachine: ObservableObject {
             
             if images[i].lowercased().hasSuffix(".gif") {
                 self.currentReviewImage = nil
-                self.state = .review(images: images, index: i)
+                if i > 0 {
+                    self.state = .review(images: images, index: i)
+                }
                 try? await Task.sleep(nanoseconds: UInt64(config.gifPreviewDuration * 1_000_000_000))
                 continue
             }
             
-            // Decode UIImage BEFORE updating state/currentReviewImage to prevent 1-frame spinner flicker
+            // Decode UIImage BEFORE updating state/currentReviewImage to prevent 1-frame spinner flicker.
+            // Note: Sony captures ("sony_<UUID>.jpg") are already normalized & single-pass auto-exposed
+            // once in SonyUSBCameraClient.takePicture(), so do not re-apply auto-exposure a second time.
             do {
                 let data = try await cameraService.fetchImage(url: images[i])
                 if let image = UIImage(data: data) {
-                    self.currentReviewImage = SonyUSBCameraClient.autoExposeCapturedUIImage(image)
+                    let isAlreadyNormalizedSonyFile = images[i].contains("sony_")
+                    self.currentReviewImage = isAlreadyNormalizedSonyFile
+                        ? image
+                        : SonyUSBCameraClient.autoExposeCapturedUIImage(image)
                     self.state = .review(images: images, index: i)
                     try? await Task.sleep(nanoseconds: UInt64(config.previewDurationSec) * 1_000_000_000)
                 } else {

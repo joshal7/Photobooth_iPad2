@@ -86,17 +86,65 @@ final class GIFService: Sendable {
         
         let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
         
+        struct FrameEntry {
+            let cgImage: CGImage
+            let luma: Double
+        }
+        
+        var loadedFrames: [FrameEntry] = []
+        loadedFrames.reserveCapacity(imagePaths.count)
+        
         for path in imagePaths {
             let url = resolveFileURL(path)
-            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let rawCG = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
                 print("Failed to load image source at \(path)")
                 continue
             }
             
-            if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
-                let exposedCGImage = SonyUSBCameraClient.autoExposeCapturedCGImage(cgImage, ciContext: ciContext)
-                CGImageDestinationAddImage(destination, exposedCGImage, frameProperties as CFDictionary)
+            // Frames captured by SonyUSBCameraClient.takePicture() ("sony_<UUID>.jpg") are already
+            // normalized and single-pass auto-exposed once when written to /tmp. Do not auto-expose
+            // them a second time (which would double the gain and clip colors/highlights).
+            let isAlreadyNormalizedSonyFrame = url.lastPathComponent.hasPrefix("sony_")
+            let baseCG = isAlreadyNormalizedSonyFrame
+                ? rawCG
+                : SonyUSBCameraClient.autoExposeCapturedCGImage(rawCG, ciContext: ciContext)
+            let (luma, _) = SonyUSBCameraClient.measureSceneLuminance(baseCG)
+            loadedFrames.append(FrameEntry(cgImage: baseCG, luma: max(luma, 0.02)))
+        }
+        
+        guard !loadedFrames.isEmpty else {
+            return nil
+        }
+        
+        // Compute the median scene luminance across all frames in the GIF burst so that if any
+        // single frame (e.g. the 4th frame in Aperture Priority mode) varied slightly in exposure,
+        // all frames are smoothly equalized to the burst's median brightness.
+        let sortedLumas = loadedFrames.map(\.luma).sorted()
+        let mid = sortedLumas.count / 2
+        let medianLuma: Double = (sortedLumas.count % 2 == 0 && sortedLumas.count >= 2)
+            ? (sortedLumas[mid - 1] + sortedLumas[mid]) * 0.5
+            : sortedLumas[mid]
+        
+        for entry in loadedFrames {
+            let deltaEV = log2(medianLuma / entry.luma)
+            let clampedDeltaEV = min(max(deltaEV, -0.65), 0.65)
+            let finalCG: CGImage
+            if abs(clampedDeltaEV) > 0.04,
+               let exposureFilter = CIFilter(name: "CIExposureAdjust") {
+                let ciInput = CIImage(cgImage: entry.cgImage)
+                exposureFilter.setValue(ciInput, forKey: kCIInputImageKey)
+                exposureFilter.setValue(clampedDeltaEV, forKey: kCIInputEVKey)
+                if let outCI = exposureFilter.outputImage,
+                   let equalizedCG = ciContext.createCGImage(outCI, from: ciInput.extent) {
+                    finalCG = equalizedCG
+                } else {
+                    finalCG = entry.cgImage
+                }
+            } else {
+                finalCG = entry.cgImage
             }
+            CGImageDestinationAddImage(destination, finalCG, frameProperties as CFDictionary)
         }
         
         if CGImageDestinationFinalize(destination) {

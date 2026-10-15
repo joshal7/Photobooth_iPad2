@@ -95,6 +95,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     private var ptpTransport: PTPTransport?
     private var liveViewTask: Task<Void, Never>?
     private var keepAliveTask: Task<Void, Never>?
+    private var autoDiscoveryTask: Task<Void, Never>?
     private var wasLiveViewRunningBeforeSuspend: Bool = false
     private var sessionOpenContinuation: CheckedContinuation<Void, Error>?
     
@@ -103,18 +104,60 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         super.init()
         if injectedTransport == nil {
             setupDeviceBrowser()
+            startAutoDiscoveryLoop()
         }
     }
     
     deinit {
         liveViewTask?.cancel()
         keepAliveTask?.cancel()
+        autoDiscoveryTask?.cancel()
     }
     
     private var isOpeningOrHandshaking: Bool = false
     private var isAuthorizingBrowser: Bool = false
     private var controlAuthSummary: String = "pending"
     private var contentsAuthSummary: String = "pending"
+    
+    /// Continuously monitors USB discovery every 2.5s while disconnected so that if the camera was already
+    /// plugged in when the app was sideloaded/launched (while iPadOS's `icdd` daemon is still releasing the
+    /// prior process's USB session), it automatically re-polls and connects without needing a physical replug.
+    private func startAutoDiscoveryLoop() {
+        autoDiscoveryTask?.cancel()
+        autoDiscoveryTask = Task.detached(priority: .utility) { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_500_000_000) // 2.5s
+                guard let self = self, !Task.isCancelled else { break }
+                await MainActor.run {
+                    guard !self.isConnected,
+                          !self.isOpeningOrHandshaking,
+                          !self.isAuthorizingBrowser else { return }
+                    // Skip in unit tests with injected transport
+                    if self.ptpTransport != nil && self.cameraDevice == nil { return }
+                    
+                    self.checkAlreadyDiscoveredDevices()
+                    
+                    if let camera = self.cameraDevice {
+                        if !camera.hasOpenSession {
+                            self.isOpeningOrHandshaking = true
+                            self.statusMessage = "Found \(camera.name ?? "Camera") — opening USB PTP session..."
+                            camera.requestOpenSession()
+                        } else if self.ptpTransport == nil {
+                            // Session is already open at the OS level; trigger the PTP handshake
+                            self.device(camera, didOpenSessionWithError: nil)
+                        }
+                    } else if let browser = self.deviceBrowser {
+                        // Cycle ICDeviceBrowser to force iPadOS `icdd` to re-announce already-attached USB devices
+                        browser.stop()
+                        browser.start()
+                        self.checkAlreadyDiscoveredDevices()
+                    } else {
+                        self.setupDeviceBrowser(forceRestart: true)
+                    }
+                }
+            }
+        }
+    }
     
     private func setupDeviceBrowser(forceRestart: Bool = false) {
         if forceRestart, let existing = self.deviceBrowser {
@@ -618,29 +661,34 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         }
     }
     
-    /// Auto-exposes a captured `UIImage` (used for Photo Review, AirDrop, and GIF frames) using
-    /// highlight-rejected center-weighted linear metering and a closed-loop verification pass.
+    /// Auto-exposes a captured `UIImage` (called once during JPEG normalization in `takePicture()`)
+    /// using a single-pass, highlight-protected sRGB tone curve.
     nonisolated static func autoExposeCapturedUIImage(_ image: UIImage, ciContext: CIContext? = nil) -> UIImage {
         guard let cgImage = image.cgImage else { return image }
         let ctx = ciContext ?? CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
         let boostedCG = autoExposeCapturedCGImage(cgImage, ciContext: ctx)
+        if boostedCG === cgImage {
+            return image
+        }
         return UIImage(cgImage: boostedCG, scale: image.scale, orientation: image.imageOrientation)
     }
     
-    /// Auto-exposes a captured `CGImage` (also called directly by `GIFService.createGIF`) so that both
-    /// very dark manual captures (e.g. ISO 200 with small lights) and slightly dim Auto-ISO captures
-    /// are brought up to a clean, bright target exposure (`~0.50` sRGB midtone brightness).
+    /// Auto-exposes a captured `CGImage` in a single, continuous pass:
+    /// - Very dark manual captures (Mode "1" / ISO 200 without flash) receive up to +3.8 EV + gentle shadow
+    ///   & gamma lift with color-saturation preservation so they brighten cleanly without clipping into
+    ///   1-bit black-and-white JPEG macroblocks.
+    /// - Slightly dim Auto-ISO 12800 captures receive a gentle +0.4..+0.8 EV lift with 90th-percentile
+    ///   highlight protection so faces and walls never blow out.
     nonisolated static func autoExposeCapturedCGImage(_ cgImage: CGImage, ciContext: CIContext) -> CGImage {
-        let (pass1CG, _) = adjustCGImageExposureIfNeeded(
+        let (boostedCG, _) = adjustCGImageExposureIfNeeded(
             cgImage,
             ciContext: ciContext,
-            minRecoverableSrgbLuma: 0.0,   // Never bail out on dark captured photos/GIFs
-            targetSrgbLuma: 0.50,          // Bright, well-lit portrait target
-            triggerThresholdSrgb: 0.44,    // Boost any capture dimmer than 0.44 sRGB (fixes dim Auto-ISO shots too)
-            maxLinearEVBoost: 9.0,         // Up to +9 EV in linear light (~512x linear gain for dark ISO 200 captures)
-            allowClosedLoopSecondPass: true
+            minRecoverableSrgbLuma: 0.0,
+            targetSrgbLuma: 0.42,
+            triggerThresholdSrgb: 0.42,
+            maxEVBoost: 3.8
         )
-        return pass1CG
+        return boostedCG
     }
     
     // MARK: - Paced 30 FPS PTP Live View (0xFFFFC002) & Sleep Prevention
@@ -716,10 +764,9 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             cgImage,
             ciContext: ciContext,
             minRecoverableSrgbLuma: 0.025, // Avoid quantizing pitch-black frames during the 100ms while 0xD231 switches to 2
-            targetSrgbLuma: 0.48,
+            targetSrgbLuma: 0.42,
             triggerThresholdSrgb: 0.40,
-            maxLinearEVBoost: 3.5,
-            allowClosedLoopSecondPass: false
+            maxEVBoost: 3.5
         )
         if boostedCG === cgImage {
             return (image, subjectSrgbLuma)
@@ -727,10 +774,10 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         return (UIImage(cgImage: boostedCG, scale: image.scale, orientation: image.imageOrientation), subjectSrgbLuma)
     }
     
-    /// Measures highlight-rejected, center-weighted scene luminance in both sRGB (`0..1`) and
-    /// true IEC 61966-2-1 linear light (`0..1`). Discards the brightest 20% of pixels so small
-    /// specular lights or lamps in a dark room never trick the meter into under-boosting.
-    nonisolated private static func measureSubjectLuminance(_ cgImage: CGImage) -> (srgbY: Double, linearY: Double) {
+    /// Measures center-weighted sRGB scene luminance (`subjectSrgbY`, discarding only the top 5% specular
+    /// pinpoints so small lamps don't skew dark-room metering) and the 90th-percentile highlight luminance
+    /// (`p90SrgbY`, used to prevent blowing out faces/walls in dim Auto-ISO 12800 shots).
+    nonisolated static func measureSceneLuminance(_ cgImage: CGImage) -> (subjectSrgbY: Double, p90SrgbY: Double) {
         let sampleSize = 24
         var pixels = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
@@ -743,19 +790,13 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else {
-            return (0.5, 0.214)
+            return (0.5, 0.7)
         }
         ctx.interpolationQuality = .low
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
         
-        @inline(__always)
-        func srgbToLinear(_ c: Double) -> Double {
-            return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4)
-        }
-        
         struct Sample {
             let srgbY: Double
-            let linearY: Double
             let weight: Double
         }
         
@@ -772,29 +813,27 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 let b = Double(pixels[offset + 2]) / 255.0
                 
                 let srgbY = 0.2126 * r + 0.7152 * g + 0.0722 * b
-                let linY = 0.2126 * srgbToLinear(r) + 0.7152 * srgbToLinear(g) + 0.0722 * srgbToLinear(b)
                 let weight = (isCenterX && isCenterY) ? 2.5 : 1.0
-                samples.append(Sample(srgbY: srgbY, linearY: linY, weight: weight))
+                samples.append(Sample(srgbY: srgbY, weight: weight))
             }
         }
         
-        // Sort ascending by brightness and discard the brightest 20% of pixels
-        // so small bright lights / lamps in the background don't skew the subject exposure meter.
         samples.sort { $0.srgbY < $1.srgbY }
-        let keepCount = max(1, Int(Double(samples.count) * 0.80))
+        let p90Index = min(samples.count - 1, max(0, Int(Double(samples.count) * 0.90)))
+        let p90SrgbY = samples[p90Index].srgbY
         
+        // Discard only the brightest 5% specular pinpoints (e.g. a small bulb in frame)
+        let keepCount = max(1, Int(Double(samples.count) * 0.95))
         var weightedSrgbSum = 0.0
-        var weightedLinearSum = 0.0
         var totalWeight = 0.0
         for i in 0..<keepCount {
             let s = samples[i]
             weightedSrgbSum += s.srgbY * s.weight
-            weightedLinearSum += s.linearY * s.weight
             totalWeight += s.weight
         }
         
-        guard totalWeight > 0 else { return (0.5, 0.214) }
-        return (weightedSrgbSum / totalWeight, weightedLinearSum / totalWeight)
+        guard totalWeight > 0 else { return (0.5, p90SrgbY) }
+        return (weightedSrgbSum / totalWeight, p90SrgbY)
     }
     
     nonisolated private static func adjustCGImageExposureIfNeeded(
@@ -803,90 +842,76 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         minRecoverableSrgbLuma: Double,
         targetSrgbLuma: Double,
         triggerThresholdSrgb: Double,
-        maxLinearEVBoost: Double,
-        allowClosedLoopSecondPass: Bool
+        maxEVBoost: Double
     ) -> (CGImage, Double) {
-        let (subjectSrgbY, subjectLinearY) = measureSubjectLuminance(cgImage)
+        let (subjectSrgbY, p90SrgbY) = measureSceneLuminance(cgImage)
         
         guard subjectSrgbY < triggerThresholdSrgb, subjectSrgbY >= minRecoverableSrgbLuma else {
             return (cgImage, subjectSrgbY)
         }
         
-        // Convert target sRGB luminance to true IEC 61966-2-1 linear luminance
-        // because CIExposureAdjust operates in linear light (output_linear = input_linear * 2^EV).
-        let targetLinearY = (targetSrgbLuma <= 0.04045)
-            ? (targetSrgbLuma / 12.92)
-            : pow((targetSrgbLuma + 0.055) / 1.055, 2.4)
+        // Compute smooth sRGB exposure boost with zero discontinuity at triggerThresholdSrgb
+        let safeLuma = max(subjectSrgbY, 0.03)
+        var ev = min(max(log2(targetSrgbLuma / safeLuma), 0.0), maxEVBoost)
         
-        let safeLinearY = max(subjectLinearY, 0.00020)
-        let linearEV = min(max(log2(targetLinearY / safeLinearY), 0.25), maxLinearEVBoost)
+        // Protect highlights on already-viewable / moderately dim images (e.g. Auto-ISO 12800):
+        // When the scene already has midtones/highlights (subjectSrgbY >= 0.16 and p90SrgbY > 0.45),
+        // limit EV so the 90th-percentile highlight never blows out past 0.85 sRGB.
+        if subjectSrgbY >= 0.16, p90SrgbY > 0.45 {
+            let highlightSafeEV = max(0.15, log2(0.85 / p90SrgbY) * 1.6)
+            ev = min(ev, highlightSafeEV)
+        }
+        
+        guard ev > 0.04 else {
+            return (cgImage, subjectSrgbY)
+        }
         
         let ciInput = CIImage(cgImage: cgImage)
         var currentCI = ciInput
         
-        // 1. Lift shadows & protect small bright highlights first
+        // 1. Smoothly lift shadows & roll off highlights (no minimum step jump at low EV)
         if let shadowFilter = CIFilter(name: "CIHighlightShadowAdjust") {
-            let shadowLift = min(1.0, max(0.30, linearEV * 0.22))
+            let shadowLift = min(0.55, ev * 0.15)
             shadowFilter.setValue(currentCI, forKey: kCIInputImageKey)
             shadowFilter.setValue(shadowLift, forKey: "inputShadowAmount")
-            shadowFilter.setValue(0.80, forKey: "inputHighlightAmount")
+            shadowFilter.setValue(0.85, forKey: "inputHighlightAmount")
             if let out = shadowFilter.outputImage {
                 currentCI = out
             }
         }
         
-        // 2. Apply true-linear EV boost
+        // 2. Apply single-pass exposure gain
         if let exposureFilter = CIFilter(name: "CIExposureAdjust") {
             exposureFilter.setValue(currentCI, forKey: kCIInputImageKey)
-            exposureFilter.setValue(linearEV, forKey: kCIInputEVKey)
+            exposureFilter.setValue(ev, forKey: kCIInputEVKey)
             if let out = exposureFilter.outputImage {
                 currentCI = out
             }
         }
         
-        // 3. Apply midtone gamma lift when boosting dark or dim images
-        if linearEV > 0.8, let gammaFilter = CIFilter(name: "CIGammaAdjust") {
-            let gammaPower = max(0.52, 0.92 - (linearEV - 0.8) * 0.055)
-            gammaFilter.setValue(currentCI, forKey: kCIInputImageKey)
-            gammaFilter.setValue(gammaPower, forKey: "inputPower")
-            if let out = gammaFilter.outputImage {
-                currentCI = out
+        // 3. For dark scenes (ev > 1.0), apply a gentle midtone gamma lift (>= 0.75) and
+        //    subtle color-saturation compensation so low-light captures retain natural color.
+        if ev > 1.0 {
+            if let gammaFilter = CIFilter(name: "CIGammaAdjust") {
+                let gammaPower = max(0.75, 1.0 - (ev - 1.0) * 0.08)
+                gammaFilter.setValue(currentCI, forKey: kCIInputImageKey)
+                gammaFilter.setValue(gammaPower, forKey: "inputPower")
+                if let out = gammaFilter.outputImage {
+                    currentCI = out
+                }
+            }
+            if let colorFilter = CIFilter(name: "CIColorControls") {
+                let satBoost = min(1.12, 1.0 + (ev - 1.0) * 0.04)
+                colorFilter.setValue(currentCI, forKey: kCIInputImageKey)
+                colorFilter.setValue(satBoost, forKey: kCIInputSaturationKey)
+                if let out = colorFilter.outputImage {
+                    currentCI = out
+                }
             }
         }
         
-        guard var outputCG = ciContext.createCGImage(currentCI, from: ciInput.extent) else {
+        guard let outputCG = ciContext.createCGImage(currentCI, from: ciInput.extent) else {
             return (cgImage, subjectSrgbY)
-        }
-        
-        // 4. Closed-loop second pass for captured Review/GIF frames:
-        //    If the image started almost pitch-black (e.g. ISO 200 without flash) and is still dimmer
-        //    than 0.42 sRGB after Pass 1, apply a second tone-mapped exposure + gamma lift so it reaches target brightness.
-        if allowClosedLoopSecondPass {
-            let (postSrgbY, postLinearY) = measureSubjectLuminance(outputCG)
-            if postSrgbY < 0.42 {
-                let safePostLinear = max(postLinearY, 0.0015)
-                let secondEV = min(max(log2(targetLinearY / safePostLinear), 0.35), 4.5)
-                var pass2CI = CIImage(cgImage: outputCG)
-                
-                if let exp2 = CIFilter(name: "CIExposureAdjust") {
-                    exp2.setValue(pass2CI, forKey: kCIInputImageKey)
-                    exp2.setValue(secondEV, forKey: kCIInputEVKey)
-                    if let out = exp2.outputImage {
-                        pass2CI = out
-                    }
-                }
-                if let gamma2 = CIFilter(name: "CIGammaAdjust") {
-                    let gPower = max(0.60, 0.90 - secondEV * 0.07)
-                    gamma2.setValue(pass2CI, forKey: kCIInputImageKey)
-                    gamma2.setValue(gPower, forKey: "inputPower")
-                    if let out = gamma2.outputImage {
-                        pass2CI = out
-                    }
-                }
-                if let pass2CG = ciContext.createCGImage(pass2CI, from: pass2CI.extent) {
-                    outputCG = pass2CG
-                }
-            }
         }
         
         return (outputCG, subjectSrgbY)
@@ -1006,7 +1031,9 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     func device(_ device: ICDevice, didOpenSessionWithError error: (any Error)?) {
         if let error = error {
             isOpeningOrHandshaking = false
-            self.statusMessage = "USB Session Error: \(error.localizedDescription)"
+            self.ptpTransport = nil
+            self.cameraDevice = nil
+            self.statusMessage = "USB Session Error: \(error.localizedDescription) — retrying automatically..."
             sessionOpenContinuation?.resume(throwing: error)
             sessionOpenContinuation = nil
             return
@@ -1019,7 +1046,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             return
         }
         
-        // Otherwise (hot-plug via `deviceBrowser(_:didAdd:)`), perform the single handshake here.
+        // Otherwise (hot-plug or auto-discovery loop), perform the single handshake here.
         Task { @MainActor in
             defer { self.isOpeningOrHandshaking = false }
             guard !self.isConnected, let camera = device as? ICCameraDevice else { return }
@@ -1034,8 +1061,11 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 self.isConnected = true
                 self.startKeepAliveLoop()
             } catch {
-                self.statusMessage = "PTP Handshake Error: \(error.localizedDescription)"
+                self.statusMessage = "PTP Handshake Error: \(error.localizedDescription) — retrying..."
                 self.isConnected = false
+                self.ptpTransport = nil
+                try? await camera.requestCloseSession()
+                self.cameraDevice = nil
             }
         }
     }
