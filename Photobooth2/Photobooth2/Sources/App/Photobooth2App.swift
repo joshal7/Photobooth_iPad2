@@ -5,6 +5,16 @@ struct Photobooth2App: App {
     @StateObject private var stateMachine = StateMachine()
     @Environment(\.scenePhase) var scenePhase
     
+    init() {
+        #if DEBUG
+        if CommandLine.arguments.contains("--verify") {
+            Task { @MainActor in
+                await AutomatedVerificationSuite.runAllAndExit()
+            }
+        }
+        #endif
+    }
+    
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -12,9 +22,6 @@ struct Photobooth2App: App {
                 .onAppear {
                     #if DEBUG
                     if CommandLine.arguments.contains("--verify") {
-                        Task { @MainActor in
-                            await AutomatedVerificationSuite.runAllAndExit()
-                        }
                         return
                     }
                     #endif

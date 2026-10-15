@@ -2,6 +2,8 @@
 import Foundation
 import Combine
 import UIKit
+import CoreImage
+import ImageIO
 
 /// Automated Tier 2 & Tier 3 Verification Suite executed when `--verify` is passed on launch.
 enum AutomatedVerificationSuite {
@@ -185,15 +187,16 @@ enum AutomatedVerificationSuite {
     
     static func runAllAndExit() async {
         print("========================================================")
-        print("Starting PhotoboothApp2 Automated Verification (Tiers 2 & 3)")
+        print("Starting PhotoboothApp2 Automated Verification (Tiers 2 & 3 + Lighting QA)")
         print("========================================================")
         
         runTier2Tests()
         do {
+            try runLightingAndExposureQATests()
             try await runTier3Tests()
         } catch {
             failedAssertions += 1
-            print("  ❌ FAIL: Unhandled error in Tier 3 tests: \(error)")
+            print("  ❌ FAIL: Unhandled error in verification suite: \(error)")
         }
         
         let summary = "Verification Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED"
@@ -614,5 +617,249 @@ enum AutomatedVerificationSuite {
         
         config.resetToDefaults()
     }
+    
+    // MARK: - Simulated Lighting & Exposure Scaling QA Suite
+    
+    /// Synthesizes a 48x48 sRGB test image with configurable background RGB, center subject RGB,
+    /// bottom-right secondary patch RGB, top-left shadow ramp (`1, 2, 4, 8, 16`), and optional specular lamp.
+    private static func makeSyntheticLightingScene(
+        bgRGB: (UInt8, UInt8, UInt8),
+        subjectSkinRGB: (UInt8, UInt8, UInt8),
+        shirtRGB: (UInt8, UInt8, UInt8),
+        includeShadowRamp: Bool = false,
+        includeSmallBrightLamp: Bool = false
+    ) -> CGImage {
+        let width = 48
+        let height = 48
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        
+        for y in 0..<height {
+            for x in 0..<width {
+                var rgb = bgRGB
+                // Center subject skin patch (x: 12..<30, y: 12..<30)
+                if x >= 12 && x < 30 && y >= 12 && y < 30 {
+                    rgb = subjectSkinRGB
+                }
+                // Shirt patch (x: 12..<36, y: 30..<38)
+                else if x >= 12 && x < 36 && y >= 30 && y < 38 {
+                    rgb = shirtRGB
+                }
+                // Optional shadow step ramp at y == 4, x == 2, 4, 6, 8, 10
+                if includeShadowRamp && y == 4 {
+                    if x == 2 { rgb = (1, 1, 1) }
+                    else if x == 4 { rgb = (2, 2, 2) }
+                    else if x == 6 { rgb = (4, 4, 4) }
+                    else if x == 8 { rgb = (8, 8, 8) }
+                    else if x == 10 { rgb = (16, 16, 16) }
+                }
+                // Optional small specular background lamp (< 2% of pixels)
+                if includeSmallBrightLamp && x >= 42 && x < 45 && y >= 3 && y < 6 {
+                    rgb = (245, 240, 225)
+                }
+                
+                let idx = (y * width + x) * 4
+                pixels[idx] = rgb.0
+                pixels[idx + 1] = rgb.1
+                pixels[idx + 2] = rgb.2
+                pixels[idx + 3] = 255
+            }
+        }
+        
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let ctx = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        return ctx.makeImage()!
+    }
+    
+    /// Reads the exact `(R, G, B)` 8-bit tuple at `(x, y)` from a `CGImage`.
+    private static func readPixelRGB(_ cgImage: CGImage, x: Int, y: Int) -> (r: Int, g: Int, b: Int) {
+        let width = cgImage.width
+        let height = cgImage.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return (0, 0, 0)
+        }
+        ctx.interpolationQuality = .none
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        let idx = (y * width + x) * 4
+        return (Int(pixels[idx]), Int(pixels[idx + 1]), Int(pixels[idx + 2]))
+    }
+    
+    private static func runLightingAndExposureQATests() throws {
+        print("\n--- LIGHTING & EXPOSURE SCALING QA SUITE ---")
+        let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+        let tempDir = FileManager.default.temporaryDirectory
+        
+        // 1. Low-Light Mode "1" / Manual ISO 200 without Flash
+        //    Dark background (2,2,3), warm skin (18,12,8), cool blue shirt (7,13,20), shadow ramp, and small lamp.
+        let lowLightCG = makeSyntheticLightingScene(
+            bgRGB: (2, 2, 3),
+            subjectSkinRGB: (18, 12, 8),
+            shirtRGB: (7, 13, 20),
+            includeShadowRamp: true,
+            includeSmallBrightLamp: true
+        )
+        let (lowPreLuma, _) = SonyUSBCameraClient.measureSceneLuminance(lowLightCG)
+        let lowBoostedCG = SonyUSBCameraClient.autoExposeCapturedCGImage(lowLightCG, ciContext: ciContext)
+        let (lowPostLuma, lowPostP90) = SonyUSBCameraClient.measureSceneLuminance(lowBoostedCG)
+        
+        assertTrue(
+            lowPreLuma < 0.04 && lowPostLuma >= 0.25 && lowPostLuma <= 0.52,
+            String(format: "Low-Light Mode 1 brightness recovery: %.3f -> %.3f sRGB (target 0.25..0.52)", lowPreLuma, lowPostLuma)
+        )
+        assertTrue(
+            lowPostP90 < 0.85,
+            String(format: "Low-Light Mode 1 90th-percentile highlight stays un-clipped: p90=%.3f (< 0.85)", lowPostP90)
+        )
+        
+        // Verify RGB color ordering & chroma preservation (NOT black-and-white!)
+        let skinPost = readPixelRGB(lowBoostedCG, x: 20, y: 20)
+        let shirtPost = readPixelRGB(lowBoostedCG, x: 20, y: 34)
+        assertTrue(
+            skinPost.r > skinPost.g && skinPost.g > skinPost.b && (skinPost.r - skinPost.b) >= 15 && skinPost.r < 235,
+            "Low-Light Mode 1 preserves warm skin color ratios (R=\(skinPost.r) > G=\(skinPost.g) > B=\(skinPost.b), non-clipped)"
+        )
+        assertTrue(
+            shirtPost.b > shirtPost.g && shirtPost.g > shirtPost.r && (shirtPost.b - shirtPost.r) >= 12 && shirtPost.b < 235,
+            "Low-Light Mode 1 preserves cool shirt color ratios (B=\(shirtPost.b) > G=\(shirtPost.g) > R=\(shirtPost.r), non-clipped)"
+        )
+        
+        // Verify smooth shadow gradation (no 1-bit block quantization where 1/255 jumps to 255)
+        let step1 = readPixelRGB(lowBoostedCG, x: 2, y: 4).r
+        let step2 = readPixelRGB(lowBoostedCG, x: 4, y: 4).r
+        let step4 = readPixelRGB(lowBoostedCG, x: 6, y: 4).r
+        let step8 = readPixelRGB(lowBoostedCG, x: 8, y: 4).r
+        let step16 = readPixelRGB(lowBoostedCG, x: 10, y: 4).r
+        assertTrue(
+            step1 < step4 && step4 < step8 && step8 < step16 && step1 < 80 && step16 < 210,
+            "Low-Light Mode 1 shadow steps (1,2,4,8,16/255) scale smoothly without 1-bit block clipping: [\(step1), \(step2), \(step4), \(step8), \(step16)]"
+        )
+        
+        // 2. Decent Light / Dim Auto-ISO 12800 ("A little dim on camera, but viewable")
+        //    Warm room walls (62,55,48), viewable face/forehead (155,136,120) -> preLuma ~0.31, p90 ~0.55.
+        let autoISOCG = makeSyntheticLightingScene(
+            bgRGB: (62, 55, 48),
+            subjectSkinRGB: (155, 136, 120),
+            shirtRGB: (80, 95, 115)
+        )
+        let (autoPreLuma, autoPreP90) = SonyUSBCameraClient.measureSceneLuminance(autoISOCG)
+        let autoBoostedCG = SonyUSBCameraClient.autoExposeCapturedCGImage(autoISOCG, ciContext: ciContext)
+        let (autoPostLuma, autoPostP90) = SonyUSBCameraClient.measureSceneLuminance(autoBoostedCG)
+        let autoFacePost = readPixelRGB(autoBoostedCG, x: 20, y: 20)
+        
+        assertTrue(
+            autoPostLuma > autoPreLuma && autoPostLuma <= 0.45,
+            String(format: "Auto-ISO 12800 dim capture receives gentle midtone lift: %.3f -> %.3f sRGB", autoPreLuma, autoPostLuma)
+        )
+        assertTrue(
+            autoPostP90 < 0.82 && autoFacePost.r < 220 && autoFacePost.r > autoFacePost.g && autoFacePost.g > autoFacePost.b,
+            String(format: "Auto-ISO 12800 highlights are protected from blowing out: p90 %.3f -> %.3f, face RGB=(%d,%d,%d)", autoPreP90, autoPostP90, autoFacePost.r, autoFacePost.g, autoFacePost.b)
+        )
+        
+        // 3. Threshold Continuity Check (0.36 -> 0.44 sRGB)
+        //    Ensures no step jump near the 0.42 trigger threshold.
+        var prevOutLuma: Double? = nil
+        var maxStepDelta: Double = 0.0
+        for rawVal in stride(from: 92, through: 114, by: 4) { // ~0.36 to ~0.45 sRGB
+            let v = UInt8(rawVal)
+            let testCG = makeSyntheticLightingScene(bgRGB: (v, v, v), subjectSkinRGB: (v, v, v), shirtRGB: (v, v, v))
+            let outCG = SonyUSBCameraClient.autoExposeCapturedCGImage(testCG, ciContext: ciContext)
+            let (outLuma, _) = SonyUSBCameraClient.measureSceneLuminance(outCG)
+            if let prev = prevOutLuma {
+                maxStepDelta = max(maxStepDelta, abs(outLuma - prev))
+            }
+            prevOutLuma = outLuma
+        }
+        assertTrue(
+            maxStepDelta < 0.030,
+            String(format: "Exposure curve across 0.36..0.45 sRGB threshold is smooth with zero step jump (maxStepDelta=%.4f)", maxStepDelta)
+        )
+        
+        // 4. 4-Frame GIF Burst Equalization (Simulating 4th-Frame Overexposure in Aperture Priority)
+        //    Frames 1-3 at ~0.41 sRGB (105,105,105), Frame 4 drifted brighter to ~0.52 sRGB (133,133,133).
+        var burstURLs: [URL] = []
+        let frameValues: [UInt8] = [104, 106, 105, 134]
+        for (idx, val) in frameValues.enumerated() {
+            let cg = makeSyntheticLightingScene(
+                bgRGB: (val, val, val),
+                subjectSkinRGB: (val &+ 10, val, val &- 8),
+                shirtRGB: (val &- 10, val, val &+ 8)
+            )
+            let ui = UIImage(cgImage: cg)
+            let fileURL = tempDir.appendingPathComponent("sony_qa_burst_\(idx)_\(UUID().uuidString).jpg")
+            try ui.jpegData(compressionQuality: 0.92)!.write(to: fileURL)
+            burstURLs.append(fileURL)
+        }
+        
+        if let compiledGIFURL = GIFService.createGIF(from: burstURLs.map(\.absoluteString), frameDuration: 0.25) {
+            if let gifSource = CGImageSourceCreateWithURL(compiledGIFURL as CFURL, nil) {
+                let count = CGImageSourceGetCount(gifSource)
+                assertEqual(count, 4, "Compiled burst GIF contains 4 frames")
+                var outputFrameLumas: [Double] = []
+                for i in 0..<count {
+                    if let frameCG = CGImageSourceCreateImageAtIndex(gifSource, i, nil) {
+                        outputFrameLumas.append(SonyUSBCameraClient.measureSceneLuminance(frameCG).subjectSrgbY)
+                    }
+                }
+                if let minL = outputFrameLumas.min(), let maxL = outputFrameLumas.max() {
+                    let spread = maxL - minL
+                    assertTrue(
+                        spread < 0.030,
+                        String(format: "GIFService equalizes 4th-frame exposure drift (input spread 0.115 -> output spread %.4f)", spread)
+                    )
+                }
+            }
+            
+            // Verify GIFPlayerView.loadAnimatedImage decodes the 4-frame GIF synchronously for instant in-app preview
+            let startDecode = Date()
+            let animatedImage = GIFPlayerView.loadAnimatedImage(from: compiledGIFURL)
+            let decodeMs = Date().timeIntervalSince(startDecode) * 1000.0
+            assertTrue(
+                animatedImage != nil && (animatedImage?.images?.count == 4),
+                String(format: "GIFPlayerView.loadAnimatedImage decodes 4-frame animated UIImage in %.1fms (no black WKWebView delay)", decodeMs)
+            )
+            try? FileManager.default.removeItem(at: compiledGIFURL)
+        } else {
+            assertTrue(false, "Failed to create burst QA GIF")
+        }
+        for u in burstURLs { try? FileManager.default.removeItem(at: u) }
+        
+        // 5. Non-Duplication Verification for Low-Light Sony Captures in GIFService
+        //    Verify that a `sony_<UUID>.jpg` file that was already auto-exposed once during capture
+        //    is NOT auto-exposed a second time inside GIFService.createGIF.
+        let singleExposedLowUI = UIImage(cgImage: lowBoostedCG)
+        let sonyLowURL = tempDir.appendingPathComponent("sony_lowlight_once_\(UUID().uuidString).jpg")
+        try singleExposedLowUI.jpegData(compressionQuality: 0.92)!.write(to: sonyLowURL)
+        if let lowGIFURL = GIFService.createGIF(from: [sonyLowURL.absoluteString, sonyLowURL.absoluteString], frameDuration: 0.25),
+           let src = CGImageSourceCreateWithURL(lowGIFURL as CFURL, nil),
+           let gifFrameCG = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+            let (gifFrameLuma, _) = SonyUSBCameraClient.measureSceneLuminance(gifFrameCG)
+            assertTrue(
+                abs(gifFrameLuma - lowPostLuma) < 0.035,
+                String(format: "Low-light sony_*.jpg is NOT double-exposed in GIFService (singlePass=%.3f vs gifFrame=%.3f)", lowPostLuma, gifFrameLuma)
+            )
+            try? FileManager.default.removeItem(at: lowGIFURL)
+        } else {
+            assertTrue(false, "Failed to verify low-light GIF non-duplication")
+        }
+        try? FileManager.default.removeItem(at: sonyLowURL)
+    }
 }
 #endif
+

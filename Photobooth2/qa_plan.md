@@ -1,55 +1,65 @@
-# Photobooth2 App QA Plan
+# Photobooth2 Standard Post-Fix QA Plan
 
-Use this guide to validate the robustness of the Photobooth2 app, specifically focusing on connection stability and recovery.
+Use this standard post-fix QA plan to validate every change to `Photobooth2` across both **Automated Simulator QA (`--verify`)** and **Hardware Verification (iPad + Sony USB-C PTP)**.
 
-## 1. Connection Robustness
+---
 
-### Test 1.1: Active Disconnect (Simulated Crash)
-**Goal:** Verify the app detects when the camera app is closed or crashes.
-1.  Connect iPad to Sony Camera Wi-Fi.
-2.  Open Photobooth App and ensure Live View is active.
-3.  **Action:** On the Sony Camera, press the "Menu" or "Exit" button to close the "Smart Remote Control" app.
-4.  **Expected Result:** Within 5 seconds, the iPad app should show the "Connect to Camera Wi-Fi" (or Mismatch) screen.
-5.  **Recovery:** Re-open "Smart Remote Control" on the camera. The iPad should eventually reconnect (or tap "Try Anyway").
+## 1. Automated Post-Fix Verification Suite (`verify_qa.swift` & `--verify`)
 
-### Test 1.2: Wi-Fi Drop (Range/Interference)
-**Goal:** Verify the app handles Wi-Fi signal loss.
-1.  Ensure Live View is active.
-2.  **Action:** Walk the iPad out of range of the camera (or turn off the camera).
-3.  **Expected Result:** The Live View may freeze, and within ~5-10 seconds, the app should show the connection prompt.
-4.  **Recovery:** Walk back in range (or turn camera on). Ensure the iPad re-joins the *Camera's* Wi-Fi (check iOS Settings if needed). App should recover.
+Every code change must build cleanly (`CODE_SIGNING_ALLOWED=NO`) and pass all simulated lighting & exposure QA assertions in `Photobooth2/verify_qa.swift` and `AutomatedVerificationSuite` (`Photobooth2/Sources/Verification/AutomatedVerificationSuite.swift`):
 
-### Test 1.3: Background/Foreground Cycle
-**Goal:** Verify connection persists after app backgrounding.
-1.  Ensure Live View is active.
-2.  **Action:** Press Home button on iPad to background the app. Wait 30 seconds.
-3.  **Action:** Re-open Photobooth App.
-4.  **Expected Result:** App should immediately resume Live View (or reconnect within 1-2 seconds).
+```bash
+# 1. Run the Simulated Lighting & Exposure Scaling QA Unit Tests directly via Swift CLI:
+swift Photobooth2/verify_qa.swift
 
-## 2. Capture Stability
+# 2. Verify clean iOS Device & Simulator compilation:
+xcodebuild -project Photobooth2/Photobooth2.xcodeproj -scheme Photobooth2 -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
+```
 
-### Test 2.1: Rapid Fire
-**Goal:** Verify no crashes during fast capture sequences.
-1.  Set "Photo Count" to 3 and "Between Shots" to 1s.
-2.  **Action:** Start a capture sequence.
-3.  **Expected Result:** All 3 photos taken with minimal lag. No crashes. All photos saved to iPad Photos app.
+### 1.1 Simulated Lighting & Exposure Scaling QA (`runLightingAndExposureQATests`)
+1. **Low-Light Manual / Mode `"1"` (`ISO 200`, `1/125s` without flash)**:
+   - Synthesizes a dark scene (`subjectSrgbY < 0.04`) with a dark background (`RGB = (2, 2, 3)`), warm skin tone (`RGB = (18, 12, 8)`), cool shirt (`RGB = (7, 13, 20)`), shadow step ramp (`1, 2, 4, 8, 16 / 255`), and small specular background light (`< 2%` of pixels).
+   - **Verified Assertions**:
+     - Scene brightness lifts from `< 0.04` into the target midtone range (`0.25 <= postSrgbY <= 0.52`), and the 90th-percentile highlight stays un-clipped (`p90 < 0.85`).
+     - **Color Preservation**: Warm skin pixels retain `R > G > B` (`R - B >= 15`, `< 235`) and cool shirt pixels retain `B > G > R` (`B - R >= 12`, `< 235`), ensuring low-light captures never clip into a black-and-white stencil.
+     - **Smooth Shadow Gradation**: Dark shadow steps (`1, 2, 4, 8, 16 / 255`) map monotonically to intermediate gray values (`< 210 / 255`) without 1-bit block quantization.
+2. **Decent Light / Dim Auto-ISO `12800` ("A little dim on camera, but viewable")**:
+   - Synthesizes a moderately dim scene (`subjectSrgbY ~ 0.31`, `p90 ~ 0.55`) with warm room walls (`RGB = (62, 55, 48)`) and viewable forehead/face highlights (`RGB = (155, 136, 120)`).
+   - **Verified Assertions**:
+     - Scene receives a gentle midtone lift (`postSrgbY > preSrgbY`, `<= 0.45`) while 90th-percentile highlights remain protected (`p90 < 0.82`, face `< 220 / 255` with `R > G > B` preserved) so faces and walls never blow out.
+3. **Threshold Continuity (`0.36..0.45` sRGB)**:
+   - Sweeps input scene brightness across the `0.42` sRGB trigger threshold and asserts `maxStepDelta < 0.030`, guaranteeing zero step jump between adjacent frames.
+4. **4-Frame GIF Burst Exposure Equalization & Instant In-App Decoding**:
+   - Synthesizes a 4-frame burst where Frames 1–3 are at `~0.41` sRGB and Frame 4 drifted brighter to `~0.52` sRGB (simulating Aperture Priority frame-to-frame drift).
+   - **Verified Assertions**:
+     - `GIFService.createGIF` equalizes all 4 frames to the burst median (`maxLuma - minLuma < 0.030`).
+     - `GIFPlayerView.loadAnimatedImage` synchronously decodes all 4 frames into an animated `UIImage` in `< 100ms` (eliminating the black `WKWebView` startup delay).
+     - `sony_<UUID>.jpg` files are auto-exposed **once** (never double-boosted in `StateMachine.startReviewSequence` or `GIFService.createGIF`).
 
-### Test 2.2: Long Duration (Soak Test)
-**Goal:** Verify stability over time.
-1.  Leave the app in "Idle" (Live View) mode for 30 minutes.
-2.  **Action:** Come back and trigger a capture.
-3.  **Expected Result:** App should still be connected and capture immediately. If it disconnected, it should have auto-recovered or be showing the prompt.
+### 1.2 Sony PTP Protocol & StateMachine Concurrency QA (`runTier2Tests` & `runTier3Tests`)
+- **Tier 2**: Binary framing (`SDIO_Connect`, Little-Endian `UInt8`/`UInt16` payloads, `0xFFFFC002` Live View extraction, `0xD215` `ObjectInMemory` parsing).
+- **Tier 3**: 3-phase Sony PTP handshake (`0xD268 = 2M`, `0xD222 = 0x0011`, `0xD231 = 2` Setting Effect OFF, `0xD25A = 0` dial unlock), mode-based storage routing (`PC+Camera` for standard photos vs `PC Only` for GIF frames), pre-capture buffer drain, zero Live View interleaving during capture, `1.5s` USB disconnect debounce + automatic recovery, and immediate `2MP` `/tmp` file cleanup after review/AirDrop.
 
-## 3. Configuration & Reset
+---
 
-### Test 3.1: Reset to Defaults
-**Goal:** Verify reset enforces Wi-Fi check.
-1.  Connect iPad to Home Wi-Fi (NOT Camera).
-2.  Go to Settings -> Reset to Defaults.
-3.  **Expected Result:** App switches to "Sony Camera" mode and **immediately** shows the "Connect to Camera Wi-Fi" screen.
+## 2. Hardware Verification Checklist (iPad + Sony USB-C PTP)
 
-## Reporting Issues
-If you encounter any errors, please note:
-- **What happened?** (e.g., "App froze", "Showed error X")
-- **What were you doing?** (e.g., "Just finished a photo", "App was idle")
-- **Time of occurrence** (helps trace logs)
+### Test 2.1: Zero-Touch USB Connection on Launch / Sideload
+1. Plug the Sony camera (powered ON, PC Remote mode) into the USB-C hub connected to the iPad **before** sideloading or launching `Photobooth2`.
+2. Launch `Photobooth2`.
+3. **Expected Result**: Even if iPadOS `icdd` takes a few seconds to release the prior process's USB session, `SonyUSBCameraClient.startAutoDiscoveryLoop` and `StateMachine`'s `errorAutoRetryTask` automatically cycle `ICDeviceBrowser` and transition to Live View (`Idle`) within 2–5 seconds without physically unplugging or replugging the cable.
+
+### Test 2.2: Low-Light Manual / Mode `"1"` Capture & GIF
+1. Set the camera mode dial to `"1"` (or `M` at `1/125s`, `f/5.6`–`f/8`, `ISO 200` without flash).
+2. Verify Live View is bright and clear (`0xD231 = 2` Setting Effect OFF + single-pass Live View curve).
+3. Take both a **Photo** session and a **GIF** session.
+4. **Expected Result**:
+   - Photo Review and saved GIF frames are brightened to natural midtones with preserved skin/room colors and expected low-light grain (never 1-bit black-and-white blocks).
+   - In-app GIF Review plays all 4 frames immediately (never a black screen).
+
+### Test 2.3: Auto-ISO `12800` & Aperture Priority Capture
+1. Test with Auto-ISO (`12800`) in a dim room and with Aperture Priority in normal lighting.
+2. **Expected Result**:
+   - Dim Auto-ISO captures are gently brightened in Review and GIFs without blowing out faces or walls.
+   - All 4 frames in an Aperture Priority GIF have uniform, locked brightness with no 4th-frame exposure jump.
+

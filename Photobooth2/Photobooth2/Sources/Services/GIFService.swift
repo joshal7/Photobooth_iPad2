@@ -127,8 +127,9 @@ final class GIFService: Sendable {
             : sortedLumas[mid]
         
         for entry in loadedFrames {
-            let deltaEV = log2(medianLuma / entry.luma)
-            let clampedDeltaEV = min(max(deltaEV, -0.65), 0.65)
+            // Convert sRGB luminance ratio to linear stops (sRGB ~ linear^(1/2.2)) for CIExposureAdjust
+            let deltaEV = 2.2 * log2(medianLuma / entry.luma)
+            let clampedDeltaEV = min(max(deltaEV, -1.20), 1.20)
             let finalCG: CGImage
             if abs(clampedDeltaEV) > 0.04,
                let exposureFilter = CIFilter(name: "CIExposureAdjust") {

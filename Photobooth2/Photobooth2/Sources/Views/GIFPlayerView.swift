@@ -46,7 +46,7 @@ struct GIFPlayerView: UIViewRepresentable {
         }
     }
     
-    private static func loadAnimatedImage(from url: URL) -> UIImage? {
+    static func loadAnimatedImage(from url: URL) -> UIImage? {
         let resolvedURL: URL
         if url.isFileURL {
             resolvedURL = url
