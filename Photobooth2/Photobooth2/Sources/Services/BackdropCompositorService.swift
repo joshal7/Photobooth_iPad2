@@ -29,7 +29,7 @@ final class BackdropCompositorService: Sendable {
             
             guard let loaded = loader() else { return nil }
             lock.lock()
-            if cache.count > 24 {
+            if cache.count >= 8 {
                 cache.removeAll()
             }
             cache[key] = loaded
@@ -89,13 +89,47 @@ final class BackdropCompositorService: Sendable {
         customMaskProvider: ((CIImage) -> CIImage?)? = nil
     ) -> CGImage {
         guard !backdrop.isNone else { return cgImage }
+        let subjectCI = CIImage(cgImage: cgImage)
+        return composite(
+            subjectCI: subjectCI,
+            backdrop: backdrop,
+            quality: quality,
+            ciContext: ciContext,
+            customBackgroundData: customBackgroundData,
+            customForegroundData: customForegroundData,
+            additionalSearchDirectories: additionalSearchDirectories,
+            customMaskProvider: customMaskProvider
+        ) ?? cgImage
+    }
+    
+    /// Single-pass `CIImage` compositor used by both `composite(cgImage:...)` and 30 FPS `LocalCameraClient` Live View
+    /// (avoiding an intermediate `createCGImage` pass before segmentation).
+    nonisolated static func composite(
+        subjectCI: CIImage,
+        backdrop: BackdropItem,
+        quality: SegmentationQuality,
+        ciContext: CIContext,
+        customBackgroundData: Data? = nil,
+        customForegroundData: Data? = nil,
+        additionalSearchDirectories: [URL] = [],
+        customMaskProvider: ((CIImage) -> CIImage?)? = nil
+    ) -> CGImage? {
+        let rawExtent = subjectCI.extent
+        let targetWidth = rawExtent.width
+        let targetHeight = rawExtent.height
+        guard targetWidth > 1, targetHeight > 1 else { return nil }
         
-        let targetWidth = CGFloat(cgImage.width)
-        let targetHeight = CGFloat(cgImage.height)
-        guard targetWidth > 1, targetHeight > 1 else { return cgImage }
+        let normalizedSubject: CIImage
+        if rawExtent.minX != 0 || rawExtent.minY != 0 {
+            normalizedSubject = subjectCI.transformed(by: CGAffineTransform(translationX: -rawExtent.minX, y: -rawExtent.minY))
+        } else {
+            normalizedSubject = subjectCI
+        }
         let targetExtent = CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight)
         
-        let subjectCI = CIImage(cgImage: cgImage)
+        guard !backdrop.isNone else {
+            return ciContext.createCGImage(normalizedSubject, from: targetExtent)
+        }
         
         // Load optional Background CIImage
         let bgCI: CIImage? = loadLayerCIImage(
@@ -113,20 +147,22 @@ final class BackdropCompositorService: Sendable {
             additionalSearchDirectories: additionalSearchDirectories
         )
         
-        guard bgCI != nil || fgCI != nil else { return cgImage }
+        guard bgCI != nil || fgCI != nil else {
+            return ciContext.createCGImage(normalizedSubject, from: targetExtent)
+        }
         
         // Layer 1 + Layer 2: Background Replacement (only runs Vision segmentation if a background image is active)
-        var compositedCI: CIImage = subjectCI
+        var compositedCI: CIImage = normalizedSubject
         if let rawBg = bgCI {
             let scaledBg = scaleImage(rawBg, to: targetExtent, mode: .aspectFill)
             if let maskCI = generatePersonMask(
-                for: subjectCI,
+                for: normalizedSubject,
                 targetExtent: targetExtent,
                 quality: quality,
                 customMaskProvider: customMaskProvider
             ) {
                 if let blendFilter = CIFilter(name: "CIBlendWithMask") {
-                    blendFilter.setValue(subjectCI, forKey: kCIInputImageKey)
+                    blendFilter.setValue(normalizedSubject, forKey: kCIInputImageKey)
                     blendFilter.setValue(scaledBg, forKey: kCIInputBackgroundImageKey)
                     blendFilter.setValue(maskCI, forKey: kCIInputMaskImageKey)
                     if let blended = blendFilter.outputImage?.cropped(to: targetExtent) {
@@ -142,7 +178,7 @@ final class BackdropCompositorService: Sendable {
             compositedCI = scaledFg.composited(over: compositedCI).cropped(to: targetExtent)
         }
         
-        return ciContext.createCGImage(compositedCI, from: targetExtent) ?? cgImage
+        return ciContext.createCGImage(compositedCI, from: targetExtent)
     }
     
     // MARK: - Vision Person Segmentation + Edge Feathering
@@ -237,6 +273,19 @@ final class BackdropCompositorService: Sendable {
         }
     }
     
+    nonisolated private static func decodeBitmapBackedCIImage(from source: CGImageSource) -> CIImage? {
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 4096,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        if let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, opts as CFDictionary) {
+            return CIImage(cgImage: cg)
+        }
+        return nil
+    }
+    
     nonisolated private static func loadLayerCIImage(
         filename: String?,
         customData: Data?,
@@ -246,7 +295,11 @@ final class BackdropCompositorService: Sendable {
         if let data = customData, !data.isEmpty {
             let key = "\(cachePrefix)_data_\(data.count)"
             return AssetImageCache.shared.image(forKey: key) {
-                CIImage(data: data, options: [.applyOrientationProperty: true])
+                if let src = CGImageSourceCreateWithData(data as CFData, nil),
+                   let decoded = decodeBitmapBackedCIImage(from: src) {
+                    return decoded
+                }
+                return CIImage(data: data, options: [.applyOrientationProperty: true])
             }
         }
         guard let filename = filename, !filename.isEmpty else { return nil }
@@ -256,6 +309,10 @@ final class BackdropCompositorService: Sendable {
                 filename: filename,
                 additionalSearchDirectories: additionalSearchDirectories
             ) else { return nil }
+            if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let decoded = decodeBitmapBackedCIImage(from: src) {
+                return decoded
+            }
             return CIImage(contentsOf: url, options: [.applyOrientationProperty: true])
         }
     }

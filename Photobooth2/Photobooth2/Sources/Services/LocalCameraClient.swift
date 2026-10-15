@@ -18,7 +18,7 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
     private let photoOutput = AVCapturePhotoOutput()
     private let videoOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "camera.session.queue")
-    nonisolated private let ciContext = CIContext()
+    nonisolated private let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
     
     private nonisolated final class ThreadSafeState: @unchecked Sendable {
         private let lock = NSLock()
@@ -227,26 +227,20 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
         guard let cvBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let rawCI = CIImage(cvPixelBuffer: cvBuffer)
         
-        // Pre-orient and horizontally mirror raw front-camera frame BEFORE compositing any foreground text/frame
+        // Pre-orient and horizontally mirror raw front-camera frame BEFORE compositing any foreground text/frame,
+        // then render (and optionally segment/composite) in a SINGLE createCGImage GPU pass.
         let orientedMirroredCI = BackdropCompositorService.orientAndMirrorFrontCameraCIImage(
             rawCI,
             interfaceOrientation: deviceOrientation
         )
         
-        guard let rawCG = self.ciContext.createCGImage(orientedMirroredCI, from: orientedMirroredCI.extent) else {
+        guard let finalCG = BackdropCompositorService.composite(
+            subjectCI: orientedMirroredCI,
+            backdrop: selectedBackdrop,
+            quality: .liveFast,
+            ciContext: self.ciContext
+        ) else {
             return
-        }
-        
-        let finalCG: CGImage
-        if !selectedBackdrop.isNone {
-            finalCG = BackdropCompositorService.composite(
-                cgImage: rawCG,
-                backdrop: selectedBackdrop,
-                quality: .liveFast,
-                ciContext: self.ciContext
-            )
-        } else {
-            finalCG = rawCG
         }
         
         let uiImage = UIImage(cgImage: finalCG, scale: 1.0, orientation: .up)

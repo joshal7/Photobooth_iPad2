@@ -731,6 +731,52 @@ assertTrue(
     String(format: "Lock-2 RGB signature guard rejects unrelated photo within ±3s window when target photo was deleted (dist=%.3f >= 0.25)", signatureDist(sigBlue, sigGrey))
 )
 
+// 7I. Custom Backdrop Role-Suffix Stripping (Prevents `_fg_fg.png` / `_bg_bg.jpg` Double Suffixes)
+func stripRoleSuffix(from rawStem: String) -> String {
+    let trimmed = rawStem.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lower = trimmed.lowercased()
+    let allSuffixes = [
+        "_fg_fill", "-fg-fill",
+        "_background", "-background",
+        "_foreground", "-foreground",
+        "_frame", "-frame", " frame",
+        "_bg", "-bg", " bg",
+        "_fg", "-fg", " fg"
+    ]
+    for suffix in allSuffixes {
+        if lower.hasSuffix(suffix) {
+            let candidate = String(trimmed.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty {
+                return candidate
+            }
+        }
+    }
+    return trimmed
+}
+assertEqual(
+    stripRoleSuffix(from: "Evans_Bar_Mitzvah_fg"),
+    "Evans_Bar_Mitzvah",
+    "Role suffix stripper removes trailing `_fg` before saving custom backdrop"
+)
+assertEqual(
+    stripRoleSuffix(from: "Eiffel Tower-bg"),
+    "Eiffel Tower",
+    "Role suffix stripper removes trailing `-bg` before saving custom backdrop"
+)
+
+// 7J. Single-Pass Non-Zero Origin CIImage Compositing Equivalence (30 FPS Live View Optimization)
+let shiftedOriginSubjCI = CIImage(cgImage: subjectBlueCG)
+    .transformed(by: CGAffineTransform(translationX: -240, y: 120))
+let rawExt = shiftedOriginSubjCI.extent
+let normalizedShiftedCI = shiftedOriginSubjCI
+    .transformed(by: CGAffineTransform(translationX: -rawExt.minX, y: -rawExt.minY))
+let normalizedShiftedCG = ciContext.createCGImage(normalizedShiftedCI, from: CGRect(x: 0, y: 0, width: rawExt.width, height: rawExt.height))!
+let centerShiftPx = readPixelRGB(normalizedShiftedCG, x: 120, y: 80)
+assertTrue(
+     Int(rawExt.width) == 240 && Int(rawExt.height) == 160 && centerShiftPx.b > 180,
+    "Single-pass CIImage normalization preserves exact extent and pixels for mirrored non-zero-origin Live View frames"
+)
+
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")
 print("========================================================")

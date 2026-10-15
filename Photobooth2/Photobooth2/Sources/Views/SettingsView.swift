@@ -638,8 +638,9 @@ struct AddCustomBackdropSheet: View {
                     if let data = try? Data(contentsOf: url), let img = UIImage(data: data) {
                         backgroundData = img.jpegData(compressionQuality: 0.92) ?? data
                         backgroundPreview = img
-                        if displayName.isEmpty {
-                            displayName = url.deletingPathExtension().lastPathComponent
+                        if displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            let cleanStem = BackdropManager.stripRoleSuffix(from: url.deletingPathExtension().lastPathComponent)
+                            displayName = BackdropManager.humanizeDisplayName(from: cleanStem)
                         }
                     }
                 }
@@ -655,8 +656,9 @@ struct AddCustomBackdropSheet: View {
                     if let data = try? Data(contentsOf: url), let img = UIImage(data: data) {
                         foregroundData = img.pngData() ?? data
                         foregroundPreview = img
-                        if displayName.isEmpty {
-                            displayName = url.deletingPathExtension().lastPathComponent
+                        if displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            let cleanStem = BackdropManager.stripRoleSuffix(from: url.deletingPathExtension().lastPathComponent)
+                            displayName = BackdropManager.humanizeDisplayName(from: cleanStem)
                         }
                     }
                 }

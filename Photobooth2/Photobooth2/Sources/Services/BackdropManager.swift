@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import ImageIO
 import Combine
 
 final class BackdropManager: ObservableObject {
@@ -139,8 +140,8 @@ final class BackdropManager: ObservableObject {
         fitMode: ForegroundFitMode = .stretchToEdges
     ) -> BackdropItem? {
         ensureDocumentsBackdropsDirectoryExists()
-        let rawTrimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmed = rawTrimmed.isEmpty ? "Custom Backdrop" : rawTrimmed
+        let stripped = Self.stripRoleSuffix(from: displayName).trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = stripped.isEmpty ? "Custom Backdrop" : stripped
         guard backgroundData != nil || foregroundPNGData != nil else { return nil }
         
         let safeStem = trimmed
@@ -219,6 +220,29 @@ final class BackdropManager: ObservableObject {
         return parts.joined(separator: "_")
     }
     
+    /// Strips any trailing `_bg`, `-bg`, `_fg`, `-fg`, `_frame`, `-frame`, etc. suffix from a filename stem.
+    nonisolated static func stripRoleSuffix(from rawStem: String) -> String {
+        let trimmed = rawStem.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        let allSuffixes = [
+            "_fg_fill", "-fg-fill",
+            "_background", "-background",
+            "_foreground", "-foreground",
+            "_frame", "-frame", " frame",
+            "_bg", "-bg", " bg",
+            "_fg", "-fg", " fg"
+        ]
+        for suffix in allSuffixes {
+            if lower.hasSuffix(suffix) {
+                let candidate = String(trimmed.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !candidate.isEmpty {
+                    return candidate
+                }
+            }
+        }
+        return trimmed
+    }
+    
     nonisolated static func humanizeDisplayName(from rawStem: String) -> String {
         let spaced = rawStem
             .replacingOccurrences(of: "_", with: " ")
@@ -239,8 +263,16 @@ final class BackdropManager: ObservableObject {
     
     nonisolated private static func isTransparentCenterPNG(url: URL) -> Bool {
         guard url.pathExtension.lowercased() == "png",
-              let img = UIImage(contentsOfFile: url.path),
-              let cg = img.cgImage else {
+              let src = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            return false
+        }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 64,
+            kCGImageSourceShouldCache: false
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else {
             return false
         }
         let alphaInfo = cg.alphaInfo
@@ -488,6 +520,21 @@ final class BackdropManager: ObservableObject {
     
     // MARK: - Carousel Composite Thumbnail Generator
     
+    nonisolated private static func downsampledUIImage(at url: URL, maxPixelSize: Int = 336) -> UIImage? {
+        if let src = CGImageSourceCreateWithURL(url as CFURL, nil) {
+            let opts: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
+                return UIImage(cgImage: cg)
+            }
+        }
+        return UIImage(contentsOfFile: url.path)
+    }
+    
     func thumbnail(for item: BackdropItem) -> UIImage? {
         if item.isNone { return nil }
         if let cached = thumbnailCache[item.id] {
@@ -499,8 +546,8 @@ final class BackdropManager: ObservableObject {
         let bgURL = Self.resolveAssetURL(filename: item.backgroundFilename)
         let fgURL = Self.resolveAssetURL(filename: item.foregroundFilename)
         
-        let bgImage = bgURL.flatMap { UIImage(contentsOfFile: $0.path) }
-        let fgImage = fgURL.flatMap { UIImage(contentsOfFile: $0.path) }
+        let bgImage = bgURL.flatMap { Self.downsampledUIImage(at: $0, maxPixelSize: 336) }
+        let fgImage = fgURL.flatMap { Self.downsampledUIImage(at: $0, maxPixelSize: 336) }
         
         let thumb = renderer.image { ctx in
             let rect = CGRect(origin: .zero, size: size)
