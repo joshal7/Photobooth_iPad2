@@ -56,64 +56,6 @@ struct TopCenterPerimeterRoundedRect: Shape {
     }
 }
 
-/// Animatable clockwise screen-perimeter bezel trace (22pt thickness) with a 5% guide track and
-/// a 10% trailing -> 30% leading opacity gradient that blends into the 0.2s vignette flash.
-struct GIFPerimeterSweepOverlay: View, Animatable {
-    var progress: CGFloat
-    
-    var animatableData: CGFloat {
-        get { progress }
-        set { progress = newValue }
-    }
-    
-    private let strokeWidth: CGFloat = 22
-    private let cornerRadius: CGFloat = 28
-    
-    var body: some View {
-        ZStack {
-            if progress > 0.001 {
-                // 1. Subtle 5% white background track showing the remaining perimeter path
-                TopCenterPerimeterRoundedRect(cornerRadius: cornerRadius)
-                    .inset(by: strokeWidth * 0.5)
-                    .stroke(Color.white.opacity(0.05), lineWidth: strokeWidth)
-                
-                // 2. Clockwise filled sweep with 10% trailing -> 30% leading angular gradient.
-                //    During the final 15% of the sweep (0.85 -> 1.0), the trailing opacity rises
-                //    from 10% to 30% so the perimeter unifies cleanly right as the flash fires.
-                let clampedProgress = min(max(progress, 0.0), 1.0)
-                let endCharge = max(0.0, (clampedProgress - 0.85) / 0.15)
-                let trailingOpacity = 0.10 + (0.20 * Double(endCharge))
-                let midOpacity = 0.20 + (0.10 * Double(endCharge))
-                let leadingOpacity = 0.30
-                
-                TopCenterPerimeterRoundedRect(cornerRadius: cornerRadius)
-                    .inset(by: strokeWidth * 0.5)
-                    .trim(from: 0.0, to: clampedProgress)
-                    .stroke(
-                        AngularGradient(
-                            gradient: Gradient(stops: [
-                                // Start the angular gradient 4° left of 12 o'clock (-94°) and hold trailingOpacity
-                                // through 12 o'clock (location 0.012) so the 11pt rounded start cap sticking out
-                                // slightly left of Top-Center gets trailingOpacity (10%) instead of wrapping to 30%.
-                                .init(color: Color.white.opacity(trailingOpacity), location: 0.0),
-                                .init(color: Color.white.opacity(trailingOpacity), location: 0.012),
-                                .init(color: Color.white.opacity(midOpacity), location: max(0.015, 0.012 + Double(clampedProgress) * 0.55)),
-                                .init(color: Color.white.opacity(leadingOpacity), location: max(0.020, min(0.999, 0.012 + Double(clampedProgress))))
-                            ]),
-                            center: .center,
-                            startAngle: .degrees(-94),
-                            endAngle: .degrees(266)
-                        ),
-                        style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round, lineJoin: .round)
-                    )
-                    .shadow(color: Color.white.opacity(0.12), radius: 6)
-            }
-        }
-        .edgesIgnoringSafeArea(.all)
-        .allowsHitTesting(false)
-    }
-}
-
 /// Crisp 0.2s perimeter vignette flash that expands directly from the 22pt perimeter trace
 /// when each GIF frame is captured, giving clear shutter feedback without blinding the center Live View.
 struct GIFVignetteFlashOverlay: View {
@@ -137,13 +79,45 @@ struct GIFVignetteFlashOverlay: View {
     }
 }
 
-/// Sleek Top-Center progress dot pill for GIF mode.
+/// Animatable left-to-right wait bar fill rendered inside the Top-Center pill capsule background in GIF mode.
+/// Fills from left (10% trailing white opacity) to right (30% leading white opacity), completing just before the flash.
+struct PillWaitBarFill: View, Animatable {
+    var progress: CGFloat
+    
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+    
+    var body: some View {
+        GeometryReader { geo in
+            let clamped = min(max(progress, 0.0), 1.0)
+            if clamped > 0.001 {
+                LinearGradient(
+                    gradient: Gradient(stops: [
+                        .init(color: Color.white.opacity(0.10), location: 0.0),
+                        .init(color: Color.white.opacity(0.20), location: 0.60),
+                        .init(color: Color.white.opacity(0.30), location: 1.0)
+                    ]),
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: geo.size.width * clamped, height: geo.size.height)
+            }
+        }
+    }
+}
+
+/// Sleek Top-Center progress dot pill shared by GIF mode and Photo mode.
 /// - Completed frames (`index < activeFrameIndex`): solid white filled circle (20pt)
 /// - Current frame (`index == activeFrameIndex`, about to be taken): 1.5x size (30pt) with pulsing white center
 /// - Future frames (`index > activeFrameIndex`): hollow white circle (20pt)
+/// - In GIF mode, `waitProgress` (0.0 -> 1.0) fills the pill's glassy black background from left to right
+///   with a 10% trailing -> 30% leading white gradient just before the next flash.
 struct GIFProgressDotsPillView: View {
     let totalFrames: Int
     let activeFrameIndex: Int
+    var waitProgress: CGFloat = 0.0
     
     @State private var isPulsing: Bool = false
     
@@ -158,7 +132,12 @@ struct GIFProgressDotsPillView: View {
         }
         .padding(.horizontal, 26)
         .padding(.vertical, 14)
-        .background(Color.black.opacity(0.48))
+        .background(
+            ZStack(alignment: .leading) {
+                Color.black.opacity(0.48)
+                PillWaitBarFill(progress: waitProgress)
+            }
+        )
         .clipShape(Capsule())
         .overlay(
             Capsule()

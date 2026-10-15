@@ -388,18 +388,18 @@ if let lowGIFURL = createEqualizedGIF(from: [sonyLowURL, sonyLowURL], frameDurat
 }
 try? FileManager.default.removeItem(at: sonyLowURL)
 
-// 6. GIF Perimeter Sweep Opacity (5% track, 10% trailing -> 30% leading) & Progress Dot State Verification
-func computeTrailingOpacity(progress: Double) -> Double {
+// 6. Top-Center Pill Wait Bar (10% trailing -> 30% leading left-to-right fill) & Photo/GIF Progress Dot Verification
+func computePillWaitBarFillWidth(pillWidth: Double, progress: Double) -> Double {
     let clamped = min(max(progress, 0.0), 1.0)
-    let endCharge = max(0.0, (clamped - 0.85) / 0.15)
-    return 0.10 + (0.20 * endCharge)
+    return pillWidth * clamped
 }
-let midSweepTrailing = computeTrailingOpacity(progress: 0.50)
-let finalSweepTrailing = computeTrailingOpacity(progress: 1.00)
-let leftCapNubLocation = (-91.5 - (-94.0)) / 360.0 // ~0.00694, safely inside [0.0, 0.012] trailingOpacity plateau
+let pillWidth = 220.0
+let halfFill = computePillWaitBarFillWidth(pillWidth: pillWidth, progress: 0.50)
+let fullFill = computePillWaitBarFillWidth(pillWidth: pillWidth, progress: 1.00)
+let photoModeFill = computePillWaitBarFillWidth(pillWidth: pillWidth, progress: 0.0)
 assertTrue(
-    abs(midSweepTrailing - 0.10) < 0.001 && abs(finalSweepTrailing - 0.30) < 0.001 && leftCapNubLocation > 0.0 && leftCapNubLocation < 0.012,
-    String(format: "GIF 22pt perimeter sweep trailing opacity stays at %.2f (including left start-cap nub at loc=%.4f) and unifies to %.2f at 12 o'clock", midSweepTrailing, leftCapNubLocation, finalSweepTrailing)
+    abs(halfFill - 110.0) < 0.001 && abs(fullFill - 220.0) < 0.001 && abs(photoModeFill - 0.0) < 0.001,
+    String(format: "Top-Center pill wait bar fills left-to-right (10%% trailing -> 30%% leading: 50%%=%.0fpt, 100%%=%.0fpt, PhotoMode=%.0fpt)", halfFill, fullFill, photoModeFill)
 )
 
 print("========================================================")

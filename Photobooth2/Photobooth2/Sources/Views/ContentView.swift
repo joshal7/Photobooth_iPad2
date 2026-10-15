@@ -106,15 +106,13 @@ struct ContentView: View {
                     }
                     
                     if stateMachine.captureMode == .gif {
-                        // Clockwise 22pt perimeter bezel sweep between GIF frames
-                        GIFPerimeterSweepOverlay(progress: stateMachine.gifPerimeterProgress)
-                        
-                        // Sleek Top-Center progress dots pill (shown after "Look at Camera" arrow & message go away)
+                        // Sleek Top-Center progress dots pill with left-to-right wait bar fill (shown after "Look at Camera" arrow & message go away)
                         if !stateMachine.showGuidance && stateMachine.currentGIFFrameIndex > 0 {
                             VStack {
                                 GIFProgressDotsPillView(
                                     totalFrames: ConfigManager.shared.gifFrameCount,
-                                    activeFrameIndex: stateMachine.currentGIFFrameIndex
+                                    activeFrameIndex: stateMachine.currentGIFFrameIndex,
+                                    waitProgress: stateMachine.gifPerimeterProgress
                                 )
                                 .padding(.top, 26)
                                 Spacer()
@@ -123,20 +121,19 @@ struct ContentView: View {
                             .zIndex(3)
                         }
                     } else {
-                        // Standard Photo Mode counter in upper right
-                        if stateMachine.currentPhotoNumber > 0 {
+                        // Standard Photo Mode: Top-Center progress dots pill (without wait bar fill), shown after "Look at Camera" goes away
+                        if !stateMachine.showGuidance && stateMachine.currentPhotoNumber > 0 {
                             VStack {
-                                HStack {
-                                    Spacer()
-                                    Text("\(stateMachine.currentPhotoNumber) of \(ConfigManager.shared.photoCount)")
-                                        .font(.system(size: 60, weight: .heavy))
-                                        .foregroundColor(.white)
-                                        .shadow(radius: 10)
-                                        .padding(.top, 50)
-                                        .padding(.trailing, 50)
-                                }
+                                GIFProgressDotsPillView(
+                                    totalFrames: ConfigManager.shared.photoCount,
+                                    activeFrameIndex: stateMachine.currentPhotoNumber,
+                                    waitProgress: 0.0
+                                )
+                                .padding(.top, 26)
                                 Spacer()
                             }
+                            .transition(.opacity)
+                            .zIndex(3)
                         }
                     }
                 }

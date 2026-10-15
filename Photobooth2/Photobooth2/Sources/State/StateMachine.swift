@@ -328,10 +328,12 @@ class StateMachine: ObservableObject {
     
     private func startCaptureSequence() async {
         capturedImages.removeAll()
+        self.currentPhotoNumber = 0
         
         do {
             try await cameraService.prepareForCapture(mode: .standard)
         } catch {
+            self.currentPhotoNumber = 0
             transition(to: .error(message: "Capture Setup Failed: \(error.localizedDescription)"))
             return
         }
@@ -344,6 +346,7 @@ class StateMachine: ObservableObject {
             if let task = previousCaptureTask {
                 _ = await task.result
                 if case .error = state {
+                    self.currentPhotoNumber = 0
                     await cameraService.finishCaptureSequence(mode: .standard)
                     return
                 }
@@ -365,19 +368,18 @@ class StateMachine: ObservableObject {
                     countTime = config.initialCountdownSec
                 }
             } else {
+                self.currentPhotoNumber = i + 1
                 countTime = config.interShotCountdownSec
             }
             
             if countTime > 0 {
                 for t in (1...countTime).reversed() {
                     if case .error = state {
+                        self.currentPhotoNumber = 0
                         await cameraService.finishCaptureSequence(mode: .standard)
                         return
                     }
                     self.countdown = t
-                    if t == 1 {
-                        self.currentPhotoNumber = 0
-                    }
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
             }
@@ -402,14 +404,15 @@ class StateMachine: ObservableObject {
                     }
                 } catch {
                     self.isFlashing = false
+                    self.currentPhotoNumber = 0
                     self.transition(to: .error(message: "Capture Failed: \(error.localizedDescription)"))
                 }
             }
             
-            // Wait for the 1.0s flash fade to complete before showing next photo number
+            // Wait for the 1.0s flash fade to complete before advancing to the next photo countdown
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             
-            if i + 1 < totalPhotos {
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.78)) {
                 self.currentPhotoNumber = i + 2
             }
         }
