@@ -396,9 +396,10 @@ func computeTrailingOpacity(progress: Double) -> Double {
 }
 let midSweepTrailing = computeTrailingOpacity(progress: 0.50)
 let finalSweepTrailing = computeTrailingOpacity(progress: 1.00)
+let leftCapNubLocation = (-91.5 - (-94.0)) / 360.0 // ~0.00694, safely inside [0.0, 0.012] trailingOpacity plateau
 assertTrue(
-    abs(midSweepTrailing - 0.15) < 0.001 && abs(finalSweepTrailing - 0.45) < 0.001,
-    String(format: "GIF 22pt perimeter sweep trailing opacity stays at %.2f mid-sweep and unifies to %.2f at 12 o'clock flash", midSweepTrailing, finalSweepTrailing)
+    abs(midSweepTrailing - 0.15) < 0.001 && abs(finalSweepTrailing - 0.45) < 0.001 && leftCapNubLocation > 0.0 && leftCapNubLocation < 0.012,
+    String(format: "GIF 22pt perimeter sweep trailing opacity stays at %.2f (including left start-cap nub at loc=%.4f) and unifies to %.2f at 12 o'clock", midSweepTrailing, leftCapNubLocation, finalSweepTrailing)
 )
 
 print("========================================================")

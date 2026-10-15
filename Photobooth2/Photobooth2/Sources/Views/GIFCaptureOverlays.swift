@@ -92,13 +92,17 @@ struct GIFPerimeterSweepOverlay: View, Animatable {
                     .stroke(
                         AngularGradient(
                             gradient: Gradient(stops: [
+                                // Start the angular gradient 4° left of 12 o'clock (-94°) and hold trailingOpacity
+                                // through 12 o'clock (location 0.012) so the 11pt rounded start cap sticking out
+                                // slightly left of Top-Center gets trailingOpacity (15%) instead of wrapping to 45%.
                                 .init(color: Color.white.opacity(trailingOpacity), location: 0.0),
-                                .init(color: Color.white.opacity(midOpacity), location: max(0.001, Double(clampedProgress) * 0.55)),
-                                .init(color: Color.white.opacity(leadingOpacity), location: max(0.002, Double(clampedProgress)))
+                                .init(color: Color.white.opacity(trailingOpacity), location: 0.012),
+                                .init(color: Color.white.opacity(midOpacity), location: max(0.015, 0.012 + Double(clampedProgress) * 0.55)),
+                                .init(color: Color.white.opacity(leadingOpacity), location: max(0.020, min(0.999, 0.012 + Double(clampedProgress))))
                             ]),
                             center: .center,
-                            startAngle: .degrees(-90),
-                            endAngle: .degrees(270)
+                            startAngle: .degrees(-94),
+                            endAngle: .degrees(266)
                         ),
                         style: StrokeStyle(lineWidth: strokeWidth, lineCap: .round, lineJoin: .round)
                     )
