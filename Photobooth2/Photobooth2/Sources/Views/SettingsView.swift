@@ -448,7 +448,7 @@ struct SettingsView: View {
         let hours = config.gifRetrievalWindowHours
         
         Task {
-            let manifestURL = BackdropManifestStore.shared.exportAirDropManifestFile()
+            let manifestURL = BackdropManifestStore.shared.exportAirDropManifestFile(hours: max(hours, 72))
             var shareItems: [Any] = []
             
             if let recentGIFs = try? await GIFRetrievalService.fetchRecentGIFs(hours: hours) {
@@ -469,10 +469,14 @@ struct SettingsView: View {
     }
     
     private func presentShareSheet(items: [Any]) {
-        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-              let rootVC = windowScene.windows.first?.rootViewController else { return }
+        guard let windowScene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first,
+              let rootVC = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController
+                  ?? windowScene.windows.first?.rootViewController else { return }
         
-        let topController: UIViewController = rootVC.presentedViewController ?? rootVC
+        var topController: UIViewController = rootVC
+        while let presented = topController.presentedViewController {
+            topController = presented
+        }
         
         let activityVC = UIActivityViewController(activityItems: items, applicationActivities: nil)
         

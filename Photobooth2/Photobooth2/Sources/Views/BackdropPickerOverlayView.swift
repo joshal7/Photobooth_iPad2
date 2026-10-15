@@ -41,14 +41,19 @@ struct BackdropPickerOverlayView: View {
                 ZStack(alignment: .bottom) {
                     // Touch-absorbing shield zone: absorbs slightly off-target taps around the pill/carousel
                     // so they never pass through to the "Take 3 Photos" button underneath.
+                    // When the carousel is expanded, tapping in the outer margin collapses it cleanly.
                     Color.white.opacity(0.001)
                         .frame(
-                            maxWidth: stateMachine.isBackdropPickerExpanded ? 880 : Self.collapsedShieldSize.width,
+                            maxWidth: stateMachine.isBackdropPickerExpanded ? .infinity : Self.collapsedShieldSize.width,
                             maxHeight: stateMachine.isBackdropPickerExpanded ? Self.expandedShieldHeight : Self.collapsedShieldSize.height
                         )
                         .contentShape(Rectangle())
                         .onTapGesture {
-                            // Intentionally absorb stray touches in the safety buffer around the picker
+                            if stateMachine.isBackdropPickerExpanded {
+                                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                    stateMachine.isBackdropPickerExpanded = false
+                                }
+                            }
                         }
                     
                     if stateMachine.isBackdropPickerExpanded {
@@ -270,3 +275,4 @@ struct BackdropPickerOverlayView: View {
         }
     }
 }
+

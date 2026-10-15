@@ -69,17 +69,20 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
         let (exifDT, exifSub) = BackdropCompositorService.extractEXIFTimestamps(from: rawJPEGData)
         let signature = BackdropCompositorService.computeRGBSignature8x8(from: uncompositedCGImage)
         
-        // Only embed Base64 image data into JSON if this is a custom iPad-only backdrop (not baked into the app bundle)
-        var customBgData: Data? = nil
-        if BackdropManager.isCustomDocumentsOnlyAsset(filename: backdrop.backgroundFilename),
-           let url = BackdropManager.resolveAssetURL(filename: backdrop.backgroundFilename) {
-            customBgData = try? Data(contentsOf: url)
+        // Deduplicate custom iPad-only backdrop bytes at the document level (`customAssetsByFilename`)
+        // so taking 100+ photos with a custom backdrop never duplicates megabytes of Base64 data per entry.
+        var customAssetsToStore: [String: Data] = [:]
+        if let bgFile = backdrop.backgroundFilename,
+           BackdropManager.isCustomDocumentsOnlyAsset(filename: bgFile),
+           let url = BackdropManager.resolveAssetURL(filename: bgFile),
+           let data = try? Data(contentsOf: url) {
+            customAssetsToStore[bgFile] = data
         }
-        
-        var customFgData: Data? = nil
-        if BackdropManager.isCustomDocumentsOnlyAsset(filename: backdrop.foregroundFilename),
-           let url = BackdropManager.resolveAssetURL(filename: backdrop.foregroundFilename) {
-            customFgData = try? Data(contentsOf: url)
+        if let fgFile = backdrop.foregroundFilename,
+           BackdropManager.isCustomDocumentsOnlyAsset(filename: fgFile),
+           let url = BackdropManager.resolveAssetURL(filename: fgFile),
+           let data = try? Data(contentsOf: url) {
+            customAssetsToStore[fgFile] = data
         }
         
         let entry = PhotoBackdropManifestEntry(
@@ -94,21 +97,28 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             backgroundFilename: backdrop.backgroundFilename,
             foregroundFilename: backdrop.foregroundFilename,
             foregroundFitMode: backdrop.foregroundFitMode,
-            customBackgroundData: customBgData,
-            customForegroundData: customFgData,
+            customBackgroundData: nil,
+            customForegroundData: nil,
             appliedToFullRes: false,
             matchedFullResFilename: nil
         )
         
-        appendEntry(entry)
+        appendEntry(entry, newCustomAssets: customAssetsToStore)
     }
     
-    nonisolated func appendEntry(_ entry: PhotoBackdropManifestEntry) {
+    nonisolated func appendEntry(_ entry: PhotoBackdropManifestEntry, newCustomAssets: [String: Data] = [:]) {
         storage.lock.lock()
         // Prune entries older than 7 days to keep manifest lean across events
         let sevenDaysAgo = Date().addingTimeInterval(-7 * 24 * 3600)
         storage.document.entries.removeAll { $0.captureTimestampUTC < sevenDaysAgo }
         storage.document.entries.append(entry)
+        if !newCustomAssets.isEmpty {
+            var map = storage.document.customAssetsByFilename ?? [:]
+            for (k, v) in newCustomAssets {
+                map[k] = v
+            }
+            storage.document.customAssetsByFilename = map
+        }
         storage.document.exportedAtUTC = Date()
         saveLocked()
         let snapshot = storage.document.entries
@@ -128,6 +138,7 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
     nonisolated func clearAllEntries() {
         storage.lock.lock()
         storage.document.entries.removeAll()
+        storage.document.customAssetsByFilename = nil
         saveLocked()
         storage.lock.unlock()
         
@@ -147,16 +158,37 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
     
     /// Exports `photobooth_backdrop_manifest.json` containing entries from the last `hours` window
     /// to a temporary URL ready for AirDrop alongside the event's `.gif` files.
+    /// Returns `nil` if there are no manifest entries within the window.
     nonisolated func exportManifestFile(hours: Int = 72) throws -> URL? {
         storage.lock.lock()
         let cutoff = Date().addingTimeInterval(-Double(max(1, hours)) * 3600.0)
         let recentEntries = storage.document.entries.filter { $0.captureTimestampUTC >= cutoff }
+        let storedCustomMap = storage.document.customAssetsByFilename ?? [:]
         storage.lock.unlock()
+        
+        guard !recentEntries.isEmpty else { return nil }
+        
+        // Include only the custom assets actually referenced by `recentEntries`
+        var referencedCustomAssets: [String: Data] = [:]
+        for entry in recentEntries {
+            for fname in [entry.backgroundFilename, entry.foregroundFilename].compactMap({ $0 }) {
+                if referencedCustomAssets[fname] == nil {
+                    if let existing = storedCustomMap[fname] {
+                        referencedCustomAssets[fname] = existing
+                    } else if BackdropManager.isCustomDocumentsOnlyAsset(filename: fname),
+                              let url = BackdropManager.resolveAssetURL(filename: fname),
+                              let data = try? Data(contentsOf: url) {
+                        referencedCustomAssets[fname] = data
+                    }
+                }
+            }
+        }
         
         let exportDoc = BackdropManifestDocument(
             schemaVersion: BackdropManifestDocument.currentSchemaVersion,
             exportedAtUTC: Date(),
-            entries: recentEntries
+            entries: recentEntries,
+            customAssetsByFilename: referencedCustomAssets.isEmpty ? nil : referencedCustomAssets
         )
         let data = try Self.makeJSONEncoder().encode(exportDoc)
         let exportURL = FileManager.default.temporaryDirectory
@@ -311,16 +343,18 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
         for entryIndex in 0..<totalCount {
             if Task.isCancelled { break }
             let entry = manifestDoc.entries[entryIndex]
-            if entry.appliedToFullRes {
-                skippedAlreadyApplied += 1
-                continue
-            }
             
-            // If `matchedFullResFilename` was previously recorded or `ptpFilename` matches a file that already has PB2_BACKDROP EXIF tag
             var matchedCandidateIdx: Int? = nil
             
+            // LOCK 0: Previously matched filename from an earlier run on this folder
+            if let prevMatched = entry.matchedFullResFilename?.uppercased(), !prevMatched.isEmpty {
+                if let idx = candidates.indices.first(where: { candidates[$0].filenameUpper == prevMatched && !usedCandidateIndices.contains($0) }) {
+                    matchedCandidateIdx = idx
+                }
+            }
+            
             // LOCK 1: Exact PTP Filename Match (e.g., "DSC04821.JPG")
-            if let ptpName = entry.ptpFilename?.uppercased(), !ptpName.isEmpty {
+            if matchedCandidateIdx == nil, let ptpName = entry.ptpFilename?.uppercased(), !ptpName.isEmpty {
                 if let idx = candidates.indices.first(where: { candidates[$0].filenameUpper == ptpName && !usedCandidateIndices.contains($0) }) {
                     matchedCandidateIdx = idx
                 }
@@ -335,25 +369,29 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
                     }
                 }
                 
-                if timeWindowIndices.count == 1 {
-                    matchedCandidateIdx = timeWindowIndices[0]
-                } else if timeWindowIndices.count > 1 {
-                    // Multiple shots within the same 3-second window: pick the one with closest 8x8 RGB signature
-                    var bestIdx: Int? = nil
-                    var bestDist = Double.greatestFiniteMagnitude
-                    for idx in timeWindowIndices {
-                        if let candSig = getCandidateSignature(at: idx) {
-                            let dist = BackdropCompositorService.signatureDistance(entry.rgbSignature8x8, candSig)
-                            if dist < bestDist {
-                                bestDist = dist
-                                bestIdx = idx
+                if !timeWindowIndices.isEmpty {
+                    if entry.rgbSignature8x8.isEmpty {
+                        matchedCandidateIdx = timeWindowIndices.first
+                    } else {
+                        var bestIdx: Int? = nil
+                        var bestDist = Double.greatestFiniteMagnitude
+                        for idx in timeWindowIndices {
+                            if let candSig = getCandidateSignature(at: idx) {
+                                let dist = BackdropCompositorService.signatureDistance(entry.rgbSignature8x8, candSig)
+                                if dist < bestDist {
+                                    bestDist = dist
+                                    bestIdx = idx
+                                }
                             }
                         }
-                    }
-                    if let winner = bestIdx, bestDist < 0.22 {
-                        matchedCandidateIdx = winner
-                    } else {
-                        matchedCandidateIdx = timeWindowIndices.first
+                        if let winner = bestIdx, bestDist < 0.25 {
+                            matchedCandidateIdx = winner
+                        } else if timeWindowIndices.count == 1,
+                                  let singleIdx = timeWindowIndices.first,
+                                  candidates[singleIdx].alreadyAppliedBackdropID == entry.backdropID {
+                            // Already-composited file on a second run whose RGB signature changed after backdrop replacement
+                            matchedCandidateIdx = singleIdx
+                        }
                     }
                 }
             }
@@ -377,7 +415,11 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             }
             
             guard let targetIdx = matchedCandidateIdx else {
-                unmatched += 1
+                if entry.appliedToFullRes {
+                    skippedAlreadyApplied += 1
+                } else {
+                    unmatched += 1
+                }
                 continue
             }
             
@@ -385,6 +427,8 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             usedCandidateIndices.insert(targetIdx)
             
             // Idempotency Check: if the JPEG file itself already has the `PB2_BACKDROP:` EXIF tag, skip re-applying!
+            // (If the user replaced the JPEG with a fresh un-composited copy from the SD card, `alreadyAppliedBackdropID`
+            // is nil so it will re-apply cleanly.)
             if candidate.alreadyAppliedBackdropID != nil {
                 manifestDoc.entries[entryIndex].appliedToFullRes = true
                 manifestDoc.entries[entryIndex].matchedFullResFilename = candidate.url.lastPathComponent
@@ -393,6 +437,11 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             }
             
             progressCallback?(entryIndex + 1, totalCount, candidate.url.lastPathComponent)
+            
+            let resolvedCustomBgData = entry.customBackgroundData
+                ?? entry.backgroundFilename.flatMap { manifestDoc.customAssetsByFilename?[$0] }
+            let resolvedCustomFgData = entry.customForegroundData
+                ?? entry.foregroundFilename.flatMap { manifestDoc.customAssetsByFilename?[$0] }
             
             // 3. Apply Full-Resolution Auto-Exposure + .captureAccurate Backdrop Compositing inside autoreleasepool
             let didApply: Bool = autoreleasepool {
@@ -429,8 +478,8 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
                     backdrop: backdropItem,
                     quality: .captureAccurate,
                     ciContext: ciContext,
-                    customBackgroundData: entry.customBackgroundData,
-                    customForegroundData: entry.customForegroundData,
+                    customBackgroundData: resolvedCustomBgData,
+                    customForegroundData: resolvedCustomFgData,
                     additionalSearchDirectories: [folderURL],
                     customMaskProvider: customMaskProvider
                 )

@@ -632,17 +632,21 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                         initialObjState: observedObjState,
                         using: transport
                     ) {
+                        // Release USB commandQueue immediately once RAM transfer completes so 30 FPS Live View
+                        // resumes right away while .captureAccurate segmentation & JPEG write finish in parallel.
+                        await commandQueue.endCaptureScope()
                         let (backdrop, mode) = currentBackdropAndMode()
-                        let normalizedData = Self.normalizeAndAutoExposeCapturedJPEG(
-                            downloaded.jpegData,
-                            objectInfoData: downloaded.objectInfoData,
-                            backdrop: backdrop,
-                            captureMode: mode
-                        )
+                        let normalizedData = await Task.detached(priority: .userInitiated) {
+                            Self.normalizeAndAutoExposeCapturedJPEG(
+                                downloaded.jpegData,
+                                objectInfoData: downloaded.objectInfoData,
+                                backdrop: backdrop,
+                                captureMode: mode
+                            )
+                        }.value
                         let tempURL = FileManager.default.temporaryDirectory
                             .appendingPathComponent("sony_\(UUID().uuidString).jpg")
                         try normalizedData.write(to: tempURL, options: .atomic)
-                        await commandQueue.endCaptureScope()
                         return [tempURL.absoluteString]
                     }
                 }
@@ -677,11 +681,11 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     }
     
     /// Re-encodes the downloaded 2MP Sony transfer payload as a clean, standard iOS JFIF JPEG:
-    /// 1. Auto-exposes dark or dim captures on the raw subject image FIRST.
-    /// 2. In `.standard` Photo Mode with an active backdrop:
-    ///    - Records the Triple-Lock metadata (`ptpFilename`, EXIF `DateTimeOriginal`, `8x8` RGB signature) in `BackdropManifestStore`.
-    ///    - Composites the Background + Foreground with `.captureAccurate` segmentation.
-    /// 3. In `.gif` Mode, saves the raw auto-exposed frame so `GIFService.createGIF` can equalize burst luminance
+    /// 1. Records the Triple-Lock metadata (`ptpFilename`, EXIF `DateTimeOriginal`, `8x8` RGB signature) in `BackdropManifestStore`
+    ///    whenever a backdrop is active (so every full-res JPEG saved to the camera SD card gets its backdrop applied on Mac).
+    /// 2. Auto-exposes dark or dim captures on the raw subject image FIRST.
+    /// 3. In `.standard` Photo Mode with an active backdrop, composites the Background + Foreground with `.captureAccurate` segmentation.
+    /// 4. In `.gif` Mode, saves the raw auto-exposed frame so `GIFService.createGIF` can equalize burst luminance
     ///    first before applying `.captureAccurate` backdrop compositing (preventing any border/backdrop brightness flicker).
     nonisolated private static func normalizeAndAutoExposeCapturedJPEG(
         _ rawData: Data,
@@ -716,7 +720,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             
             // Record Triple-Lock manifest entry using `rawCG` (upright, pre-exposure boost) so its 8x8 RGB signature
             // matches the un-boosted SD card DSC0xxxx.JPG file even in dim lighting conditions.
-            if captureMode == .standard && !backdrop.isNone {
+            if !backdrop.isNone {
                 BackdropManifestStore.shared.recordCapture(
                     uncompositedCGImage: rawCG,
                     rawJPEGData: extracted,

@@ -313,13 +313,12 @@ final class BackdropCompositorService: Sendable {
     
     /// Parses the camera filename (e.g. `"DSC04821.JPG"`) from an ISO 15740 PTP `ObjectInfo` (`0x1008`) response payload.
     nonisolated static func parsePTPObjectInfoFilename(from data: Data?) -> String? {
-        guard let data = data, data.count >= 54 else { return nil }
+        guard let data = data, data.count >= 16 else { return nil }
         
-        // Check both offset 52 (raw ObjectInfo dataset) and offset 64 (12-byte PTP container header + 52-byte ObjectInfo header)
-        let candidateStringOffsets = [52, 64]
-        for offset in candidateStringOffsets where offset + 1 < data.count {
+        func tryParseUTF16Filename(at offset: Int) -> String? {
+            guard offset >= 0, offset + 1 < data.count else { return nil }
             let charCount = Int(data[data.startIndex + offset])
-            guard charCount >= 5, charCount <= 64, offset + 1 + (charCount * 2) <= data.count else { continue }
+            guard charCount >= 5, charCount <= 64, offset + 1 + (charCount * 2) <= data.count else { return nil }
             var scalars: [UInt16] = []
             scalars.reserveCapacity(charCount)
             for i in 0..<charCount {
@@ -327,14 +326,34 @@ final class BackdropCompositorService: Sendable {
                 let hi = UInt16(data[data.startIndex + offset + 1 + (i * 2) + 1])
                 let codeUnit = lo | (hi << 8)
                 if codeUnit == 0 { break }
+                // Must be printable ASCII filename characters
+                guard codeUnit >= 0x20 && codeUnit <= 0x7E else { return nil }
                 scalars.append(codeUnit)
             }
+            guard scalars.count >= 5 else { return nil }
             let str = String(utf16CodeUnits: scalars, count: scalars.count)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let upper = str.uppercased()
             if (upper.hasSuffix(".JPG") || upper.hasSuffix(".JPEG") || upper.hasSuffix(".ARW") || upper.hasSuffix(".HEIF")),
                !upper.contains("/") && !upper.contains("\\") {
                 return str
+            }
+            return nil
+        }
+        
+        // Check standard ISO 15740 offsets first: 52 (raw ObjectInfo dataset) and 64 (12-byte PTP container + 52-byte ObjectInfo)
+        for offset in [52, 64] {
+            if let found = tryParseUTF16Filename(at: offset) {
+                return found
+            }
+        }
+        // Fallback scan in case camera firmware uses a vendor-specific header offset
+        let maxScan = min(data.count - 10, 160)
+        if maxScan > 0 {
+            for offset in 0..<maxScan where offset != 52 && offset != 64 {
+                if let found = tryParseUTF16Filename(at: offset) {
+                    return found
+                }
             }
         }
         return nil

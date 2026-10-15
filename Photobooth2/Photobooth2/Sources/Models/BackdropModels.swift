@@ -103,6 +103,9 @@ nonisolated struct BackdropManifestDocument: Codable, Equatable, Sendable {
     var schemaVersion: Int = Self.currentSchemaVersion
     var exportedAtUTC: Date = Date()
     var entries: [PhotoBackdropManifestEntry]
+    /// Deduplicated Base64-encoded image bytes keyed by filename for custom iPad-added backdrops,
+    /// avoiding duplicating megabytes of image data across every entry in the JSON file.
+    var customAssetsByFilename: [String: Data]? = nil
 }
 
 nonisolated struct BatchApplyReport: Equatable, Sendable {
@@ -121,3 +124,4 @@ nonisolated struct BatchApplyReport: Equatable, Sendable {
     
     var summaryMessage: String { summaryText }
 }
+

@@ -1209,6 +1209,42 @@ enum AutomatedVerificationSuite {
         assertEqual(report2.newlyAppliedCount, 0, "Idempotency: re-running applyBackdropsToFolder applies 0 times")
         assertEqual(report2.skippedAlreadyAppliedCount, 2, "Idempotency: re-running skips all 2 already-applied photos")
         
+        // Verify that replacing DSC00001.JPG with a fresh un-composited SD card original allows re-applying just that photo
+        try dsc1Data.write(to: dsc1URL, options: .atomic)
+        let report3 = try BackdropManifestStore.applyBackdropsToFolder(
+            folderURL: partyFolder,
+            customMaskProvider: { _ in maskCI }
+        )
+        assertEqual(report3.newlyAppliedCount, 1, "Replacing a single JPEG with fresh un-composited SD card original re-applies backdrop to just that photo")
+        assertEqual(report3.skippedAlreadyAppliedCount, 1, "Other already-composited photo remains skipped")
+        
+        // Verify Lock-2 deleted-photo safety: if a manifest entry's photo was deleted from the folder and an unrelated photo
+        // was taken 2 seconds later (within ±3s window) with a completely different RGB signature, it is NOT falsely matched
+        let ghostEntry = PhotoBackdropManifestEntry(
+            id: UUID(),
+            captureTimestampUTC: Date(),
+            ptpFilename: "DSC09999.JPG", // Deleted from folder
+            exifDateTimeOriginal: "2026:10:15 20:16:08", // 2s before DSC00003.JPG ("2026:10:15 20:16:10")
+            exifSubSecOriginal: nil,
+            rgbSignature8x8: BackdropCompositorService.computeRGBSignature8x8(from: redBgCG), // Bright red != grey DSC00003
+            backdropID: "evans_bar_mitzvah",
+            backdropDisplayName: "Evans Bar Mitzvah",
+            backgroundFilename: nil,
+            foregroundFilename: "Evans Bar Mitzvah_fg.png",
+            foregroundFitMode: .stretchToEdges
+        )
+        let manifestWithGhost = BackdropManifestDocument(
+            entries: [entryForDSC2, entryForDSC1, ghostEntry],
+            customAssetsByFilename: ["Evans Bar Mitzvah_fg.png": customGreenFgBytes]
+        )
+        try encoder.encode(manifestWithGhost).write(to: manifestJSONURL)
+        let report4 = try BackdropManifestStore.applyBackdropsToFolder(
+            folderURL: partyFolder,
+            customMaskProvider: { _ in maskCI }
+        )
+        assertEqual(report4.newlyAppliedCount, 0, "Deleted-photo Lock-2 safety: unrelated photo within ±3s window is rejected by 8x8 RGB signature")
+        assertEqual(report4.unmatchedCount, 1, "Deleted photo is accurately reported as 1 unmatched entry")
+        
         // 6. Front-Camera Pre-Mirroring Orientation (Subject Mirrors Horizontally, Foreground Text Stays Un-Mirrored)
         let rawFrontSubj = makeSolidOrBorderCGImage(
             width: 160,

@@ -86,6 +86,25 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
         let orientation = UIDevice.current.orientation
         if orientation.isValidInterfaceOrientation {
             threadSafeState.setOrientation(orientation)
+            return
+        }
+        // Fallback when iPad is stationary in a stand at launch (.unknown / .faceUp / .faceDown):
+        // derive the corresponding UIDeviceOrientation from the active UIWindowScene.interfaceOrientation.
+        if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
+            switch scene.interfaceOrientation {
+            case .portrait:
+                threadSafeState.setOrientation(.portrait)
+            case .portraitUpsideDown:
+                threadSafeState.setOrientation(.portraitUpsideDown)
+            case .landscapeLeft:
+                // UIInterfaceOrientation.landscapeLeft (home button left) == UIDeviceOrientation.landscapeRight
+                threadSafeState.setOrientation(.landscapeRight)
+            case .landscapeRight:
+                // UIInterfaceOrientation.landscapeRight (home button right) == UIDeviceOrientation.landscapeLeft
+                threadSafeState.setOrientation(.landscapeLeft)
+            default:
+                break
+            }
         }
     }
     
@@ -116,9 +135,12 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
             self.session.beginConfiguration()
             self.session.sessionPreset = .photo
             
-            // Add input (Front Camera)
-            guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front),
+            // Add input (Front Camera on iPad, or default FaceTime camera on Mac)
+            let preferredDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
+                ?? AVCaptureDevice.default(for: .video)
+            guard let device = preferredDevice,
                   let input = try? AVCaptureDeviceInput(device: device) else {
+                self.session.commitConfiguration()
                 return
             }
             

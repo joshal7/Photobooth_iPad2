@@ -35,6 +35,16 @@ final class BackdropManager: ObservableObject {
         return docs.appendingPathComponent("Backdrops", isDirectory: true)
     }
     
+    nonisolated static var sourceTreeBackdropsDirectory: URL {
+        // Resolves `<repo>/Photobooth2/Photobooth2/Backdrops` dynamically from `#filePath`
+        let thisFile = URL(fileURLWithPath: #filePath)
+        let targetRoot = thisFile
+            .deletingLastPathComponent() // Services
+            .deletingLastPathComponent() // Sources
+            .deletingLastPathComponent() // Photobooth2
+        return targetRoot.appendingPathComponent("Backdrops", isDirectory: true)
+    }
+    
     private func ensureDocumentsBackdropsDirectoryExists() {
         try? FileManager.default.createDirectory(
             at: Self.documentsBackdropsDirectory,
@@ -61,8 +71,13 @@ final class BackdropManager: ObservableObject {
         
         // 3. On Mac, also scan the project's Backdrops/ folder directly if present so newly dropped files
         //    are immediately available on Mac without needing to rebuild the Mac target.
+        let sourceBackdrops = Self.sourceTreeBackdropsDirectory
+        if FileManager.default.fileExists(atPath: sourceBackdrops.path) {
+            searchDirs.append((sourceBackdrops, true, false))
+        }
         let macProjectBackdrops = URL(fileURLWithPath: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Backdrops", isDirectory: true)
-        if FileManager.default.fileExists(atPath: macProjectBackdrops.path) {
+        if macProjectBackdrops.standardizedFileURL != sourceBackdrops.standardizedFileURL,
+           FileManager.default.fileExists(atPath: macProjectBackdrops.path) {
             searchDirs.append((macProjectBackdrops, true, false))
         }
         
@@ -72,6 +87,14 @@ final class BackdropManager: ObservableObject {
         let discovered = Self.discoverBackdrops(from: searchDirs, disabledIDs: disabledIDs, fitModes: savedFitModes)
         self.availableBackdrops = [.none] + discovered
         self.thumbnailCache.removeAll()
+        BackdropCompositorService.clearCache()
+        
+        // If the configured defaultBackdropID was disabled or deleted, reset it to `.none` so the Settings Picker stays valid
+        let currentDefault = ConfigManager.shared.defaultBackdropID
+        if currentDefault != BackdropItem.noneID,
+           !self.enabledBackdrops.contains(where: { $0.id == currentDefault }) {
+            ConfigManager.shared.defaultBackdropID = BackdropItem.noneID
+        }
     }
     
     func backdrop(forID id: String) -> BackdropItem {
@@ -123,8 +146,20 @@ final class BackdropManager: ObservableObject {
         let safeStem = trimmed
             .replacingOccurrences(of: "/", with: "-")
             .replacingOccurrences(of: ":", with: "-")
+        let id = Self.normalizedID(from: safeStem)
         
+        // Remove any previous custom files for this ID in Documents/Backdrops/ so replacing a Combo with a BG-only
+        // (or vice-versa) never leaves stale layers behind.
         let dir = Self.documentsBackdropsDirectory
+        if let existing = availableBackdrops.first(where: { $0.id == id && !$0.isBundled }) {
+            if let oldBg = existing.backgroundFilename {
+                try? FileManager.default.removeItem(at: dir.appendingPathComponent(oldBg))
+            }
+            if let oldFg = existing.foregroundFilename {
+                try? FileManager.default.removeItem(at: dir.appendingPathComponent(oldFg))
+            }
+        }
+        
         if let bgData = backgroundData {
             let ext = backgroundExtension.lowercased().isEmpty ? "jpg" : backgroundExtension.lowercased()
             let bgURL = dir.appendingPathComponent("\(safeStem)_bg.\(ext)")
@@ -135,7 +170,6 @@ final class BackdropManager: ObservableObject {
             try? fgData.write(to: fgURL, options: .atomic)
         }
         
-        let id = Self.normalizedID(from: safeStem)
         setForegroundFitMode(for: id, fitMode: fitMode)
         setBackdropEnabled(id, isEnabled: true)
         return availableBackdrops.first(where: { $0.id == id })
@@ -203,11 +237,50 @@ final class BackdropManager: ObservableObject {
         case foreground(stem: String)
     }
     
+    nonisolated private static func isTransparentCenterPNG(url: URL) -> Bool {
+        guard url.pathExtension.lowercased() == "png",
+              let img = UIImage(contentsOfFile: url.path),
+              let cg = img.cgImage else {
+            return false
+        }
+        let alphaInfo = cg.alphaInfo
+        let hasAlpha = (alphaInfo == .premultipliedLast || alphaInfo == .premultipliedFirst || alphaInfo == .last || alphaInfo == .first)
+        guard hasAlpha else { return false }
+        
+        let sampleW = 16
+        let sampleH = 16
+        var rgba = [UInt8](repeating: 255, count: sampleW * sampleH * 4)
+        let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: &rgba,
+            width: sampleW,
+            height: sampleH,
+            bitsPerComponent: 8,
+            bytesPerRow: sampleW * 4,
+            space: cs,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return false }
+        ctx.clear(CGRect(x: 0, y: 0, width: sampleW, height: sampleH))
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: sampleW, height: sampleH))
+        
+        // Check if center 8x8 region contains transparent cutout pixels (alpha < 180)
+        var transparentCount = 0
+        for y in 4..<12 {
+            for x in 4..<12 {
+                let a = rgba[(y * sampleW + x) * 4 + 3]
+                if a < 180 {
+                    transparentCount += 1
+                }
+            }
+        }
+        return transparentCount >= 8
+    }
+    
     nonisolated private static func classifyBackdropFile(url: URL, requireExplicitSuffix: Bool) -> AssetRole? {
         let filename = url.lastPathComponent
         guard !filename.hasPrefix("."), !filename.hasPrefix("_thumb_") else { return nil }
         let lowerName = filename.lowercased()
-        if lowerName.hasPrefix("icon_") || lowerName.hasPrefix("appicon") || lowerName.hasPrefix("sony_") || lowerName.hasPrefix("local_") || lowerName.hasPrefix("mock_") {
+        if lowerName.hasPrefix("icon_") || lowerName.hasPrefix("appicon") || lowerName.hasPrefix("launch") || lowerName.hasPrefix("sony_") || lowerName.hasPrefix("local_") || lowerName.hasPrefix("mock_") {
             return nil
         }
         
@@ -227,7 +300,7 @@ final class BackdropManager: ObservableObject {
             }
         }
         
-        let fgSuffixes = ["_fg", "-fg", " fg", "_frame", "-frame", " frame", "_foreground", "-foreground"]
+        let fgSuffixes = ["_fg_fill", "-fg-fill", "_fg", "-fg", " fg", "_frame", "-frame", " frame", "_foreground", "-foreground"]
         for suffix in fgSuffixes {
             if lowerStem.hasSuffix(suffix) {
                 let cleanStem = String(rawStem.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -242,10 +315,13 @@ final class BackdropManager: ObservableObject {
             return nil
         }
         
-        // Inside a dedicated `Backdrops/` directory, also support subfolder conventions (`Backgrounds/` vs `Foregrounds/`)
-        // or standalone files (opaque JPEG -> background).
+        // Inside a dedicated `Backdrops/` directory, also support subfolder conventions (`Backgrounds/` vs `Foregrounds/`),
+        // transparent-center PNG frames without `_fg`, or standalone opaque files (`-> background`).
         let parentFolder = url.deletingLastPathComponent().lastPathComponent.lowercased()
         if parentFolder.contains("foreground") || parentFolder.contains("frame") {
+            return .foreground(stem: rawStem)
+        }
+        if ext == "png" && isTransparentCenterPNG(url: url) {
             return .foreground(stem: rawStem)
         }
         return .background(stem: rawStem)
@@ -379,6 +455,7 @@ final class BackdropManager: ObservableObject {
             candidateDirs.append(bundleURL)
         }
         
+        candidateDirs.append(sourceTreeBackdropsDirectory)
         let macProjectBackdrops = URL(fileURLWithPath: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Backdrops", isDirectory: true)
         candidateDirs.append(macProjectBackdrops)
         

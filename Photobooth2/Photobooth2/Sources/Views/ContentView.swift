@@ -73,6 +73,8 @@ struct ContentView: View {
                                         .font(.system(size: 50, weight: .heavy))
                                         .foregroundColor(.white)
                                         .shadow(radius: 10)
+                                        .padding(.bottom, stateMachine.isBackdropPickerExpanded ? 150 : 40)
+                                        .animation(.spring(response: 0.30, dampingFraction: 0.82), value: stateMachine.isBackdropPickerExpanded)
                                 }
                             }
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -84,7 +86,8 @@ struct ContentView: View {
                             Text("TAP TO TAKE \(ConfigManager.shared.photoCount) PHOTO\(ConfigManager.shared.photoCount == 1 ? "" : "S")")
                                 .font(.system(size: 60, weight: .heavy))
                                 .foregroundColor(.white)
-                                .padding(.bottom, 105)
+                                .padding(.bottom, stateMachine.isBackdropPickerExpanded ? 215 : 105)
+                                .animation(.spring(response: 0.30, dampingFraction: 0.82), value: stateMachine.isBackdropPickerExpanded)
                                 .shadow(radius: 10)
                         }
                         .contentShape(Rectangle())

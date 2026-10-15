@@ -723,6 +723,14 @@ assertTrue(
     "Bottom anti-misfire touch shield absorbs taps around the pill/carousel while keeping upper capture buttons unobstructed"
 )
 
+// 7H. Deleted-Photo Lock-2 Signature Guard & Shifted-Offset PTP Filename Extraction
+let dsc3Grey = makeSolidOrBorderCGImage(width: 200, height: 150, fillRGBA: (90, 90, 90, 255))
+let sigGrey = computeRGBSignature8x8(dsc3Grey)
+assertTrue(
+    signatureDist(sigBlue, sigGrey) >= 0.25,
+    String(format: "Lock-2 RGB signature guard rejects unrelated photo within ±3s window when target photo was deleted (dist=%.3f >= 0.25)", signatureDist(sigBlue, sigGrey))
+)
+
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")
 print("========================================================")
