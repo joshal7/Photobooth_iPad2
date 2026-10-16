@@ -678,7 +678,7 @@ enum AutomatedVerificationSuite {
         includeShadowRamp: Bool = false,
         includeSmallBrightLamp: Bool = false
     ) -> CGImage {
-        let width = 48
+        let width = 72
         let height = 48
         var pixels = [UInt8](repeating: 255, count: width * height * 4)
         
@@ -1315,6 +1315,140 @@ enum AutomatedVerificationSuite {
             "iPad Front-Camera Pre-Mirroring: subject mirrors horizontally while foreground frame text stays un-reversed"
         )
         
+        // 6B. External Camera (`SonyUSBCameraClient`) Live View, Standard Photo, Animated GIF, and Mac Batch Horizontal Mirroring
+        let rawSonySubjCG = makeSolidOrBorderCGImage(
+            width: 180,
+            height: 120,
+            fillRGBA: (95, 95, 95, 255),
+            rightMarkerRGBA: (250, 250, 20, 255) // Bright yellow marker on RIGHT side of raw external camera frame (x: 164..<176)
+        )
+        let asymSonyFrameCG = makeSolidOrBorderCGImage(
+            width: 180,
+            height: 120,
+            fillRGBA: (0, 0, 0, 0),
+            rightMarkerRGBA: (20, 240, 240, 255) // Cyan marker on RIGHT side of foreground frame (x: 164..<176)
+        )
+        let asymSonyFrameURL = sampleBackdropsDir.appendingPathComponent("AsymSony_fg.png")
+        try encodePNG(asymSonyFrameCG).write(to: asymSonyFrameURL)
+        let asymSonyItem = BackdropItem(
+            id: "asym_sony",
+            displayName: "Asym Sony",
+            backgroundFilename: nil,
+            foregroundFilename: "AsymSony_fg.png",
+            foregroundFitMode: .stretchToEdges,
+            isBundled: true,
+            isEnabled: true
+        )
+        let rawSonyJPEGData = encodeJPEGWithEXIF(rawSonySubjCG, dateTimeOriginal: "2026:10:15 21:00:00")
+        
+        // 6B-1. External Camera Live View (`processLiveViewJPEG`) mirrors subject horizontally while keeping foreground un-reversed
+        if let (liveUI, _) = SonyUSBCameraClient.processLiveViewJPEG(
+            rawSonyJPEGData,
+            backdrop: asymSonyItem,
+            ciContext: ciContext,
+            additionalSearchDirectories: [sampleBackdropsDir]
+        ), let liveCG = liveUI.cgImage {
+            let liveLeftSubj = readPixelRGB(liveCG, x: 10, y: 60)
+            let liveRightFrame = readPixelRGB(liveCG, x: 170, y: 60)
+            assertTrue(
+                liveLeftSubj.r > 200 && liveLeftSubj.g > 200 && liveLeftSubj.b < 80 &&
+                liveRightFrame.g > 200 && liveRightFrame.b > 200 && liveRightFrame.r < 80,
+                "External Camera Live View: subject mirrors horizontally to left (\(liveLeftSubj.r),\(liveLeftSubj.g),\(liveLeftSubj.b)) while foreground frame stays on right (\(liveRightFrame.r),\(liveRightFrame.g),\(liveRightFrame.b))"
+            )
+        } else {
+            assertTrue(false, "External Camera processLiveViewJPEG returned nil")
+        }
+        
+        // 6B-2. External Camera Standard Photo Capture (`normalizeAndAutoExposeCapturedJPEG`) mirrors subject horizontally while keeping foreground un-reversed
+        let normSonyStdData = SonyUSBCameraClient.normalizeAndAutoExposeCapturedJPEG(
+            rawSonyJPEGData,
+            backdrop: asymSonyItem,
+            captureMode: .standard,
+            additionalSearchDirectories: [sampleBackdropsDir]
+        )
+        if let stdUI = UIImage(data: normSonyStdData), let stdCG = stdUI.cgImage {
+            let stdLeftSubj = readPixelRGB(stdCG, x: 10, y: 60)
+            let stdRightFrame = readPixelRGB(stdCG, x: 170, y: 60)
+            assertTrue(
+                stdLeftSubj.r > 200 && stdLeftSubj.g > 200 && stdLeftSubj.b < 80 &&
+                stdRightFrame.g > 200 && stdRightFrame.b > 200 && stdRightFrame.r < 80,
+                "External Camera Standard Photo: subject mirrors horizontally to left (\(stdLeftSubj.r),\(stdLeftSubj.g),\(stdLeftSubj.b)) while foreground frame stays on right (\(stdRightFrame.r),\(stdRightFrame.g),\(stdRightFrame.b))"
+            )
+        } else {
+            assertTrue(false, "Failed to decode normalized External Camera standard photo")
+        }
+        
+        // 6B-3. External Camera Animated GIF Capture (`normalizeAndAutoExposeCapturedJPEG` in .gif mode -> `GIFService.createGIF`)
+        let normSonyGIFData = SonyUSBCameraClient.normalizeAndAutoExposeCapturedJPEG(
+            rawSonyJPEGData,
+            backdrop: asymSonyItem,
+            captureMode: .gif,
+            additionalSearchDirectories: [sampleBackdropsDir]
+        )
+        let sonyGIFSource1 = qaRoot.appendingPathComponent("sony_mirror_gif_0.jpg")
+        let sonyGIFSource2 = qaRoot.appendingPathComponent("sony_mirror_gif_1.jpg")
+        try normSonyGIFData.write(to: sonyGIFSource1)
+        try normSonyGIFData.write(to: sonyGIFSource2)
+        if let compiledMirroredGIF = GIFService.createGIF(
+            from: [sonyGIFSource1.absoluteString, sonyGIFSource2.absoluteString],
+            frameDuration: 0.25,
+            backdrop: asymSonyItem,
+            additionalSearchDirectories: [sampleBackdropsDir]
+        ),
+           let gifSrc = CGImageSourceCreateWithURL(compiledMirroredGIF as CFURL, nil),
+           let gifFrame0 = CGImageSourceCreateImageAtIndex(gifSrc, 0, nil) {
+            let w = gifFrame0.width
+            let h = gifFrame0.height
+            let gifLeftSubj = readPixelRGB(gifFrame0, x: Int((Double(w) * 10.0 / 180.0).rounded()), y: h / 2)
+            let gifRightFrame = readPixelRGB(gifFrame0, x: Int((Double(w) * 170.0 / 180.0).rounded()), y: h / 2)
+            assertTrue(
+                gifLeftSubj.r > 190 && gifLeftSubj.g > 190 && gifLeftSubj.b < 90 &&
+                gifRightFrame.g > 190 && gifRightFrame.b > 190 && gifRightFrame.r < 90,
+                "External Camera Animated GIF: subject is mirrored to left (\(gifLeftSubj.r),\(gifLeftSubj.g),\(gifLeftSubj.b)) while foreground frame stays on right (\(gifRightFrame.r),\(gifRightFrame.g),\(gifRightFrame.b))"
+            )
+            try? fm.removeItem(at: compiledMirroredGIF)
+        } else {
+            assertTrue(false, "Failed to compile External Camera mirrored GIF")
+        }
+        
+        // 6B-4. External Camera Mac Batch Full-Resolution Workflow (un-mirrored 8x8 signature match + mirrored subject composite)
+        let asymBatchFolder = qaRoot.appendingPathComponent("AsymBatchFolder", isDirectory: true)
+        try fm.createDirectory(at: asymBatchFolder, withIntermediateDirectories: true)
+        let dscAsymURL = asymBatchFolder.appendingPathComponent("DSC08888.JPG")
+        try rawSonyJPEGData.write(to: dscAsymURL)
+        let asymSonyFgBytes = encodePNG(asymSonyFrameCG)
+        let asymEntry = PhotoBackdropManifestEntry(
+            id: UUID(),
+            captureTimestampUTC: Date(),
+            ptpFilename: nil, // Verify Lock 2 + Lock 3 (un-mirrored 8x8 RGB signature) matches raw SD card JPEG
+            exifDateTimeOriginal: "2026:10:15 21:00:00",
+            exifSubSecOriginal: nil,
+            rgbSignature8x8: BackdropCompositorService.computeRGBSignature8x8(from: rawSonySubjCG),
+            backdropID: "asym_sony",
+            backdropDisplayName: "Asym Sony",
+            backgroundFilename: nil,
+            foregroundFilename: "AsymSony_fg.png",
+            foregroundFitMode: .stretchToEdges,
+            customBackgroundData: nil,
+            customForegroundData: asymSonyFgBytes
+        )
+        let asymDoc = BackdropManifestDocument(entries: [asymEntry])
+        try encoder.encode(asymDoc).write(to: asymBatchFolder.appendingPathComponent(BackdropManifestDocument.defaultFilename))
+        let asymReport = try BackdropManifestStore.applyBackdropsToFolder(folderURL: asymBatchFolder)
+        if asymReport.newlyAppliedCount == 1,
+           let srcAsym = CGImageSourceCreateWithURL(dscAsymURL as CFURL, nil),
+           let cgAsym = CGImageSourceCreateImageAtIndex(srcAsym, 0, nil) {
+            let batchLeftSubj = readPixelRGB(cgAsym, x: 10, y: 60)
+            let batchRightFrame = readPixelRGB(cgAsym, x: 170, y: 60)
+            assertTrue(
+                batchLeftSubj.r > 200 && batchLeftSubj.g > 200 && batchLeftSubj.b < 80 &&
+                batchRightFrame.g > 200 && batchRightFrame.b > 200 && batchRightFrame.r < 80,
+                "Mac Batch Full-Res Processor: matches raw SD card JPEG via un-mirrored 8x8 signature and mirrors subject horizontally while keeping foreground frame un-reversed"
+            )
+        } else {
+            assertTrue(false, "Mac Batch Full-Res Processor failed on asymmetric external camera photo")
+        }
+        
         // 7. Touch-Shield Hit-Testing Verification (`BackdropPickerOverlayView.isPointInsideShield`)
         let iPadScreen = CGSize(width: 1194, height: 834)
         let bottomCenterTap = CGPoint(x: 597, y: 800)
@@ -1407,19 +1541,83 @@ enum AutomatedVerificationSuite {
             "Motion-adaptive temporal EMA dampens stationary edge shimmer (\(edgeAfterFrameA)->\(smoothedEdgeB) vs raw \(unsmoothedEdgeB)) while fast motion responds immediately (\(fastHandWaveOut)/255)"
         )
         
-        // 10. LiveView Aspect-Fit (Zero Clipping of Camera Frame, Background, or Foreground Border on iPad)
-        let sonyLiveViewSize = CGSize(width: 1024, height: 680) // 3:2 Sony Live View stream
-        let iPad11Screen = CGSize(width: 1194, height: 834)     // 11-inch iPad Pro
-        let fittedSonyOn11 = LiveView.fittedRect(forImageSize: sonyLiveViewSize, inContainerSize: iPad11Screen)
-        assertTrue(
-            abs(fittedSonyOn11.width - 1194.0) < 0.01 &&
-            fittedSonyOn11.height < 834.0 &&
-            fittedSonyOn11.minX >= 0.0 &&
-            fittedSonyOn11.maxX <= 1194.0 &&
-            fittedSonyOn11.minY > 15.0 &&
-            abs((fittedSonyOn11.width / fittedSonyOn11.height) - (1024.0 / 680.0)) < 0.001,
-            String(format: "LiveView aspect-fits 3:2 Sony stream inside 1194x834 iPad without clipping (fitted=%.1fx%.1f, top/bottom black bar=%.1fpt each)", fittedSonyOn11.width, fittedSonyOn11.height, fittedSonyOn11.minY)
-        )
+        // 10. 3:2 Landscape Aspect Ratio & Top/Bottom Letterboxing Across All Configurations (Live View, Photos, GIFs)
+        let iPad4x3Screen = CGSize(width: 1366, height: 1024)   // 4:3 iPad screen (1.333:1)
+        let iPad11ScreenSize = CGSize(width: 1194, height: 834) // 11-inch iPad screen (1.432:1)
+        
+        // 10a. Verify iPad Front Camera (4:3 raw sensor: 1440x1080 Live View & 4032x3024 Photo) is oriented, mirrored,
+        //      and center-cropped to exact 3:2 landscape (1440x960 and 4032x2688) regardless of UIDeviceOrientation.
+        let rawFrontLiveCI = CIImage(cgImage: makeSolidOrBorderCGImage(width: 1440, height: 1080, fillRGBA: (40, 120, 220, 255)))
+        for testOrientation in [UIDeviceOrientation.landscapeLeft, .landscapeRight, .portrait, .portraitUpsideDown, .unknown] {
+            let processedCI = BackdropCompositorService.orientAndMirrorFrontCameraCIImage(
+                rawFrontLiveCI,
+                interfaceOrientation: testOrientation
+            )
+            assertEqual(Int(processedCI.extent.width), 1440, "Front camera 1440x1080 preserves full 1440 width for orientation \(testOrientation.rawValue)")
+            assertEqual(Int(processedCI.extent.height), 960, "Front camera 1440x1080 center-crops height to 960 (3:2) for orientation \(testOrientation.rawValue)")
+            assertTrue(
+                abs((processedCI.extent.width / processedCI.extent.height) - 1.5) < 0.001,
+                "Front camera Live View is exact 3:2 (1.500:1) landscape and never rotated to 3:4 portrait"
+            )
+        }
+        
+        // 10b. Verify cropToLandscapeThreeByTwo on 4:3 (4032x3024 -> 4032x2688), 16:9 (1920x1080 -> 1620x1080), and 3:2 (3504x2336 -> 3504x2336)
+        let raw4x3PhotoCG = makeSolidOrBorderCGImage(width: 400, height: 300, fillRGBA: (50, 100, 200, 255))
+        let cropped4x3CG = BackdropCompositorService.cropToLandscapeThreeByTwo(raw4x3PhotoCG)
+        assertEqual(cropped4x3CG.width, 400, "4:3 photo preserves full width (400)")
+        assertEqual(cropped4x3CG.height, 267, "4:3 photo center-crops height to 3:2 (267)")
+        
+        let raw16x9CG = makeSolidOrBorderCGImage(width: 320, height: 180, fillRGBA: (50, 100, 200, 255))
+        let cropped16x9CG = BackdropCompositorService.cropToLandscapeThreeByTwo(raw16x9CG)
+        assertEqual(cropped16x9CG.width, 270, "16:9 frame center-crops width to 3:2 (270)")
+        assertEqual(cropped16x9CG.height, 180, "16:9 frame preserves full height (180)")
+        
+        // 10c. Verify GIFService.createGIF produces 3:2 animated GIF frames even when fed 4:3 source images
+        let raw4x3GIFSourceURL = qaRoot.appendingPathComponent("raw_4x3_gif_input.jpg")
+        try UIImage(cgImage: raw4x3PhotoCG).jpegData(compressionQuality: 0.92)!.write(to: raw4x3GIFSourceURL)
+        if let gif3x2URL = GIFService.createGIF(
+            from: [raw4x3GIFSourceURL.absoluteString, raw4x3GIFSourceURL.absoluteString],
+            frameDuration: 0.25,
+            backdrop: magazine ?? .none,
+            additionalSearchDirectories: [sampleBackdropsDir],
+            customMaskProvider: { _ in maskCI }
+        ),
+           let gif3x2Src = CGImageSourceCreateWithURL(gif3x2URL as CFURL, nil),
+           let gif3x2Frame = CGImageSourceCreateImageAtIndex(gif3x2Src, 0, nil) {
+            let gifAspect = Double(gif3x2Frame.width) / Double(gif3x2Frame.height)
+            assertTrue(
+                abs(gifAspect - 1.5) < 0.01,
+                String(format: "GIFService outputs 3:2 aspect ratio frames (%dx%d, ratio=%.3f)", gif3x2Frame.width, gif3x2Frame.height, gifAspect)
+            )
+            let fittedGIFOn4x3 = LiveView.fittedRect(
+                forImageSize: CGSize(width: gif3x2Frame.width, height: gif3x2Frame.height),
+                inContainerSize: iPad4x3Screen
+            )
+            assertTrue(
+                abs(fittedGIFOn4x3.width - iPad4x3Screen.width) < 0.01 &&
+                abs(fittedGIFOn4x3.minX) < 0.01 &&
+                fittedGIFOn4x3.minY > 50.0,
+                String(format: "3:2 GIF on 4:3 iPad spans 100%% width (left/right bars=0pt, top/bottom bars=%.1fpt)", fittedGIFOn4x3.minY)
+            )
+            try? fm.removeItem(at: gif3x2URL)
+        } else {
+            assertTrue(false, "Failed to verify 3:2 GIF output")
+        }
+        
+        // 10d. Verify both Sony 3:2 (1024x680) and iPad 3:2 (1440x960) frames on both 4:3 (1366x1024) and 11" (1194x834) iPads
+        //      have 0pt left/right bars and top/bottom black bars only.
+        for streamSize in [CGSize(width: 1024, height: 680), CGSize(width: 1440, height: 960), CGSize(width: 3504, height: 2336)] {
+            for screen in [iPad4x3Screen, iPad11ScreenSize] {
+                let fitted = LiveView.fittedRect(forImageSize: streamSize, inContainerSize: screen)
+                assertTrue(
+                    abs(fitted.width - screen.width) < 0.01 &&
+                    fitted.height < screen.height &&
+                    abs(fitted.minX) < 0.01 &&
+                    fitted.minY > 15.0,
+                    String(format: "3:2 frame (%.0fx%.0f) on %.0fx%.0f iPad spans 100%% width (minX=%.1fpt, top/bottom bar=%.1fpt)", streamSize.width, streamSize.height, screen.width, screen.height, fitted.minX, fitted.minY)
+                )
+            }
+        }
     }
 }
 #endif

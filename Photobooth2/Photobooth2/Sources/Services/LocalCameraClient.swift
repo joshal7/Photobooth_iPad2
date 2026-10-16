@@ -24,7 +24,7 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
         private let lock = NSLock()
         private var currentBackdrop: BackdropItem = .none
         private var activeCaptureMode: CaptureMode = .standard
-        private var cachedOrientation: UIDeviceOrientation = .portrait
+        private var cachedOrientation: UIDeviceOrientation = .landscapeLeft
         private var isRenderingPreview: Bool = false
         
         func setBackdrop(_ backdrop: BackdropItem) {
@@ -83,28 +83,29 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
     
     @MainActor
     private func refreshCachedDeviceOrientation() {
-        let orientation = UIDevice.current.orientation
-        if orientation.isValidInterfaceOrientation {
-            threadSafeState.setOrientation(orientation)
+        if ProcessInfo.processInfo.isiOSAppOnMac {
+            threadSafeState.setOrientation(.landscapeRight)
             return
         }
-        // Fallback when iPad is stationary in a stand at launch (.unknown / .faceUp / .faceDown):
-        // derive the corresponding UIDeviceOrientation from the active UIWindowScene.interfaceOrientation.
+        // Prioritize the active UIWindowScene interface orientation so a tilted iPad in a photobooth stand
+        // or with Rotation Lock enabled always matches the landscape UI orientation on screen.
         if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
             switch scene.interfaceOrientation {
-            case .portrait:
-                threadSafeState.setOrientation(.portrait)
-            case .portraitUpsideDown:
-                threadSafeState.setOrientation(.portraitUpsideDown)
             case .landscapeLeft:
-                // UIInterfaceOrientation.landscapeLeft (home button left) == UIDeviceOrientation.landscapeRight
+                // UIInterfaceOrientation.landscapeLeft (home/USB-C left) == UIDeviceOrientation.landscapeRight
                 threadSafeState.setOrientation(.landscapeRight)
+                return
             case .landscapeRight:
-                // UIInterfaceOrientation.landscapeRight (home button right) == UIDeviceOrientation.landscapeLeft
+                // UIInterfaceOrientation.landscapeRight (home/USB-C right) == UIDeviceOrientation.landscapeLeft
                 threadSafeState.setOrientation(.landscapeLeft)
+                return
             default:
                 break
             }
+        }
+        let orientation = UIDevice.current.orientation
+        if orientation == .landscapeLeft || orientation == .landscapeRight {
+            threadSafeState.setOrientation(orientation)
         }
     }
     

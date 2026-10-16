@@ -18,6 +18,8 @@ struct ReviewView: View {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .edgesIgnoringSafeArea(.all)
                     .transition(.opacity)
                     .id(currentIndex)
             } else {
@@ -35,6 +37,7 @@ struct ReviewView: View {
                     .padding(.bottom, 20)
             }
         }
+        .edgesIgnoringSafeArea(.all)
     }
     
     private func isGIF(url: String) -> Bool {

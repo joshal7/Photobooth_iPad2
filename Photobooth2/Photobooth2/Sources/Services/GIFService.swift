@@ -54,11 +54,12 @@ final class GIFService: Sendable {
         
         CGImageDestinationSetProperties(destination, fileProperties as CFDictionary)
         
-        // Default 1080p height
+        // Default 1080p height (1620x1080 at 3:2 landscape aspect ratio)
         let targetHeight: Double = 1080
+        let defaultThreeByTwoMaxPixelSize = Int((targetHeight * Double(BackdropCompositorService.targetPhotoboothAspectRatio)).rounded())
         
-        // Calculate maxPixelSize based on the first image's aspect ratio
-        var computedMaxPixelSize: Int = Int(targetHeight)
+        // Calculate maxPixelSize based on the first image's aspect ratio (minimum 1620 for 1080p 3:2 output)
+        var computedMaxPixelSize: Int = defaultThreeByTwoMaxPixelSize
         
         if let firstPath = imagePaths.first {
             let url = resolveFileURL(firstPath)
@@ -71,9 +72,9 @@ final class GIFService: Sendable {
                 if height > 0 {
                     let aspectRatio = width / height
                     if width >= height {
-                        computedMaxPixelSize = Int(targetHeight * aspectRatio)
+                        computedMaxPixelSize = max(defaultThreeByTwoMaxPixelSize, Int((targetHeight * aspectRatio).rounded()))
                     } else {
-                        computedMaxPixelSize = Int(targetHeight)
+                        computedMaxPixelSize = defaultThreeByTwoMaxPixelSize
                     }
                 }
             }
@@ -100,10 +101,12 @@ final class GIFService: Sendable {
         for path in imagePaths {
             let url = resolveFileURL(path)
             guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                  let rawCG = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+                  let rawThumbCG = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
                 print("Failed to load image source at \(path)")
                 continue
             }
+            
+            let rawCG = BackdropCompositorService.cropToLandscapeThreeByTwo(rawThumbCG)
             
             // Frames captured by SonyUSBCameraClient.takePicture() ("sony_<UUID>.jpg") or LocalCameraClient
             // ("local_<UUID>.jpg") are already normalized and single-pass auto-exposed once when written to /tmp.

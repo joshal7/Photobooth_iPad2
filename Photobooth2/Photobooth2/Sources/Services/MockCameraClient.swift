@@ -27,10 +27,10 @@ class MockCameraClient: CameraService {
         // Start emitting frames
         DispatchQueue.main.async {
             self.timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-                let renderer = UIGraphicsImageRenderer(size: CGSize(width: 640, height: 480))
+                let renderer = UIGraphicsImageRenderer(size: CGSize(width: 720, height: 480))
                 let image = renderer.image { ctx in
                     UIColor.random().setFill()
-                    ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 480))
+                    ctx.fill(CGRect(x: 0, y: 0, width: 720, height: 480))
                 }
                 self._previewStream.send(image)
             }
@@ -44,10 +44,10 @@ class MockCameraClient: CameraService {
     
     func takePicture() async throws -> [String] {
         try await Task.sleep(nanoseconds: 300_000_000) // Simulate capture delay
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 800, height: 600))
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 900, height: 600))
         let image = renderer.image { ctx in
             UIColor.random().setFill()
-            ctx.fill(CGRect(x: 0, y: 0, width: 800, height: 600))
+            ctx.fill(CGRect(x: 0, y: 0, width: 900, height: 600))
         }
         guard let data = image.jpegData(compressionQuality: 0.85) else {
             throw CameraError.invalidResponse
@@ -68,10 +68,10 @@ class MockCameraClient: CameraService {
         }
         try await Task.sleep(nanoseconds: 100_000_000)
         // Fallback solid color image as mock data
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 800, height: 600))
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 900, height: 600))
         let image = renderer.image { ctx in
             UIColor.random().setFill()
-            ctx.fill(CGRect(x: 0, y: 0, width: 800, height: 600))
+            ctx.fill(CGRect(x: 0, y: 0, width: 900, height: 600))
         }
         return image.jpegData(compressionQuality: 0.8) ?? Data()
     }

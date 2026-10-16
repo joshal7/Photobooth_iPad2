@@ -552,31 +552,106 @@ final class BackdropCompositorService: Sendable {
         }
     }
     
-    // MARK: - Front-Camera Selfie Pre-Mirroring Helper (iPad-Only Mode)
+    // MARK: - 3:2 Landscape Aspect Ratio Enforcement & Front-Camera Selfie Pre-Mirroring
     
-    /// Orients and horizontally mirrors a raw front-camera `CIImage` into upright display coordinates
-    /// BEFORE any backdrop or foreground frame is composited, so the guest sees a natural mirror
-    /// while foreground text (e.g. "Evan's Bar Mitzvah") stays 100% right-side up and un-reversed.
+    /// Target aspect ratio (`3:2 = 1.500:1`) for all photobooth Live View frames, captured Photos, GIFs, and backdrops.
+    nonisolated static let targetPhotoboothAspectRatio: CGFloat = 3.0 / 2.0
+    
+    /// Center-crops any `CIImage` to landscape `3:2` (`width : height = 3 : 2 = 1.500:1`) and normalizes its origin to `(0, 0)`.
+    /// - For `4:3` (`1.333:1`) iPad camera frames (e.g. `1440x1080` Live View or `4032x3024` photo), preserves 100% of the width
+    ///   and trims top/bottom equally to `1440x960` / `4032x2688` (`3:2`).
+    /// - For `16:9` (`1.778:1`) frames (e.g. `1920x1080`), preserves 100% of the height and trims left/right equally to `1620x1080` (`3:2`).
+    /// - For frames already at `3:2` (e.g. `3504x2336`, `1620x1080`, `1024x680`), preserves dimensions untouched.
+    nonisolated static func cropToLandscapeThreeByTwo(_ ciImage: CIImage) -> CIImage {
+        let ext = ciImage.extent
+        guard ext.width > 1, ext.height > 1 else { return ciImage }
+        let normalized = (ext.minX != 0 || ext.minY != 0)
+            ? ciImage.transformed(by: CGAffineTransform(translationX: -ext.minX, y: -ext.minY))
+            : ciImage
+        let w = normalized.extent.width
+        let h = normalized.extent.height
+        let currentAspect = w / h
+        let targetAspect = targetPhotoboothAspectRatio
+        
+        if abs(currentAspect - targetAspect) <= 0.008 {
+            return normalized
+        }
+        
+        let cropW: CGFloat
+        let cropH: CGFloat
+        if currentAspect < targetAspect {
+            // Narrower/taller than 3:2 (e.g. 4:3 = 1.3333): keep 100% of width, center-crop height to width * 2/3
+            cropW = w
+            cropH = max(1.0, (w / targetAspect).rounded())
+        } else {
+            // Wider than 3:2 (e.g. 16:9 = 1.7778): keep 100% of height, center-crop width to height * 3/2
+            cropW = max(1.0, (h * targetAspect).rounded())
+            cropH = h
+        }
+        
+        let offsetX = ((w - cropW) * 0.5).rounded(.down)
+        let offsetY = ((h - cropH) * 0.5).rounded(.down)
+        let cropRect = CGRect(x: offsetX, y: offsetY, width: cropW, height: cropH)
+        return normalized
+            .cropped(to: cropRect)
+            .transformed(by: CGAffineTransform(translationX: -offsetX, y: -offsetY))
+    }
+    
+    /// Center-crops any `CGImage` to landscape `3:2` (`width : height = 3 : 2 = 1.500:1`).
+    nonisolated static func cropToLandscapeThreeByTwo(_ cgImage: CGImage) -> CGImage {
+        let w = CGFloat(cgImage.width)
+        let h = CGFloat(cgImage.height)
+        guard w > 1, h > 1 else { return cgImage }
+        let currentAspect = w / h
+        let targetAspect = targetPhotoboothAspectRatio
+        
+        if abs(currentAspect - targetAspect) <= 0.008 {
+            return cgImage
+        }
+        
+        let cropW: CGFloat
+        let cropH: CGFloat
+        if currentAspect < targetAspect {
+            cropW = w
+            cropH = max(1.0, (w / targetAspect).rounded())
+        } else {
+            cropW = max(1.0, (h * targetAspect).rounded())
+            cropH = h
+        }
+        
+        let offsetX = ((w - cropW) * 0.5).rounded(.down)
+        let offsetY = ((h - cropH) * 0.5).rounded(.down)
+        let cropRect = CGRect(x: offsetX, y: offsetY, width: cropW, height: cropH)
+        return cgImage.cropping(to: cropRect) ?? cgImage
+    }
+    
+    /// Orients, horizontally mirrors, and center-crops a raw front-camera `CIImage` into upright landscape `3:2`
+    /// display coordinates BEFORE any backdrop or foreground frame is composited, so the guest sees a natural mirror
+    /// at the exact `3:2` photobooth aspect ratio while foreground text (e.g. "Evan's Bar Mitzvah") stays 100% right-side up and un-reversed.
     nonisolated static func orientAndMirrorFrontCameraCIImage(
         _ rawCIImage: CIImage,
         interfaceOrientation: UIDeviceOrientation
     ) -> CIImage {
-        // Step 1: Rotate raw front-camera sensor buffer to upright display coordinates
-        // matching LocalCameraClient's UIImage.Orientation mapping:
-        // .portrait -> .right (90 CW), .portraitUpsideDown -> .left (90 CCW),
-        // .landscapeLeft -> .down (180), .landscapeRight -> .up (0).
+        // Step 1: Rotate raw front-camera sensor buffer to upright LANDSCAPE display coordinates.
+        // All photobooth backgrounds and foreground frames are landscape 3:2 (3504x2336), so we never
+        // rotate a landscape sensor buffer 90° into vertical 3:4 portrait (which would scale the image
+        // down left-to-right and add black bars on the left and right of the iPad screen).
+        let isRawSensorLandscape = rawCIImage.extent.width >= rawCIImage.extent.height
         let uprightExif: CGImagePropertyOrientation
-        switch interfaceOrientation {
-        case .portrait:
-            uprightExif = .right
-        case .portraitUpsideDown:
-            uprightExif = .left
-        case .landscapeLeft:
-            uprightExif = .down
-        case .landscapeRight:
-            uprightExif = .up
-        default:
-            uprightExif = .right
+        if ProcessInfo.processInfo.isiOSAppOnMac {
+            uprightExif = isRawSensorLandscape ? .up : .right
+        } else {
+            switch interfaceOrientation {
+            case .landscapeLeft:
+                // UIDeviceOrientation.landscapeLeft == UIInterfaceOrientation.landscapeRight (home/USB-C on right)
+                uprightExif = isRawSensorLandscape ? .down : .right
+            case .landscapeRight:
+                // UIDeviceOrientation.landscapeRight == UIInterfaceOrientation.landscapeLeft (home/USB-C on left)
+                uprightExif = isRawSensorLandscape ? .up : .left
+            default:
+                // Keep landscape orientation when stationary in a stand, tilted, or at launch
+                uprightExif = isRawSensorLandscape ? .down : .right
+            }
         }
         let upright = rawCIImage.oriented(forExifOrientation: Int32(uprightExif.rawValue))
         let ext = upright.extent
@@ -586,9 +661,14 @@ final class BackdropCompositorService: Sendable {
         
         // Step 2: Horizontally mirror the upright subject image so selfie motion feels like a natural mirror,
         // while any subsequently composited foreground text/frame remains un-mirrored.
-        return normalizedUpright
+        let mirrored = normalizedUpright
             .transformed(by: CGAffineTransform(scaleX: -1.0, y: 1.0))
             .transformed(by: CGAffineTransform(translationX: ext.width, y: 0))
+        
+        // Step 3: Center-crop the 4:3 (or 16:9) front-camera buffer to exact 3:2 landscape aspect ratio
+        // so Live View, captured Photos, and GIFs match the 3:2 backgrounds/foregrounds and span 100% width
+        // on the iPad with top/bottom black bars only.
+        return cropToLandscapeThreeByTwo(mirrored)
     }
     
     /// Horizontally mirrors an already-upright `CGImage` (used in deterministic QA tests for front-camera selfie pre-mirroring).

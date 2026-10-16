@@ -961,14 +961,51 @@ if let pb = testPB {
     )
 }
 
-// 7Q. Verify LiveView Uses `.aspectRatio(contentMode: .fit)` (Matching ReviewView) with Zero Edge Clipping
+// 7Q. Verify 3:2 Landscape Aspect Ratio & Top/Bottom Black Bars Across All Configurations (Live View, Photos, GIFs)
 let liveViewSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Views/LiveView.swift", encoding: .utf8)) ?? ""
+let reviewViewSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Views/ReviewView.swift", encoding: .utf8)) ?? ""
+let infoPlistSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Info.plist", encoding: .utf8)) ?? ""
 assertTrue(
     liveViewSource.contains(".aspectRatio(contentMode: .fit)") &&
     !liveViewSource.contains(".aspectRatio(contentMode: .fill)") &&
-    !liveViewSource.contains(".clipped()"),
-    "LiveView.swift renders previewImage with .aspectRatio(contentMode: .fit) and no .clipped() cropping"
+    !liveViewSource.contains(".clipped()") &&
+    reviewViewSource.contains(".aspectRatio(contentMode: .fit)"),
+    "LiveView.swift and ReviewView.swift render images with .aspectRatio(contentMode: .fit)"
 )
+assertTrue(
+    !infoPlistSource.contains("UIInterfaceOrientationPortrait") &&
+    infoPlistSource.contains("UIInterfaceOrientationLandscapeRight") &&
+    infoPlistSource.contains("UIInterfaceOrientationLandscapeLeft"),
+    "Info.plist locks iPad interface orientations to horizontal Landscape (4:3 screen)"
+)
+
+func cropToLandscapeThreeByTwo(_ ciImage: CIImage) -> CIImage {
+    let ext = ciImage.extent
+    let normalized = (ext.minX != 0 || ext.minY != 0)
+        ? ciImage.transformed(by: CGAffineTransform(translationX: -ext.minX, y: -ext.minY))
+        : ciImage
+    let w = normalized.extent.width
+    let h = normalized.extent.height
+    let currentAspect = w / h
+    let targetAspect: CGFloat = 1.5
+    if abs(currentAspect - targetAspect) <= 0.008 {
+        return normalized
+    }
+    let cropW: CGFloat
+    let cropH: CGFloat
+    if currentAspect < targetAspect {
+        cropW = w
+        cropH = max(1.0, (w / targetAspect).rounded())
+    } else {
+        cropW = max(1.0, (h * targetAspect).rounded())
+        cropH = h
+    }
+    let ox = ((w - cropW) * 0.5).rounded(.down)
+    let oy = ((h - cropH) * 0.5).rounded(.down)
+    return normalized
+        .cropped(to: CGRect(x: ox, y: oy, width: cropW, height: cropH))
+        .transformed(by: CGAffineTransform(translationX: -ox, y: -oy))
+}
 
 func computeFittedRect(imageSize: CGSize, containerSize: CGSize) -> CGRect {
     let scale = min(containerSize.width / imageSize.width, containerSize.height / imageSize.height)
@@ -977,40 +1014,164 @@ func computeFittedRect(imageSize: CGSize, containerSize: CGSize) -> CGRect {
     return CGRect(x: (containerSize.width - w) * 0.5, y: (containerSize.height - h) * 0.5, width: w, height: h)
 }
 
-// Case 1: Sony 3:2 Live View (1024x680) on 11-inch iPad (1194x834) -> Full width visible, subtle top/bottom black bars (~19.2pt each)
-let fittedSonyOnIPad11 = computeFittedRect(imageSize: CGSize(width: 1024, height: 680), containerSize: CGSize(width: 1194, height: 834))
+// Verify iPad 4:3 Front Camera Live View (1440x1080) and Photo (4032x3024) are oriented, mirrored, and cropped to exact 3:2 (1440x960 and 4032x2688)
+func orientAndMirrorFrontCameraCI(_ rawCIImage: CIImage, orientationRaw: Int) -> CIImage {
+    let isRawSensorLandscape = rawCIImage.extent.width >= rawCIImage.extent.height
+    let uprightExif: Int32
+    switch orientationRaw {
+    case 3: // .landscapeLeft
+        uprightExif = isRawSensorLandscape ? 3 : 6 // .down : .right
+    case 4: // .landscapeRight
+        uprightExif = isRawSensorLandscape ? 1 : 8 // .up : .left
+    default: // .portrait (1), .portraitUpsideDown (2), .unknown (0) -> keep landscape!
+        uprightExif = isRawSensorLandscape ? 3 : 6
+    }
+    let upright = rawCIImage.oriented(forExifOrientation: uprightExif)
+    let ext = upright.extent
+    let normalized = upright.transformed(by: CGAffineTransform(translationX: -ext.minX, y: -ext.minY))
+    let mirrored = normalized
+        .transformed(by: CGAffineTransform(scaleX: -1.0, y: 1.0))
+        .transformed(by: CGAffineTransform(translationX: ext.width, y: 0))
+    return cropToLandscapeThreeByTwo(mirrored)
+}
+
+for orientRaw in [0, 1, 2, 3, 4] {
+    let liveExt = orientAndMirrorFrontCameraCI(
+        CIImage(color: .black).cropped(to: CGRect(x: 0, y: 0, width: 1440, height: 1080)),
+        orientationRaw: orientRaw
+    ).extent
+    assertEqual(Int(liveExt.width), 1440, "Front camera 1440x1080 preserves full 1440 width (orientation=\(orientRaw))")
+    assertEqual(Int(liveExt.height), 960, "Front camera 1440x1080 center-crops height to 960 3:2 (orientation=\(orientRaw))")
+}
+
+let iPadPhotoCropped = orientAndMirrorFrontCameraCI(
+    CIImage(color: .black).cropped(to: CGRect(x: 0, y: 0, width: 4032, height: 3024)),
+    orientationRaw: 3
+).extent
+let mac16x9Cropped = cropToLandscapeThreeByTwo(CIImage(color: .black).cropped(to: CGRect(x: 0, y: 0, width: 1920, height: 1080))).extent
+assertEqual(Int(iPadPhotoCropped.width), 4032, "iPad 4:3 Photo preserves full 4032 width")
+assertEqual(Int(iPadPhotoCropped.height), 2688, "iPad 4:3 Photo center-crops height to 2688 (exact 3:2)")
+assertEqual(Int(mac16x9Cropped.width), 1620, "16:9 camera frame center-crops width to 1620 (exact 3:2)")
+assertEqual(Int(mac16x9Cropped.height), 1080, "16:9 camera frame preserves full 1080 height")
+
+// Verify 3-layer compositing (none, bg-only, fg-only, combo) on a cropped 3:2 camera frame (360x240 from 360x270 4:3)
+// and compiling into a real animated GIF file on disk produces exact 3:2 frames with 0.0pt left/right black bars!
+let raw4x3CameraCG = makeSolidOrBorderCGImage(width: 360, height: 270, fillRGBA: (30, 90, 230, 255))
+let cropped3x2CameraCI = cropToLandscapeThreeByTwo(CIImage(cgImage: raw4x3CameraCG))
+let cropped3x2CameraCG = ciContext.createCGImage(cropped3x2CameraCI, from: cropped3x2CameraCI.extent)!
+assertEqual(cropped3x2CameraCG.width, 360, "Cropped camera frame width is 360")
+assertEqual(cropped3x2CameraCG.height, 240, "Cropped camera frame height is 240 (exact 3:2)")
+
+let bg3x2CG = makeSolidOrBorderCGImage(width: 360, height: 240, fillRGBA: (220, 30, 30, 255))
+let fg3x2CG = makeSolidOrBorderCGImage(width: 360, height: 240, fillRGBA: (0, 0, 0, 0), borderThickness: 12, borderRGBA: (20, 210, 60, 255))
+let mask3x2CI = CIImage(cgImage: makeSolidOrBorderCGImage(width: 360, height: 240, fillRGBA: (255, 255, 255, 255), borderThickness: 40, borderRGBA: (0, 0, 0, 255)))
+
+let modeOutputs: [(String, CGImage)] = [
+    ("Original (None)", compositeThreeLayers(subjectCG: cropped3x2CameraCG, bgCG: nil, fgCG: nil, maskProvider: { nil })),
+    ("Background-Only", compositeThreeLayers(subjectCG: cropped3x2CameraCG, bgCG: bg3x2CG, fgCG: nil, maskProvider: { mask3x2CI })),
+    ("Foreground-Only", compositeThreeLayers(subjectCG: cropped3x2CameraCG, bgCG: nil, fgCG: fg3x2CG, maskProvider: { nil })),
+    ("Background+Foreground Combo", compositeThreeLayers(subjectCG: cropped3x2CameraCG, bgCG: bg3x2CG, fgCG: fg3x2CG, maskProvider: { mask3x2CI }))
+]
+
+for (modeName, outCG) in modeOutputs {
+    let ratio = Double(outCG.width) / Double(outCG.height)
+    assertTrue(
+        outCG.width == 360 && outCG.height == 240 && abs(ratio - 1.5) < 0.0001,
+        "\(modeName) Photo/LiveView output is exact 3:2 (\(outCG.width)x\(outCG.height), ratio=\(String(format: "%.3f", ratio)))"
+    )
+    // Also compile a 2-frame animated GIF for this backdrop mode and verify the encoded GIF frames are 3:2
+    let gifTempURL = FileManager.default.temporaryDirectory.appendingPathComponent("qa_3x2_\(UUID().uuidString).gif")
+    if let dest = CGImageDestinationCreateWithURL(gifTempURL as CFURL, UTType.gif.identifier as CFString, 2, nil) {
+        CGImageDestinationAddImage(dest, outCG, nil)
+        CGImageDestinationAddImage(dest, outCG, nil)
+        CGImageDestinationFinalize(dest)
+        if let src = CGImageSourceCreateWithURL(gifTempURL as CFURL, nil),
+           let decodedGIFFrame = CGImageSourceCreateImageAtIndex(src, 0, nil) {
+            let gifRatio = Double(decodedGIFFrame.width) / Double(decodedGIFFrame.height)
+            assertTrue(
+                abs(gifRatio - 1.5) < 0.0001,
+                "\(modeName) compiled GIF frame is exact 3:2 (\(decodedGIFFrame.width)x\(decodedGIFFrame.height), ratio=\(String(format: "%.3f", gifRatio)))"
+            )
+        }
+        try? FileManager.default.removeItem(at: gifTempURL)
+    }
+}
+
+// Verify ALL configurations (Sony Live View 1024x680, iPad Live View 1440x960, Captured Photo 4032x2688,
+// Backdrop/Foreground 3504x2336, and 1080p GIF 1620x1080) on BOTH 4:3 iPad (1366x1024 & 1024x768) and 11" iPad (1194x834)
+// have 0.0pt left/right black bars and place small black bars EXCLUSIVELY on top and bottom!
+let all3x2Configs: [(String, CGSize)] = [
+    ("Sony 3:2 Live View", CGSize(width: 1024, height: 680)),
+    ("iPad 3:2 Live View", CGSize(width: 1440, height: 960)),
+    ("iPad 3:2 Captured Photo", CGSize(width: 4032, height: 2688)),
+    ("Backdrop/Foreground 3:2 Asset", CGSize(width: 3504, height: 2336)),
+    ("Compiled 3:2 1080p GIF", CGSize(width: 1620, height: 1080))
+]
+let allIPadScreens: [(String, CGSize)] = [
+    ("4:3 iPad (1024x768)", CGSize(width: 1024, height: 768)),
+    ("4:3 iPad Pro 12.9\" (1366x1024)", CGSize(width: 1366, height: 1024)),
+    ("11\" iPad Pro/Air (1194x834)", CGSize(width: 1194, height: 834))
+]
+
+for (configName, imgSize) in all3x2Configs {
+    for (screenName, screenSize) in allIPadScreens {
+        let fitted = computeFittedRect(imageSize: imgSize, containerSize: screenSize)
+        assertTrue(
+            abs(fitted.width - screenSize.width) < 0.01 &&
+            fitted.height < screenSize.height &&
+            abs(fitted.minX) < 0.01 &&
+            fitted.minY > 15.0 &&
+            abs((fitted.width / fitted.height) - (imgSize.width / imgSize.height)) < 0.0001,
+            String(format: "%@ on %@ spans 100%% width (left/right bars=0.0pt, top/bottom bars=%.1fpt each)", configName, screenName, fitted.minY)
+        )
+    }
+}
+
+// 7R. External Camera (`SonyUSBCameraClient`) Horizontal Mirroring for Live View, Captured Photos, Animated GIFs & Mac Batch
+let sonySource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Services/SonyUSBCameraClient.swift", encoding: .utf8)) ?? ""
+let manifestSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Services/BackdropManifestStore.swift", encoding: .utf8)) ?? ""
 assertTrue(
-    abs(fittedSonyOnIPad11.width - 1194.0) < 0.01 &&
-    fittedSonyOnIPad11.height < 834.0 &&
-    fittedSonyOnIPad11.minX == 0.0 &&
-    fittedSonyOnIPad11.minY > 18.0 &&
-    abs((fittedSonyOnIPad11.width / fittedSonyOnIPad11.height) - (1024.0 / 680.0)) < 0.0001,
-    String(format: "Sony 3:2 Live View on 11\" iPad (1194x834) shows 100%% of width & height (1194x%.1f) with %.1fpt top/bottom black bars", fittedSonyOnIPad11.height, fittedSonyOnIPad11.minY)
+    sonySource.contains("let mirroredRawCG = BackdropCompositorService.mirrorCGImageHorizontally(unmirroredRawCG, ciContext: ciContext)") &&
+    sonySource.contains("let mirroredCG = BackdropCompositorService.mirrorCGImageHorizontally(threeByTwoCG, ciContext: ciContext)") &&
+    manifestSource.contains("let mirroredFullCG = BackdropCompositorService.mirrorCGImageHorizontally(rawFullCG, ciContext: ciContext)"),
+    "SonyUSBCameraClient & BackdropManifestStore horizontally mirror external camera Live View, Photo, GIF, and Full-Res subject frames before backdrop/foreground compositing"
 )
 
-// Case 2: Sony 3:2 Live View (1024x680) on 13-inch iPad (1366x1024, 4:3) -> Full width visible, top/bottom black bars (~58.6pt each)
-let fittedSonyOnIPad13 = computeFittedRect(imageSize: CGSize(width: 1024, height: 680), containerSize: CGSize(width: 1366, height: 1024))
-assertTrue(
-    abs(fittedSonyOnIPad13.width - 1366.0) < 0.01 &&
-    fittedSonyOnIPad13.height < 1024.0 &&
-    fittedSonyOnIPad13.minX == 0.0 &&
-    fittedSonyOnIPad13.minY > 55.0,
-    String(format: "Sony 3:2 Live View on 13\" 4:3 iPad (1366x1024) shows 100%% of width & height (1366x%.1f) with %.1fpt top/bottom black bars", fittedSonyOnIPad13.height, fittedSonyOnIPad13.minY)
+let rawExternalSubj = makeSolidOrBorderCGImage(
+    width: 180,
+    height: 120,
+    fillRGBA: (95, 95, 95, 255),
+    rightMarkerRGBA: (250, 250, 20, 255) // Yellow marker on RIGHT of raw external camera image
 )
-
-// Case 3: iPad 4:3 Front Camera (1440x1080) on 11-inch iPad (1194x834, 1.43:1) -> Full height visible, subtle left/right black bars (~41pt each)
-let fittedFrontCamOnIPad11 = computeFittedRect(imageSize: CGSize(width: 1440, height: 1080), containerSize: CGSize(width: 1194, height: 834))
+let externalAsymFrame = makeSolidOrBorderCGImage(
+    width: 180,
+    height: 120,
+    fillRGBA: (0, 0, 0, 0),
+    rightMarkerRGBA: (20, 240, 240, 255) // Cyan marker on RIGHT of foreground frame
+)
+let mirroredExtSubjCI = CIImage(cgImage: rawExternalSubj)
+    .transformed(by: CGAffineTransform(scaleX: -1.0, y: 1.0))
+    .transformed(by: CGAffineTransform(translationX: 180, y: 0))
+let mirroredExtSubjCG = ciContext.createCGImage(mirroredExtSubjCI, from: CGRect(x: 0, y: 0, width: 180, height: 120))!
+let extExposedCG = autoExposeCapturedCGImage(mirroredExtSubjCG)
+let extCompositedOut = compositeThreeLayers(
+    subjectCG: extExposedCG,
+    bgCG: nil,
+    fgCG: externalAsymFrame,
+    maskProvider: { nil }
+)
+let extLeftSubjPx = readPixelRGB(extCompositedOut, x: 10, y: 60)
+let extRightFramePx = readPixelRGB(extCompositedOut, x: 170, y: 60)
 assertTrue(
-    abs(fittedFrontCamOnIPad11.height - 834.0) < 0.01 &&
-    fittedFrontCamOnIPad11.width < 1194.0 &&
-    fittedFrontCamOnIPad11.minY == 0.0 &&
-    fittedFrontCamOnIPad11.minX > 40.0,
-    String(format: "iPad 4:3 camera on 11\" iPad (1194x834) shows 100%% of width & height (%.1fx834) with %.1fpt left/right black bars", fittedFrontCamOnIPad11.width, fittedFrontCamOnIPad11.minX)
+    extLeftSubjPx.r > 200 && extLeftSubjPx.g > 200 && extLeftSubjPx.b < 80 &&
+    extRightFramePx.g > 200 && extRightFramePx.b > 200 && extRightFramePx.r < 80,
+    "External Camera Horizontal Mirroring: subject mirrors to left (\(extLeftSubjPx.r),\(extLeftSubjPx.g),\(extLeftSubjPx.b)) while foreground frame stays un-reversed on right (\(extRightFramePx.r),\(extRightFramePx.g),\(extRightFramePx.b))"
 )
 
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")
 print("========================================================")
 exit(failedAssertions == 0 ? 0 : 1)
+
 
 

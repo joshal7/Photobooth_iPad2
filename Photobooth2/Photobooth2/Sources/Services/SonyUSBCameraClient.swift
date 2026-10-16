@@ -702,21 +702,24 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     /// 1. Records the Triple-Lock metadata (`ptpFilename`, EXIF `DateTimeOriginal`, `8x8` RGB signature) in `BackdropManifestStore`
     ///    in `.standard` Photo Mode when a backdrop is active (since `.standard` uses `pcAndCamera` `0x0003` to save full-res JPEGs
     ///    to the camera SD card, whereas `.gif` uses `pcOnly` `0x0001` RAM-only transfer).
-    /// 2. Auto-exposes dark or dim captures on the raw subject image FIRST.
-    /// 3. In `.standard` Photo Mode with an active backdrop, composites the Background + Foreground with `.captureAccurate` segmentation.
-    /// 4. In `.gif` Mode, saves the raw auto-exposed frame so `GIFService.createGIF` can equalize burst luminance
+    /// 2. Horizontally mirrors the external camera subject so captured photos and GIF frames match the mirrored Live View preview
+    ///    while keeping any composited foreground frame text un-reversed.
+    /// 3. Auto-exposes dark or dim captures on the mirrored subject image FIRST.
+    /// 4. In `.standard` Photo Mode with an active backdrop, composites the Background + Foreground with `.captureAccurate` segmentation.
+    /// 5. In `.gif` Mode, saves the mirrored, auto-exposed frame so `GIFService.createGIF` can equalize burst luminance
     ///    first before applying `.captureAccurate` backdrop compositing (preventing any border/backdrop brightness flicker).
-    nonisolated private static func normalizeAndAutoExposeCapturedJPEG(
+    nonisolated static func normalizeAndAutoExposeCapturedJPEG(
         _ rawData: Data,
         objectInfoData: Data? = nil,
         backdrop: BackdropItem = .none,
-        captureMode: CaptureMode = .standard
+        captureMode: CaptureMode = .standard,
+        additionalSearchDirectories: [URL] = []
     ) -> Data {
         return autoreleasepool {
             let extracted = SonyPTPPacket.extractCapturedJPEG(from: rawData) ?? rawData
             
             // Decode with kCGImageSourceCreateThumbnailWithTransform: true so EXIF orientation is baked upright
-            // before computing the 8x8 RGB signature, auto-exposing, and compositing foreground frames.
+            // before computing the 8x8 RGB signature, mirroring, auto-exposing, and compositing foreground frames.
             let uprightRawCG: CGImage? = {
                 if let src = CGImageSourceCreateWithData(extracted as CFData, nil) {
                     let opts: [CFString: Any] = [
@@ -731,25 +734,29 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 return UIImage(data: extracted)?.cgImage
             }()
             
-            guard let rawCG = uprightRawCG else {
+            guard let decodedRawCG = uprightRawCG else {
                 return extracted
             }
             
+            let unmirroredRawCG = BackdropCompositorService.cropToLandscapeThreeByTwo(decodedRawCG)
             let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
             
-            // Record Triple-Lock manifest entry using `rawCG` (upright, pre-exposure boost) so its 8x8 RGB signature
-            // matches the un-boosted SD card DSC0xxxx.JPG file even in dim lighting conditions.
+            // Record Triple-Lock manifest entry using `unmirroredRawCG` (upright, un-mirrored, pre-exposure boost)
+            // so its 8x8 RGB signature matches the un-boosted SD card DSC0xxxx.JPG file even in dim lighting conditions.
             // Only record in `.standard` Photo Mode where the Sony camera writes to the SD card (`0x0003`).
             if captureMode == .standard && !backdrop.isNone {
                 BackdropManifestStore.shared.recordCapture(
-                    uncompositedCGImage: rawCG,
+                    uncompositedCGImage: unmirroredRawCG,
                     rawJPEGData: extracted,
                     ptpObjectInfoData: objectInfoData,
                     backdrop: backdrop
                 )
             }
             
-            let exposedCG = autoExposeCapturedCGImage(rawCG, ciContext: ciContext)
+            // Horizontally mirror the external camera subject so captured photos and GIF frames match the
+            // mirrored Live View preview while any subsequently composited foreground frame text stays un-reversed.
+            let mirroredRawCG = BackdropCompositorService.mirrorCGImageHorizontally(unmirroredRawCG, ciContext: ciContext)
+            let exposedCG = autoExposeCapturedCGImage(mirroredRawCG, ciContext: ciContext)
             
             let finalCG: CGImage
             if captureMode == .standard && !backdrop.isNone {
@@ -757,7 +764,8 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                     cgImage: exposedCG,
                     backdrop: backdrop,
                     quality: .captureAccurate,
-                    ciContext: ciContext
+                    ciContext: ciContext,
+                    additionalSearchDirectories: additionalSearchDirectories
                 )
             } else {
                 finalCG = exposedCG
@@ -766,6 +774,37 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             let processedImage = UIImage(cgImage: finalCG, scale: 1.0, orientation: .up)
             return processedImage.jpegData(compressionQuality: 0.92) ?? extracted
         }
+    }
+    
+    /// Decodes a raw Sony `0xFFFFC002` Live View JPEG frame, center-crops to landscape `3:2`,
+    /// horizontally mirrors the subject (so the external camera acts like a natural mirror for guests),
+    /// auto-exposes dark frames, and composites any active background/foreground (keeping foreground text un-reversed).
+    nonisolated static func processLiveViewJPEG(
+        _ jpegData: Data,
+        backdrop: BackdropItem = .none,
+        ciContext: CIContext,
+        additionalSearchDirectories: [URL] = []
+    ) -> (UIImage, Double)? {
+        guard let rawImage = UIImage(data: jpegData),
+              let rawCG = rawImage.cgImage else {
+            return nil
+        }
+        let threeByTwoCG = BackdropCompositorService.cropToLandscapeThreeByTwo(rawCG)
+        let mirroredCG = BackdropCompositorService.mirrorCGImageHorizontally(threeByTwoCG, ciContext: ciContext)
+        let normalizedLiveUI = UIImage(cgImage: mirroredCG, scale: 1.0, orientation: .up)
+        let (exposedImage, rawLuma) = Self.autoExposeLiveViewIfNeeded(normalizedLiveUI, ciContext: ciContext)
+        guard !backdrop.isNone, let exposedCG = exposedImage.cgImage else {
+            return (exposedImage, rawLuma)
+        }
+        let compositedCG = BackdropCompositorService.composite(
+            cgImage: exposedCG,
+            backdrop: backdrop,
+            quality: .liveFast,
+            ciContext: ciContext,
+            additionalSearchDirectories: additionalSearchDirectories
+        )
+        let finalUI = UIImage(cgImage: compositedCG, scale: 1.0, orientation: .up)
+        return (finalUI, rawLuma)
     }
     
     /// Auto-exposes a captured `UIImage` (called once during JPEG normalization in `takePicture()`)
@@ -824,22 +863,14 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                     
                     let (activeBackdrop, _) = self.currentBackdropAndMode()
                     let result: (UIImage, Double)? = autoreleasepool {
-                        guard let jpegData = SonyPTPPacket.extractLiveViewJPEG(from: payload),
-                              let rawImage = UIImage(data: jpegData) else {
+                        guard let jpegData = SonyPTPPacket.extractLiveViewJPEG(from: payload) else {
                             return nil
                         }
-                        let (exposedImage, rawLuma) = Self.autoExposeLiveViewIfNeeded(rawImage, ciContext: ciContext)
-                        guard !activeBackdrop.isNone, let exposedCG = exposedImage.cgImage else {
-                            return (exposedImage, rawLuma)
-                        }
-                        let compositedCG = BackdropCompositorService.composite(
-                            cgImage: exposedCG,
+                        return Self.processLiveViewJPEG(
+                            jpegData,
                             backdrop: activeBackdrop,
-                            quality: .liveFast,
                             ciContext: ciContext
                         )
-                        let finalUI = UIImage(cgImage: compositedCG, scale: exposedImage.scale, orientation: exposedImage.imageOrientation)
-                        return (finalUI, rawLuma)
                     }
                     
                     if let (image, meanLuma) = result {

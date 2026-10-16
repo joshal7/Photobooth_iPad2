@@ -499,8 +499,10 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
                     return false
                 }
                 
-                // Step A: Run single-pass highlight-protected auto-exposure on the raw subject FIRST
-                let exposedFullCG = SonyUSBCameraClient.autoExposeCapturedCGImage(rawFullCG, ciContext: ciContext)
+                // Step A: Horizontally mirror the external camera subject to match the iPad Live View / Review framing,
+                // then run single-pass highlight-protected auto-exposure on the subject FIRST before compositing.
+                let mirroredFullCG = BackdropCompositorService.mirrorCGImageHorizontally(rawFullCG, ciContext: ciContext)
+                let exposedFullCG = SonyUSBCameraClient.autoExposeCapturedCGImage(mirroredFullCG, ciContext: ciContext)
                 
                 // Step B: Composite BackdropItem at full native resolution
                 let compositedFullCG = BackdropCompositorService.composite(
