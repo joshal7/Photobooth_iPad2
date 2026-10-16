@@ -1618,6 +1618,33 @@ enum AutomatedVerificationSuite {
                 )
             }
         }
+        
+        // 11. Numeric Prefix Stripping in Backdrop Display Names (Carousel & Settings)
+        assertEqual(
+            BackdropManager.humanizeDisplayName(from: BackdropManager.stripRoleSuffix(from: "101_snowy_mountains_bg")),
+            "Snowy Mountains",
+            "101_snowy_mountains_bg.jpg displays as 'Snowy Mountains' (omits prepended 101_)"
+        )
+        assertEqual(
+            BackdropManager.humanizeDisplayName(from: BackdropManager.stripRoleSuffix(from: "301_mars_bg")),
+            "Mars",
+            "301_mars_bg.jpg displays as 'Mars' (omits prepended 301_)"
+        )
+        assertEqual(
+            BackdropManager.humanizeDisplayName(from: BackdropManager.stripRoleSuffix(from: "snowy_mountains_bg")),
+            "Snowy Mountains",
+            "Un-prefixed snowy_mountains_bg.jpg displays as 'Snowy Mountains' without modification"
+        )
+        assertEqual(
+            BackdropManager.humanizeDisplayName(from: BackdropManager.stripRoleSuffix(from: "Eiffel Tower_bg")),
+            "Eiffel Tower",
+            "Un-prefixed Eiffel Tower_bg.jpg preserves capitalization without modification"
+        )
+        assertEqual(
+            BackdropManager.humanizeDisplayName(from: BackdropManager.stripRoleSuffix(from: "304_levis_stadium_niners_bg")),
+            "Levis Stadium Niners",
+            "304_levis_stadium_niners_bg.jpg displays as 'Levis Stadium Niners'"
+        )
     }
 }
 #endif

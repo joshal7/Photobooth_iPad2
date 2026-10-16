@@ -485,11 +485,39 @@ assertTrue(
     "Bundled Backdrops/ directory contains valid *_bg and *_fg assets (\(starterNames.count) files)"
 )
 
-// 7B. Zero-Code Auto-Discovery & Pairing (`_bg` + `_fg` -> Combo)
-func classifyAndDiscover(in dir: URL) -> [(id: String, name: String, bg: String?, fg: String?)] {
+// 7B. Zero-Code Auto-Discovery & Pairing (`_bg` + `_fg` -> Combo) & Leading Numeric Prefix Omission
+func stripLeadingNumberPrefix(_ rawStem: String) -> String {
+    let trimmed = rawStem.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let firstChar = trimmed.first, firstChar.isWholeNumber else {
+        return trimmed
+    }
+    let afterDigits = trimmed.drop(while: { $0.isWholeNumber })
+    guard let sep = afterDigits.first, sep == "_" || sep == "-" || sep.isWhitespace else {
+        return trimmed
+    }
+    let remainder = afterDigits
+        .drop(while: { $0 == "_" || $0 == "-" || $0.isWhitespace })
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return remainder.isEmpty ? trimmed : remainder
+}
+
+func humanizeDisplayName(_ rawStem: String) -> String {
+    let withoutPrefix = stripLeadingNumberPrefix(rawStem)
+    let spaced = withoutPrefix
+        .replacingOccurrences(of: "_", with: " ")
+        .replacingOccurrences(of: "-", with: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !spaced.isEmpty else { return "Backdrop" }
+    if spaced != spaced.lowercased() {
+        return spaced
+    }
+    return spaced.capitalized
+}
+
+func classifyAndDiscover(in dir: URL) -> [(id: String, name: String, displayName: String, bg: String?, fg: String?)] {
     let files = ((try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? [])
         .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-    var map: [String: (name: String, bg: String?, fg: String?)] = [:]
+    var map: [String: (name: String, displayName: String, bg: String?, fg: String?)] = [:]
     var order: [String] = []
     for f in files {
         let stem = f.deletingPathExtension().lastPathComponent
@@ -497,18 +525,18 @@ func classifyAndDiscover(in dir: URL) -> [(id: String, name: String, bg: String?
         if lower.hasSuffix("_bg") {
             let base = String(stem.dropLast(3))
             let id = base.lowercased().replacingOccurrences(of: " ", with: "_")
-            if map[id] == nil { order.append(id); map[id] = (base, f.lastPathComponent, nil) }
+            if map[id] == nil { order.append(id); map[id] = (base, humanizeDisplayName(base), f.lastPathComponent, nil) }
             else { map[id]?.bg = f.lastPathComponent }
         } else if lower.hasSuffix("_fg") {
             let base = String(stem.dropLast(3))
             let id = base.lowercased().replacingOccurrences(of: " ", with: "_")
-            if map[id] == nil { order.append(id); map[id] = (base, nil, f.lastPathComponent) }
+            if map[id] == nil { order.append(id); map[id] = (base, humanizeDisplayName(base), nil, f.lastPathComponent) }
             else { map[id]?.fg = f.lastPathComponent }
         }
     }
     return order.compactMap { id in
         guard let v = map[id] else { return nil }
-        return (id, v.name, v.bg, v.fg)
+        return (id, v.name, v.displayName, v.bg, v.fg)
     }
 }
 
@@ -521,6 +549,31 @@ assertTrue(
 assertTrue(
     !pairedCombos.isEmpty,
     "Auto-discovery pairs matching *_bg + *_fg files into Combo items (\(pairedCombos.map(\.id).joined(separator: ", ")))"
+)
+
+// Verify leading 3-digit prefix omission in displayName while preserving exact numeric sort order in carousel & Settings
+assertEqual(humanizeDisplayName("101_snowy_mountains"), "Snowy Mountains", "101_snowy_mountains_bg.jpg displays as 'Snowy Mountains'")
+assertEqual(humanizeDisplayName("301_mars"), "Mars", "301_mars_bg.jpg displays as 'Mars'")
+assertEqual(humanizeDisplayName("snowy_mountains"), "Snowy Mountains", "Un-prefixed snowy_mountains_bg.jpg remains 'Snowy Mountains'")
+assertEqual(humanizeDisplayName("Eiffel Tower"), "Eiffel Tower", "Un-prefixed Eiffel Tower_bg.jpg remains 'Eiffel Tower'")
+
+let anyStartsWithDigits = discoveredStarters.contains { item in
+    guard let first = item.displayName.first else { return false }
+    return first.isWholeNumber
+}
+assertTrue(
+    !anyStartsWithDigits,
+    "All \(discoveredStarters.count) bundled Backdrops omit their 3-digit prefix in displayName (e.g. '\(discoveredStarters.first?.displayName ?? "")', '\(discoveredStarters.last?.displayName ?? "")')"
+)
+assertEqual(
+    discoveredStarters.first?.id,
+    "101_snowy_peaks",
+    "First backdrop in carousel/Settings sort order is 101_snowy_peaks ('\(discoveredStarters.first?.displayName ?? "")')"
+)
+assertEqual(
+    discoveredStarters.last?.id,
+    "704_zach_levine_bar_mitzvah",
+    "Last backdrop in carousel/Settings sort order is 704_zach_levine_bar_mitzvah ('\(discoveredStarters.last?.displayName ?? "")')"
 )
 
 // 7C. Resolution Auto-Scaling & 3-Layer Compositing Order (Background -> Segmented Subject -> Foreground Frame)

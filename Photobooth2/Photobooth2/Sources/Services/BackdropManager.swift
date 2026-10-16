@@ -255,8 +255,27 @@ final class BackdropManager: ObservableObject {
         return trimmed
     }
     
+    /// Strips a leading numeric organization prefix followed by one or more underscores, hyphens, or spaces
+    /// (e.g., `"101_snowy_mountains"` -> `"snowy_mountains"`, `"301_mars"` -> `"mars"`).
+    /// If the name is not prepended with digits + separator (or if stripping would leave an empty string), returns it unchanged.
+    nonisolated static func stripLeadingNumberPrefix(from rawStem: String) -> String {
+        let trimmed = rawStem.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let firstChar = trimmed.first, firstChar.isWholeNumber else {
+            return trimmed
+        }
+        let afterDigits = trimmed.drop(while: { $0.isWholeNumber })
+        guard let sep = afterDigits.first, sep == "_" || sep == "-" || sep.isWhitespace else {
+            return trimmed
+        }
+        let remainder = afterDigits
+            .drop(while: { $0 == "_" || $0 == "-" || $0.isWhitespace })
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return remainder.isEmpty ? trimmed : remainder
+    }
+    
     nonisolated static func humanizeDisplayName(from rawStem: String) -> String {
-        let spaced = rawStem
+        let withoutPrefix = stripLeadingNumberPrefix(from: rawStem)
+        let spaced = withoutPrefix
             .replacingOccurrences(of: "_", with: " ")
             .replacingOccurrences(of: "-", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
