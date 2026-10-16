@@ -6,18 +6,107 @@ import ImageIO
 import UIKit
 
 enum SegmentationQuality: Sendable {
+    /// Uses Vision `.balanced` real-time video segmentation on the Apple Neural Engine
+    /// combined with Hermite smoothstep matte solidification and motion-adaptive temporal EMA stabilization.
     case liveFast
+    /// Uses Vision `.accurate` high-resolution still segmentation with smoothstep matte solidification.
     case captureAccurate
 }
 
 final class BackdropCompositorService: Sendable {
     
+    /// Precomputed 256-entry Hermite smoothstep LUT (`3t^2 - 2t^3`) for Live View masks (`48..202` -> `0..255`).
+    /// Eliminates background wall bleed-through (`<= 48` -> `0`) and translucent clothing holes (`>= 202` -> `255`).
+    nonisolated static let liveMatteLUT: [UInt8] = buildSmoothstepLUT(lowClip: 48, highClip: 202)
+    
+    /// Precomputed 256-entry Hermite smoothstep LUT for Capture/GIF `.accurate` masks (`32..216` -> `0..255`).
+    nonisolated static let accurateMatteLUT: [UInt8] = buildSmoothstepLUT(lowClip: 32, highClip: 216)
+    
+    nonisolated static func buildSmoothstepLUT(lowClip: Int, highClip: Int) -> [UInt8] {
+        var lut = [UInt8](repeating: 0, count: 256)
+        let span = Double(max(1, highClip - lowClip))
+        for i in 0..<256 {
+            if i <= lowClip {
+                lut[i] = 0
+            } else if i >= highClip {
+                lut[i] = 255
+            } else {
+                let t = Double(i - lowClip) / span
+                let s = t * t * (3.0 - 2.0 * t)
+                lut[i] = UInt8(clamping: Int((s * 255.0).rounded()))
+            }
+        }
+        return lut
+    }
+    
+    /// Applies Hermite smoothstep matte solidification and motion-adaptive temporal EMA filtering
+    /// to a single-channel 8-bit segmentation mask buffer.
+    /// - Stationary/shimmering boundary pixels (`diff < 85`) blend 47% current + 53% previous to eliminate edge jitter.
+    /// - Moderate motion pixels (`85 <= diff < 155`) blend 75% current + 25% previous.
+    /// - Fast motion pixels (`diff >= 155`) blend 93% current + 7% previous so moving hands/arms never leave ghost trails.
+    nonisolated static func solidifyAndTemporalSmoothMask(
+        rawRowBytes: UnsafePointer<UInt8>,
+        width: Int,
+        height: Int,
+        srcBytesPerRow: Int,
+        lut: [UInt8],
+        temporalBuffer: inout [UInt8],
+        enableTemporalSmoothing: Bool
+    ) {
+        let count = width * height
+        guard count > 0 else { return }
+        let hasValidPrior = enableTemporalSmoothing && (temporalBuffer.count == count)
+        if temporalBuffer.count != count {
+            temporalBuffer = [UInt8](repeating: 0, count: count)
+        }
+        
+        temporalBuffer.withUnsafeMutableBufferPointer { dstPtr in
+            guard let dstBase = dstPtr.baseAddress else { return }
+            if hasValidPrior {
+                for y in 0..<height {
+                    let srcRow = rawRowBytes.advanced(by: y * srcBytesPerRow)
+                    let dstRow = dstBase.advanced(by: y * width)
+                    for x in 0..<width {
+                        let solid = Int(lut[Int(srcRow[x])])
+                        let prev = Int(dstRow[x])
+                        let diff = abs(solid - prev)
+                        let smoothed: Int
+                        if diff < 85 {
+                            smoothed = (solid * 120 + prev * 136) >> 8
+                        } else if diff < 155 {
+                            smoothed = (solid * 192 + prev * 64) >> 8
+                        } else {
+                            smoothed = (solid * 238 + prev * 18) >> 8
+                        }
+                        dstRow[x] = UInt8(clamping: smoothed)
+                    }
+                }
+            } else {
+                for y in 0..<height {
+                    let srcRow = rawRowBytes.advanced(by: y * srcBytesPerRow)
+                    let dstRow = dstBase.advanced(by: y * width)
+                    for x in 0..<width {
+                        dstRow[x] = lut[Int(srcRow[x])]
+                    }
+                }
+            }
+        }
+    }
+    
     private nonisolated final class AssetImageCache: @unchecked Sendable {
         static let shared = AssetImageCache()
         private let lock = NSLock()
         private var cache: [String: CIImage] = [:]
-        private let fastSegmentationLock = NSLock()
-        private var reusableFastRequest: VNGeneratePersonSegmentationRequest?
+        
+        private let liveSegmentationLock = NSLock()
+        private var reusableBalancedRequest: VNGeneratePersonSegmentationRequest?
+        private var temporalMaskBuffer: [UInt8] = []
+        private var temporalWidth: Int = 0
+        private var temporalHeight: Int = 0
+        private var lastLiveMaskTimestampNs: UInt64 = 0
+        
+        private let accurateSegmentationLock = NSLock()
+        private var reusableAccurateRequest: VNGeneratePersonSegmentationRequest?
         
         func image(forKey key: String, loader: () -> CIImage?) -> CIImage? {
             lock.lock()
@@ -41,35 +130,155 @@ final class BackdropCompositorService: Sendable {
             lock.lock()
             cache.removeAll()
             lock.unlock()
+            resetTemporalState()
         }
         
-        func performFastSegmentation(on ciImage: CIImage) -> CVPixelBuffer? {
-            fastSegmentationLock.lock()
-            defer { fastSegmentationLock.unlock() }
+        func resetTemporalState() {
+            liveSegmentationLock.lock()
+            temporalMaskBuffer.removeAll(keepingCapacity: true)
+            temporalWidth = 0
+            temporalHeight = 0
+            lastLiveMaskTimestampNs = 0
+            liveSegmentationLock.unlock()
+        }
+        
+        func performLiveBalancedSegmentation(on ciImage: CIImage) -> CIImage? {
+            liveSegmentationLock.lock()
+            defer { liveSegmentationLock.unlock() }
             
             let request: VNGeneratePersonSegmentationRequest
-            if let existing = reusableFastRequest {
+            if let existing = reusableBalancedRequest {
                 request = existing
             } else {
                 let req = VNGeneratePersonSegmentationRequest()
-                req.qualityLevel = .fast
+                // `.balanced` is Apple's real-time video segmentation neural network (dramatically cleaner
+                // boundaries and interior confidence than `.fast`, while running at live frame rates on ANE).
+                req.qualityLevel = .balanced
                 req.outputPixelFormat = kCVPixelFormatType_OneComponent8
-                reusableFastRequest = req
+                reusableBalancedRequest = req
                 request = req
             }
             
             let handler = VNImageRequestHandler(ciImage: ciImage, options: [:])
             do {
                 try handler.perform([request])
-                return request.results?.first?.pixelBuffer
+                guard let pixelBuffer = request.results?.first?.pixelBuffer else { return nil }
+                
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                let isContinuousStream = (lastLiveMaskTimestampNs > 0) && ((nowNs - lastLiveMaskTimestampNs) <= 450_000_000)
+                lastLiveMaskTimestampNs = nowNs
+                
+                return Self.createSolidifiedMaskCIImage(
+                    from: pixelBuffer,
+                    lut: BackdropCompositorService.liveMatteLUT,
+                    temporalBuffer: &temporalMaskBuffer,
+                    previousWidth: &temporalWidth,
+                    previousHeight: &temporalHeight,
+                    enableTemporalSmoothing: isContinuousStream
+                )
             } catch {
                 return nil
             }
+        }
+        
+        func performAccurateSegmentation(on ciImage: CIImage) -> CIImage? {
+            accurateSegmentationLock.lock()
+            defer { accurateSegmentationLock.unlock() }
+            
+            let request: VNGeneratePersonSegmentationRequest
+            if let existing = reusableAccurateRequest {
+                request = existing
+            } else {
+                let req = VNGeneratePersonSegmentationRequest()
+                req.qualityLevel = .accurate
+                req.outputPixelFormat = kCVPixelFormatType_OneComponent8
+                reusableAccurateRequest = req
+                request = req
+            }
+            
+            let handler = VNImageRequestHandler(ciImage: ciImage, options: [:])
+            do {
+                try handler.perform([request])
+                guard let pixelBuffer = request.results?.first?.pixelBuffer else { return nil }
+                var scratchBuffer: [UInt8] = []
+                var w = 0
+                var h = 0
+                return Self.createSolidifiedMaskCIImage(
+                    from: pixelBuffer,
+                    lut: BackdropCompositorService.accurateMatteLUT,
+                    temporalBuffer: &scratchBuffer,
+                    previousWidth: &w,
+                    previousHeight: &h,
+                    enableTemporalSmoothing: false
+                )
+            } catch {
+                return nil
+            }
+        }
+        
+        private static func createSolidifiedMaskCIImage(
+            from pixelBuffer: CVPixelBuffer,
+            lut: [UInt8],
+            temporalBuffer: inout [UInt8],
+            previousWidth: inout Int,
+            previousHeight: inout Int,
+            enableTemporalSmoothing: Bool
+        ) -> CIImage? {
+            guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+                return CIImage(cvPixelBuffer: pixelBuffer)
+            }
+            defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+            
+            let width = CVPixelBufferGetWidth(pixelBuffer)
+            let height = CVPixelBufferGetHeight(pixelBuffer)
+            let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+            guard width > 0, height > 0,
+                  let baseAddr = CVPixelBufferGetBaseAddress(pixelBuffer)?.assumingMemoryBound(to: UInt8.self) else {
+                return CIImage(cvPixelBuffer: pixelBuffer)
+            }
+            
+            let dimensionsMatch = (width == previousWidth && height == previousHeight)
+            previousWidth = width
+            previousHeight = height
+            
+            BackdropCompositorService.solidifyAndTemporalSmoothMask(
+                rawRowBytes: baseAddr,
+                width: width,
+                height: height,
+                srcBytesPerRow: bytesPerRow,
+                lut: lut,
+                temporalBuffer: &temporalBuffer,
+                enableTemporalSmoothing: enableTemporalSmoothing && dimensionsMatch
+            )
+            
+            let graySpace = CGColorSpaceCreateDeviceGray()
+            let maskData = Data(temporalBuffer)
+            guard let provider = CGDataProvider(data: maskData as CFData),
+                  let cgImage = CGImage(
+                      width: width,
+                      height: height,
+                      bitsPerComponent: 8,
+                      bitsPerPixel: 8,
+                      bytesPerRow: width,
+                      space: graySpace,
+                      bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                      provider: provider,
+                      decode: nil,
+                      shouldInterpolate: true,
+                      intent: .defaultIntent
+                  ) else {
+                return CIImage(cvPixelBuffer: pixelBuffer)
+            }
+            return CIImage(cgImage: cgImage)
         }
     }
     
     nonisolated static func clearCache() {
         AssetImageCache.shared.clear()
+    }
+    
+    nonisolated static func resetLiveTemporalState() {
+        AssetImageCache.shared.resetTemporalState()
     }
     
     // MARK: - 3-Layer Compositing (Background -> Segmented Subject -> Foreground Frame)
@@ -193,21 +402,15 @@ final class BackdropCompositorService: Sendable {
             return scaleImage(customMask, to: targetExtent, mode: .stretchToEdges)
         }
         
-        let maskPixelBuffer: CVPixelBuffer?
+        let rawMaskCI: CIImage?
         switch quality {
         case .liveFast:
-            maskPixelBuffer = AssetImageCache.shared.performFastSegmentation(on: subjectCI)
+            rawMaskCI = AssetImageCache.shared.performLiveBalancedSegmentation(on: subjectCI)
         case .captureAccurate:
-            let request = VNGeneratePersonSegmentationRequest()
-            request.qualityLevel = .accurate
-            request.outputPixelFormat = kCVPixelFormatType_OneComponent8
-            let handler = VNImageRequestHandler(ciImage: subjectCI, options: [:])
-            try? handler.perform([request])
-            maskPixelBuffer = request.results?.first?.pixelBuffer
+            rawMaskCI = AssetImageCache.shared.performAccurateSegmentation(on: subjectCI)
         }
         
-        guard let pixelBuffer = maskPixelBuffer else { return nil }
-        let rawMaskCI = CIImage(cvPixelBuffer: pixelBuffer)
+        guard let rawMaskCI = rawMaskCI else { return nil }
         let maskExtent = rawMaskCI.extent
         guard maskExtent.width > 0, maskExtent.height > 0 else { return nil }
         
@@ -218,7 +421,7 @@ final class BackdropCompositorService: Sendable {
             .cropped(to: targetExtent)
         
         // Apply proportional soft edge feathering so hair & shoulder boundaries blend naturally without stair-stepping
-        let blurRadius = max(0.8, min(3.5, targetExtent.width * 0.0008))
+        let blurRadius = max(1.0, min(3.5, targetExtent.width * 0.0010))
         scaledMask = scaledMask
             .clampedToExtent()
             .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: blurRadius])

@@ -564,7 +564,7 @@ final class BackdropManager: ObservableObject {
         let thumb = renderer.image { ctx in
             let rect = CGRect(origin: .zero, size: size)
             
-            // 1. Background layer (aspect fill) or dark room grid placeholder for frame-only
+            // 1. Background layer (aspect fill) or dark room placeholder for frame-only
             if let bg = bgImage {
                 let bgSize = bg.size
                 if bgSize.width > 0 && bgSize.height > 0 {
@@ -584,23 +584,7 @@ final class BackdropManager: ObservableObject {
                 ctx.fill(rect)
             }
             
-            // 2. Subtle person silhouette indicator in center
-            if let personIcon = UIImage(systemName: "person.2.fill")?.withTintColor(
-                UIColor.white.withAlphaComponent(bgImage != nil ? 0.82 : 0.45),
-                renderingMode: .alwaysOriginal
-            ) {
-                let iconW: CGFloat = 54
-                let iconH: CGFloat = 42
-                let iconRect = CGRect(
-                    x: (size.width - iconW) * 0.5,
-                    y: size.height - iconH - 12,
-                    width: iconW,
-                    height: iconH
-                )
-                personIcon.draw(in: iconRect)
-            }
-            
-            // 3. Foreground frame layer
+            // 2. Foreground frame layer
             if let fg = fgImage {
                 fg.draw(in: rect)
             }

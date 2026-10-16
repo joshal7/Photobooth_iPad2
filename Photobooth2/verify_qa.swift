@@ -866,6 +866,101 @@ assertEqual(mockState.selectedBackdropID, "magazine", "Selecting a different bac
 mockState.persistentBackdropSelection = false
 assertEqual(mockState.selectedBackdropID, "none", "Toggling Persistent Background Selection off immediately reverts to the default background ('none')")
 
+// 7N. Live View Vision .balanced Matte Solidification LUT & Motion-Adaptive Temporal EMA Stabilization
+func buildSmoothstepLUT(lowClip: Int, highClip: Int) -> [UInt8] {
+    var lut = [UInt8](repeating: 0, count: 256)
+    let span = Double(max(1, highClip - lowClip))
+    for i in 0..<256 {
+        if i <= lowClip { lut[i] = 0 }
+        else if i >= highClip { lut[i] = 255 }
+        else {
+            let t = Double(i - lowClip) / span
+            let s = t * t * (3.0 - 2.0 * t)
+            lut[i] = UInt8(clamping: Int((s * 255.0).rounded()))
+        }
+    }
+    return lut
+}
+let liveLUT = buildSmoothstepLUT(lowClip: 48, highClip: 202)
+assertTrue(
+    liveLUT[45] == 0 && liveLUT[205] == 255 && liveLUT[125] > 100 && liveLUT[125] < 155,
+    "Hermite smoothstep matte LUT eliminates background noise (<=48 -> 0) and see-through clothing (>=202 -> 255) with smooth boundary ramp"
+)
+
+func stepTemporalEMA(prev: [UInt8], raw: [UInt8], lut: [UInt8]) -> [UInt8] {
+    var out = [UInt8](repeating: 0, count: raw.count)
+    for i in 0..<raw.count {
+        let solid = Int(lut[Int(raw[i])])
+        let p = Int(prev[i])
+        let diff = abs(solid - p)
+        if diff < 85 {
+            out[i] = UInt8(clamping: (solid * 120 + p * 136) >> 8)
+        } else if diff < 155 {
+            out[i] = UInt8(clamping: (solid * 192 + p * 64) >> 8)
+        } else {
+            out[i] = UInt8(clamping: (solid * 238 + p * 18) >> 8)
+        }
+    }
+    return out
+}
+let priorMask: [UInt8] = [0, liveLUT[118], 255, 0]
+let nextRaw: [UInt8]   = [35, 134, 215, 240]
+let nextSmoothed = stepTemporalEMA(prev: priorMask, raw: nextRaw, lut: liveLUT)
+let rawEdgeJump = abs(Int(liveLUT[134]) - Int(priorMask[1]))
+let smoothedEdgeJump = abs(Int(nextSmoothed[1]) - Int(priorMask[1]))
+assertTrue(
+    nextSmoothed[0] == 0 && nextSmoothed[2] == 255 && smoothedEdgeJump < rawEdgeJump && nextSmoothed[3] >= 235,
+    "Motion-adaptive temporal EMA dampens edge shimmer (jump \(rawEdgeJump)->\(smoothedEdgeJump)) while fast hand movement responds immediately (\(nextSmoothed[3])/255)"
+)
+
+// 7O. Verify BackdropManager.swift Thumbnail Generator Has Removed Dual People Silhouette Icon (`person.2.fill`)
+let backdropManagerSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Services/BackdropManager.swift", encoding: .utf8)) ?? ""
+assertTrue(
+    !backdropManagerSource.contains("person.2.fill"),
+    "BackdropManager thumbnail generator renders clean background/frame artwork without 'person.2.fill' overlay"
+)
+
+// 7P. Verify CVPixelBuffer (OneComponent8) and Solidified Grayscale CGImage Have Identical Vertical Orientation in CoreImage
+var testPB: CVPixelBuffer? = nil
+CVPixelBufferCreate(kCFAllocatorDefault, 16, 16, kCVPixelFormatType_OneComponent8, nil, &testPB)
+if let pb = testPB {
+    CVPixelBufferLockBaseAddress(pb, [])
+    let bpr = CVPixelBufferGetBytesPerRow(pb)
+    let base = CVPixelBufferGetBaseAddress(pb)!.assumingMemoryBound(to: UInt8.self)
+    for y in 0..<16 {
+        for x in 0..<16 {
+            base[y * bpr + x] = (y < 8) ? 255 : 0 // Top 8 rows white (255), bottom 8 rows black (0)
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(pb, [])
+    
+    let ciFromPB = CIImage(cvPixelBuffer: pb)
+    var flatBytes = [UInt8](repeating: 0, count: 16 * 16)
+    for y in 0..<16 {
+        for x in 0..<16 {
+            flatBytes[y * 16 + x] = (y < 8) ? 255 : 0
+        }
+    }
+    let grayCS = CGColorSpaceCreateDeviceGray()
+    let cgFromBuf = flatBytes.withUnsafeMutableBytes { ptr -> CGImage in
+        let ctx = CGContext(data: ptr.baseAddress, width: 16, height: 16, bitsPerComponent: 8, bytesPerRow: 16, space: grayCS, bitmapInfo: CGImageAlphaInfo.none.rawValue)!
+        return ctx.makeImage()!
+    }
+    let ciFromCG = CIImage(cgImage: cgFromBuf)
+    let outPB = ciContext.createCGImage(ciFromPB, from: CGRect(x: 0, y: 0, width: 16, height: 16))!
+    let outCG = ciContext.createCGImage(ciFromCG, from: CGRect(x: 0, y: 0, width: 16, height: 16))!
+    assertEqual(
+        readPixelRGB(outPB, x: 8, y: 2).r,
+        readPixelRGB(outCG, x: 8, y: 2).r,
+        "Solidified CGImage mask top row matches CVPixelBuffer top row orientation in CoreImage (255)"
+    )
+    assertEqual(
+        readPixelRGB(outPB, x: 8, y: 14).r,
+        readPixelRGB(outCG, x: 8, y: 14).r,
+        "Solidified CGImage mask bottom row matches CVPixelBuffer bottom row orientation in CoreImage (0)"
+    )
+}
+
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")
 print("========================================================")

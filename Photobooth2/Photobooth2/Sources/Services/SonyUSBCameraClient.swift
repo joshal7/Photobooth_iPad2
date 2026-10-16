@@ -851,7 +851,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 if elapsed < targetFrameIntervalNs {
                     try? await Task.sleep(nanoseconds: targetFrameIntervalNs - elapsed)
                 } else {
-                    try? await Task.sleep(nanoseconds: 5_000_000)
+                    try? await Task.sleep(nanoseconds: 1_500_000)
                 }
             }
         }

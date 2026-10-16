@@ -39,6 +39,9 @@ class StateMachine: ObservableObject {
     @Published var lowStorageWarning: String? = nil
     @Published var selectedBackdrop: BackdropItem = .none {
         didSet {
+            if oldValue.id != selectedBackdrop.id {
+                BackdropCompositorService.resetLiveTemporalState()
+            }
             cameraService.updateSelectedBackdrop(selectedBackdrop)
         }
     }

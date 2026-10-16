@@ -1360,6 +1360,52 @@ enum AutomatedVerificationSuite {
             ),
             "BackdropCompositorService.hasResolvableAssets returns true when custom asset bytes are embedded in manifest JSON"
         )
+        
+        // 9. Live View Vision .balanced Matte Solidification & Motion-Adaptive Temporal EMA Stabilization
+        let liveLUT = BackdropCompositorService.liveMatteLUT
+        assertEqual(liveLUT[0], 0, "Live matte LUT clamps 0 to 0")
+        assertEqual(liveLUT[45], 0, "Live matte LUT suppresses background clutter noise (45/255 -> 0)")
+        assertEqual(liveLUT[205], 255, "Live matte LUT solidifies interior person confidence (205/255 -> 255, zero see-through clothes)")
+        assertTrue(
+            liveLUT[125] > 100 && liveLUT[125] < 155,
+            "Live matte LUT preserves smooth anti-aliased boundary transition at midpoint (liveLUT[125]=\(liveLUT[125]))"
+        )
+        
+        var temporalBuf: [UInt8] = []
+        let frameA: [UInt8] = [30, 118, 210, 0]   // [bg noise, edge shimmer A, person interior, empty]
+        let frameB: [UInt8] = [35, 134, 215, 240] // [bg noise, edge shimmer B (+16), person interior, fast hand wave (+240)]
+        frameA.withUnsafeBufferPointer { ptr in
+            BackdropCompositorService.solidifyAndTemporalSmoothMask(
+                rawRowBytes: ptr.baseAddress!,
+                width: 4,
+                height: 1,
+                srcBytesPerRow: 4,
+                lut: liveLUT,
+                temporalBuffer: &temporalBuf,
+                enableTemporalSmoothing: false
+            )
+        }
+        let edgeAfterFrameA = Int(temporalBuf[1])
+        frameB.withUnsafeBufferPointer { ptr in
+            BackdropCompositorService.solidifyAndTemporalSmoothMask(
+                rawRowBytes: ptr.baseAddress!,
+                width: 4,
+                height: 1,
+                srcBytesPerRow: 4,
+                lut: liveLUT,
+                temporalBuffer: &temporalBuf,
+                enableTemporalSmoothing: true
+            )
+        }
+        let unsmoothedEdgeB = Int(liveLUT[134])
+        let smoothedEdgeB = Int(temporalBuf[1])
+        let fastHandWaveOut = Int(temporalBuf[3])
+        assertTrue(
+            temporalBuf[0] == 0 && temporalBuf[2] == 255 &&
+            abs(smoothedEdgeB - edgeAfterFrameA) < abs(unsmoothedEdgeB - edgeAfterFrameA) &&
+            fastHandWaveOut >= 235,
+            "Motion-adaptive temporal EMA dampens stationary edge shimmer (\(edgeAfterFrameA)->\(smoothedEdgeB) vs raw \(unsmoothedEdgeB)) while fast motion responds immediately (\(fastHandWaveOut)/255)"
+        )
     }
 }
 #endif
