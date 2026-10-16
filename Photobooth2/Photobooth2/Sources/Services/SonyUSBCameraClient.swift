@@ -197,26 +197,39 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         self.statusMessage = "Requesting iPadOS USB camera permissions..."
         
         #if os(iOS)
-        browser.requestControlAuthorization { [weak self] controlStatus in
-            browser.requestContentsAuthorization { [weak self] contentsStatus in
-                Task { @MainActor [weak self] in
-                    guard let self = self else { return }
-                    self.isAuthorizingBrowser = false
-                    self.controlAuthSummary = controlStatus.rawValue
-                    self.contentsAuthSummary = contentsStatus.rawValue
-                    
-                    if controlStatus == .denied || contentsStatus == .denied {
-                        self.statusMessage = "\(CameraError.usbPermissionDenied.localizedDescription) (Control: \(controlStatus.rawValue), Contents: \(contentsStatus.rawValue))"
-                    } else {
-                        self.statusMessage = "Scanning USB bus (Auth: OK)..."
+        let controlAuthSelector = NSSelectorFromString("requestControlAuthorizationWithCompletion:")
+        let contentsAuthSelector = NSSelectorFromString("requestContentsAuthorizationWithCompletion:")
+        if !ProcessInfo.processInfo.isiOSAppOnMac,
+           browser.responds(to: controlAuthSelector),
+           browser.responds(to: contentsAuthSelector) {
+            browser.requestControlAuthorization { [weak self] controlStatus in
+                browser.requestContentsAuthorization { [weak self] contentsStatus in
+                    Task { @MainActor [weak self] in
+                        guard let self = self else { return }
+                        self.isAuthorizingBrowser = false
+                        self.controlAuthSummary = controlStatus.rawValue
+                        self.contentsAuthSummary = contentsStatus.rawValue
+                        
+                        if controlStatus.rawValue.lowercased().contains("denied") || contentsStatus.rawValue.lowercased().contains("denied") {
+                            self.statusMessage = "\(CameraError.usbPermissionDenied.localizedDescription) (Control: \(controlStatus.rawValue), Contents: \(contentsStatus.rawValue))"
+                        } else {
+                            self.statusMessage = "Scanning USB bus (Auth: OK)..."
+                        }
+                        
+                        // Restart browser cleanly after permissions are granted
+                        self.deviceBrowser?.stop()
+                        self.deviceBrowser?.start()
+                        self.checkAlreadyDiscoveredDevices()
                     }
-                    
-                    // Restart browser cleanly after permissions are granted
-                    self.deviceBrowser?.stop()
-                    self.deviceBrowser?.start()
-                    self.checkAlreadyDiscoveredDevices()
                 }
             }
+        } else {
+            isAuthorizingBrowser = false
+            self.controlAuthSummary = "macOS"
+            self.contentsAuthSummary = "macOS"
+            self.statusMessage = "Scanning USB bus for camera..."
+            browser.start()
+            self.checkAlreadyDiscoveredDevices()
         }
         #else
         isAuthorizingBrowser = false
