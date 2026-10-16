@@ -1406,6 +1406,20 @@ enum AutomatedVerificationSuite {
             fastHandWaveOut >= 235,
             "Motion-adaptive temporal EMA dampens stationary edge shimmer (\(edgeAfterFrameA)->\(smoothedEdgeB) vs raw \(unsmoothedEdgeB)) while fast motion responds immediately (\(fastHandWaveOut)/255)"
         )
+        
+        // 10. LiveView Aspect-Fit (Zero Clipping of Camera Frame, Background, or Foreground Border on iPad)
+        let sonyLiveViewSize = CGSize(width: 1024, height: 680) // 3:2 Sony Live View stream
+        let iPad11Screen = CGSize(width: 1194, height: 834)     // 11-inch iPad Pro
+        let fittedSonyOn11 = LiveView.fittedRect(forImageSize: sonyLiveViewSize, inContainerSize: iPad11Screen)
+        assertTrue(
+            abs(fittedSonyOn11.width - 1194.0) < 0.01 &&
+            fittedSonyOn11.height < 834.0 &&
+            fittedSonyOn11.minX >= 0.0 &&
+            fittedSonyOn11.maxX <= 1194.0 &&
+            fittedSonyOn11.minY > 15.0 &&
+            abs((fittedSonyOn11.width / fittedSonyOn11.height) - (1024.0 / 680.0)) < 0.001,
+            String(format: "LiveView aspect-fits 3:2 Sony stream inside 1194x834 iPad without clipping (fitted=%.1fx%.1f, top/bottom black bar=%.1fpt each)", fittedSonyOn11.width, fittedSonyOn11.height, fittedSonyOn11.minY)
+        )
     }
 }
 #endif

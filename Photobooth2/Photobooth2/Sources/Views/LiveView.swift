@@ -3,17 +3,32 @@ import SwiftUI
 struct LiveView: View {
     @EnvironmentObject var stateMachine: StateMachine
     
+    /// Computes the exact aspect-fitted (`contentMode: .fit`) frame of a Live View image inside `containerSize`,
+    /// ensuring 100% of the camera image, background, and foreground frame borders remain visible without clipping.
+    static func fittedRect(forImageSize imageSize: CGSize, inContainerSize containerSize: CGSize) -> CGRect {
+        guard imageSize.width > 0, imageSize.height > 0,
+              containerSize.width > 0, containerSize.height > 0 else {
+            return .zero
+        }
+        let scale = min(containerSize.width / imageSize.width, containerSize.height / imageSize.height)
+        let fittedWidth = imageSize.width * scale
+        let fittedHeight = imageSize.height * scale
+        let originX = (containerSize.width - fittedWidth) * 0.5
+        let originY = (containerSize.height - fittedHeight) * 0.5
+        return CGRect(x: originX, y: originY, width: fittedWidth, height: fittedHeight)
+    }
+    
     var body: some View {
         GeometryReader { geometry in
             ZStack {
                 Color.black
+                    .edgesIgnoringSafeArea(.all)
                 
                 if let image = stateMachine.previewImage {
                     Image(uiImage: image)
                         .resizable()
-                        .aspectRatio(contentMode: .fill)
+                        .aspectRatio(contentMode: .fit)
                         .frame(width: geometry.size.width, height: geometry.size.height)
-                        .clipped()
                 } else {
                     // Placeholder or loading indicator
                     ZStack {
@@ -39,5 +54,6 @@ struct LiveView: View {
                 }
             }
         }
+        .edgesIgnoringSafeArea(.all)
     }
 }

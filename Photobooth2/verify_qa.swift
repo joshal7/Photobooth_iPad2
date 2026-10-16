@@ -961,6 +961,53 @@ if let pb = testPB {
     )
 }
 
+// 7Q. Verify LiveView Uses `.aspectRatio(contentMode: .fit)` (Matching ReviewView) with Zero Edge Clipping
+let liveViewSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Views/LiveView.swift", encoding: .utf8)) ?? ""
+assertTrue(
+    liveViewSource.contains(".aspectRatio(contentMode: .fit)") &&
+    !liveViewSource.contains(".aspectRatio(contentMode: .fill)") &&
+    !liveViewSource.contains(".clipped()"),
+    "LiveView.swift renders previewImage with .aspectRatio(contentMode: .fit) and no .clipped() cropping"
+)
+
+func computeFittedRect(imageSize: CGSize, containerSize: CGSize) -> CGRect {
+    let scale = min(containerSize.width / imageSize.width, containerSize.height / imageSize.height)
+    let w = imageSize.width * scale
+    let h = imageSize.height * scale
+    return CGRect(x: (containerSize.width - w) * 0.5, y: (containerSize.height - h) * 0.5, width: w, height: h)
+}
+
+// Case 1: Sony 3:2 Live View (1024x680) on 11-inch iPad (1194x834) -> Full width visible, subtle top/bottom black bars (~19.2pt each)
+let fittedSonyOnIPad11 = computeFittedRect(imageSize: CGSize(width: 1024, height: 680), containerSize: CGSize(width: 1194, height: 834))
+assertTrue(
+    abs(fittedSonyOnIPad11.width - 1194.0) < 0.01 &&
+    fittedSonyOnIPad11.height < 834.0 &&
+    fittedSonyOnIPad11.minX == 0.0 &&
+    fittedSonyOnIPad11.minY > 18.0 &&
+    abs((fittedSonyOnIPad11.width / fittedSonyOnIPad11.height) - (1024.0 / 680.0)) < 0.0001,
+    String(format: "Sony 3:2 Live View on 11\" iPad (1194x834) shows 100%% of width & height (1194x%.1f) with %.1fpt top/bottom black bars", fittedSonyOnIPad11.height, fittedSonyOnIPad11.minY)
+)
+
+// Case 2: Sony 3:2 Live View (1024x680) on 13-inch iPad (1366x1024, 4:3) -> Full width visible, top/bottom black bars (~58.6pt each)
+let fittedSonyOnIPad13 = computeFittedRect(imageSize: CGSize(width: 1024, height: 680), containerSize: CGSize(width: 1366, height: 1024))
+assertTrue(
+    abs(fittedSonyOnIPad13.width - 1366.0) < 0.01 &&
+    fittedSonyOnIPad13.height < 1024.0 &&
+    fittedSonyOnIPad13.minX == 0.0 &&
+    fittedSonyOnIPad13.minY > 55.0,
+    String(format: "Sony 3:2 Live View on 13\" 4:3 iPad (1366x1024) shows 100%% of width & height (1366x%.1f) with %.1fpt top/bottom black bars", fittedSonyOnIPad13.height, fittedSonyOnIPad13.minY)
+)
+
+// Case 3: iPad 4:3 Front Camera (1440x1080) on 11-inch iPad (1194x834, 1.43:1) -> Full height visible, subtle left/right black bars (~41pt each)
+let fittedFrontCamOnIPad11 = computeFittedRect(imageSize: CGSize(width: 1440, height: 1080), containerSize: CGSize(width: 1194, height: 834))
+assertTrue(
+    abs(fittedFrontCamOnIPad11.height - 834.0) < 0.01 &&
+    fittedFrontCamOnIPad11.width < 1194.0 &&
+    fittedFrontCamOnIPad11.minY == 0.0 &&
+    fittedFrontCamOnIPad11.minX > 40.0,
+    String(format: "iPad 4:3 camera on 11\" iPad (1194x834) shows 100%% of width & height (%.1fx834) with %.1fpt left/right black bars", fittedFrontCamOnIPad11.width, fittedFrontCamOnIPad11.minX)
+)
+
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")
 print("========================================================")
