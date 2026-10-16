@@ -72,6 +72,8 @@ struct SettingsView: View {
                     }
                     .pickerStyle(.menu)
                     
+                    Toggle("Persistent Background Selection", isOn: $config.persistentBackdropSelection)
+                    
                     let configurableItems = backdropManager.availableBackdrops.filter { !$0.isNone }
                     if configurableItems.isEmpty {
                         Text("No backdrops found. Add *_bg.jpg or *_fg.png files to Backdrops/ or tap '+ Add Custom Backdrop / Frame' below.")

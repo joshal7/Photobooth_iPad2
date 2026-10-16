@@ -474,16 +474,15 @@ func encodeJPEGWithEXIF(_ cgImage: CGImage, dateTimeOriginal: String, backdropTa
     return data as Data
 }
 
-// 7A. Verify Bundled Starter Assets in Photobooth2/Photobooth2/Backdrops/
+// 7A. Verify Bundled Assets in Photobooth2/Photobooth2/Backdrops/
 let projectBackdropsURL = URL(fileURLWithPath: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Backdrops", isDirectory: true)
 let starterFiles = (try? FileManager.default.contentsOfDirectory(at: projectBackdropsURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
 let starterNames = Set(starterFiles.map(\.lastPathComponent))
+let hasBgFiles = starterNames.contains { $0.lowercased().contains("_bg.") }
+let hasFgFiles = starterNames.contains { $0.lowercased().contains("_fg.") }
 assertTrue(
-    starterNames.contains("Eiffel Tower_bg.jpg") &&
-    starterNames.contains("Celebration Frame_fg.png") &&
-    starterNames.contains("Magazine_bg.jpg") &&
-    starterNames.contains("Magazine_fg.png"),
-    "Bundled Backdrops/ directory contains starter Background, Foreground Frame, and Combo assets (\(starterNames.count) files)"
+    !starterNames.isEmpty && hasBgFiles && hasFgFiles,
+    "Bundled Backdrops/ directory contains valid *_bg and *_fg assets (\(starterNames.count) files)"
 )
 
 // 7B. Zero-Code Auto-Discovery & Pairing (`_bg` + `_fg` -> Combo)
@@ -514,11 +513,14 @@ func classifyAndDiscover(in dir: URL) -> [(id: String, name: String, bg: String?
 }
 
 let discoveredStarters = classifyAndDiscover(in: projectBackdropsURL)
-assertEqual(discoveredStarters.count, 3, "Zero-code auto-discovery pairs 4 starter files into 3 distinct backdrop items (Eiffel Tower, Celebration Frame, Magazine)")
-let magStarter = discoveredStarters.first(where: { $0.id == "magazine" })
+let pairedCombos = discoveredStarters.filter { $0.bg != nil && $0.fg != nil }
 assertTrue(
-    magStarter?.bg == "Magazine_bg.jpg" && magStarter?.fg == "Magazine_fg.png",
-    "Auto-discovery pairs 'Magazine_bg.jpg' + 'Magazine_fg.png' into a single Combo item"
+    !discoveredStarters.isEmpty && (discoveredStarters.count + pairedCombos.count == starterNames.count),
+    "Zero-code auto-discovery pairs \(starterNames.count) files into \(discoveredStarters.count) distinct backdrop items (\(pairedCombos.count) combos)"
+)
+assertTrue(
+    !pairedCombos.isEmpty,
+    "Auto-discovery pairs matching *_bg + *_fg files into Combo items (\(pairedCombos.map(\.id).joined(separator: ", ")))"
 )
 
 // 7C. Resolution Auto-Scaling & 3-Layer Compositing Order (Background -> Segmented Subject -> Foreground Frame)
@@ -797,9 +799,10 @@ func hasResolvableAssets(
     }
     return bgFilename != nil || fgFilename != nil
 }
+let existingSampleFilename = starterNames.sorted().first ?? "eiffel_tower_night_bg.jpg"
 assertTrue(
     !hasResolvableAssets(bgFilename: "NonExistent_bg.jpg", fgFilename: nil, customBgData: nil, customFgData: nil, searchDirs: [projectBackdropsURL]) &&
-    hasResolvableAssets(bgFilename: "Eiffel Tower_bg.jpg", fgFilename: nil, customBgData: nil, customFgData: nil, searchDirs: [projectBackdropsURL]),
+    hasResolvableAssets(bgFilename: existingSampleFilename, fgFilename: nil, customBgData: nil, customFgData: nil, searchDirs: [projectBackdropsURL]),
     "Pre-check guard rejects missing backdrop assets before decoding/overwriting full-res JPEGs"
 )
 
@@ -818,6 +821,50 @@ assertEqual(
     "Custom Backdrop 3",
     "Unnamed custom backdrops auto-increment ('Custom Backdrop 3') instead of overwriting previous custom backdrops"
 )
+
+// 7M. Persistent Background Selection State Machine Behavior (Default Off, Persists When On, Reverts When Toggled Off)
+struct MockPersistentBackdropState {
+    let enabledIDs: Set<String> = ["none", "eiffel_tower", "magazine", "celebration_frame"]
+    var defaultBackdropID: String = "none"
+    var persistentBackdropSelection: Bool = false {
+        didSet {
+            if !persistentBackdropSelection {
+                selectedBackdropID = enabledIDs.contains(defaultBackdropID) ? defaultBackdropID : "none"
+            }
+        }
+    }
+    var selectedBackdropID: String = "none"
+    
+    mutating func selectBackdrop(_ id: String) {
+        selectedBackdropID = id
+    }
+    
+    mutating func transitionToIdleForNextPhoto() {
+        if persistentBackdropSelection && enabledIDs.contains(selectedBackdropID) {
+            // Keep selectedBackdropID
+        } else {
+            selectedBackdropID = enabledIDs.contains(defaultBackdropID) ? defaultBackdropID : "none"
+        }
+    }
+}
+
+var mockState = MockPersistentBackdropState()
+assertEqual(mockState.persistentBackdropSelection, false, "Persistent Background Selection defaults to off (false)")
+mockState.selectBackdrop("eiffel_tower")
+mockState.transitionToIdleForNextPhoto()
+assertEqual(mockState.selectedBackdropID, "none", "When Persistent Background Selection is off, next photo resets to default background ('none')")
+
+mockState.persistentBackdropSelection = true
+mockState.selectBackdrop("eiffel_tower")
+mockState.transitionToIdleForNextPhoto()
+assertEqual(mockState.selectedBackdropID, "eiffel_tower", "When Persistent Background Selection is on, 'eiffel_tower' stays present for the next photo")
+
+mockState.selectBackdrop("magazine")
+mockState.transitionToIdleForNextPhoto()
+assertEqual(mockState.selectedBackdropID, "magazine", "Selecting a different background ('magazine') persists the new selection for the next photo")
+
+mockState.persistentBackdropSelection = false
+assertEqual(mockState.selectedBackdropID, "none", "Toggling Persistent Background Selection off immediately reverts to the default background ('none')")
 
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")

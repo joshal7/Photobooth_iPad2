@@ -633,6 +633,37 @@ enum AutomatedVerificationSuite {
         try? FileManager.default.removeItem(at: frame1URL)
         try? FileManager.default.removeItem(at: frame2URL)
         
+        // 11. Persistent Background Selection Setting (Defaults to Off, Persists When On, Reverts When Toggled Off)
+        config.resetToDefaults()
+        assertEqual(config.persistentBackdropSelection, false, "persistentBackdropSelection defaults to false (off)")
+        assertEqual(sm.selectedBackdrop.id, BackdropItem.noneID, "Default selected backdrop is live camera (.none)")
+        
+        let nonNoneBackdrops = BackdropManager.shared.enabledBackdrops.filter { !$0.isNone }
+        if let firstTheme = nonNoneBackdrops.first {
+            // 11a. With persistentBackdropSelection == false, returning to .idle resets to default (.none)
+            sm.selectBackdrop(firstTheme)
+            assertEqual(sm.selectedBackdrop.id, firstTheme.id, "Guest selects backdrop (\(firstTheme.displayName))")
+            sm.transition(to: .idle)
+            assertEqual(sm.selectedBackdrop.id, BackdropItem.noneID, "With persistentBackdropSelection off, next photo resets to default live background")
+            
+            // 11b. With persistentBackdropSelection == true, returning to .idle keeps the selected backdrop
+            config.persistentBackdropSelection = true
+            sm.selectBackdrop(firstTheme)
+            sm.transition(to: .idle)
+            assertEqual(sm.selectedBackdrop.id, firstTheme.id, "With persistentBackdropSelection on, selected backdrop (\(firstTheme.displayName)) stays present for the next photo")
+            
+            // 11c. Selecting a different backdrop updates and persists the new backdrop
+            if let secondTheme = nonNoneBackdrops.dropFirst().first {
+                sm.selectBackdrop(secondTheme)
+                sm.transition(to: .idle)
+                assertEqual(sm.selectedBackdrop.id, secondTheme.id, "Selecting a different backdrop (\(secondTheme.displayName)) persists that new backdrop for the next photo")
+            }
+            
+            // 11d. Toggling persistentBackdropSelection off immediately reverts to the default background
+            config.persistentBackdropSelection = false
+            assertEqual(sm.selectedBackdrop.id, BackdropItem.noneID, "Toggling persistentBackdropSelection off immediately reverts to default background")
+        }
+        
         config.resetToDefaults()
     }
     

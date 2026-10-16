@@ -86,11 +86,39 @@ class StateMachine: ObservableObject {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] newDefaultID in
-                Task { @MainActor [weak self] in
+                let applyChange = { @MainActor [weak self] in
                     guard let self = self else { return }
                     if case .idle = self.state {
                         self.selectedBackdrop = BackdropManager.shared.backdrop(forID: newDefaultID)
                     }
+                }
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { applyChange() }
+                } else {
+                    Task { @MainActor in applyChange() }
+                }
+            }
+            .store(in: &cancellables)
+            
+        config.$persistentBackdropSelection
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] isPersistent in
+                let applyChange = { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    if !isPersistent {
+                        switch self.state {
+                        case .capture, .processing:
+                            break
+                        default:
+                            self.selectedBackdrop = BackdropManager.shared.backdrop(forID: self.config.defaultBackdropID)
+                        }
+                    }
+                }
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { applyChange() }
+                } else {
+                    Task { @MainActor in applyChange() }
                 }
             }
             .store(in: &cancellables)
@@ -98,15 +126,20 @@ class StateMachine: ObservableObject {
         BackdropManager.shared.$availableBackdrops
             .dropFirst()
             .sink { [weak self] available in
-                Task { @MainActor [weak self] in
+                let applyChange = { @MainActor [weak self] in
                     guard let self = self else { return }
-                    if let updated = available.first(where: { $0.id == self.selectedBackdrop.id }) {
+                    if let updated = available.first(where: { $0.id == self.selectedBackdrop.id && ($0.id == BackdropItem.noneID || $0.isEnabled) }) {
                         if updated != self.selectedBackdrop {
                             self.selectedBackdrop = updated
                         }
                     } else {
                         self.selectedBackdrop = BackdropManager.shared.backdrop(forID: self.config.defaultBackdropID)
                     }
+                }
+                if Thread.isMainThread {
+                    MainActor.assumeIsolated { applyChange() }
+                } else {
+                    Task { @MainActor in applyChange() }
                 }
             }
             .store(in: &cancellables)
@@ -233,9 +266,14 @@ class StateMachine: ObservableObject {
             Task { await initializeCamera() }
             
         case .idle:
-            // Reset backdrop selection to configured default and collapse the bottom picker between sessions
+            // Collapse the bottom picker between sessions; reset backdrop selection to default unless persistent selection is enabled
             self.isBackdropPickerExpanded = false
-            self.selectedBackdrop = BackdropManager.shared.backdrop(forID: config.defaultBackdropID)
+            if config.persistentBackdropSelection,
+               let validCurrent = BackdropManager.shared.enabledBackdrops.first(where: { $0.id == selectedBackdrop.id }) {
+                self.selectedBackdrop = validCurrent
+            } else {
+                self.selectedBackdrop = BackdropManager.shared.backdrop(forID: config.defaultBackdropID)
+            }
             
             if case .airDrop = previousState {
                 // Keep temporary .jpg files alive on disk for 90s after the AirDrop sheet closes

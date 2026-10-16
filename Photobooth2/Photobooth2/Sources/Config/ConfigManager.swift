@@ -34,6 +34,7 @@ class ConfigManager: ObservableObject {
     
     // Backdrop / Foreground Frame Configuration
     @Published var defaultBackdropID: String { didSet { save() } }
+    @Published var persistentBackdropSelection: Bool { didSet { save() } }
 
     private init() {
         self.initialCountdownSec = UserDefaults.standard.object(forKey: "initialCountdownSec") as? Int ?? 5
@@ -61,6 +62,7 @@ class ConfigManager: ObservableObject {
         self.qrCodeURLString = UserDefaults.standard.string(forKey: "qrCodeURLString") ?? "https://www.joshal.com/\(currentYear)"
         self.daysUntilPhotosAvailable = UserDefaults.standard.object(forKey: "daysUntilPhotosAvailable") as? Int ?? 2
         self.defaultBackdropID = UserDefaults.standard.string(forKey: "defaultBackdropID") ?? BackdropItem.noneID
+        self.persistentBackdropSelection = UserDefaults.standard.object(forKey: "persistentBackdropSelection") as? Bool ?? false
     }
     
     func save() {
@@ -85,6 +87,7 @@ class ConfigManager: ObservableObject {
         UserDefaults.standard.set(qrCodeURLString, forKey: "qrCodeURLString")
         UserDefaults.standard.set(daysUntilPhotosAvailable, forKey: "daysUntilPhotosAvailable")
         UserDefaults.standard.set(defaultBackdropID, forKey: "defaultBackdropID")
+        UserDefaults.standard.set(persistentBackdropSelection, forKey: "persistentBackdropSelection")
     }
     
     func resetToDefaults() {
@@ -110,6 +113,7 @@ class ConfigManager: ObservableObject {
         self.qrCodeURLString = "https://www.joshal.com/\(currentYear)"
         self.daysUntilPhotosAvailable = 2
         self.defaultBackdropID = BackdropItem.noneID
+        self.persistentBackdropSelection = false
         save()
     }
 }
