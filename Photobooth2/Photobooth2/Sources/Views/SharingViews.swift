@@ -4,6 +4,14 @@ struct SharingOverlayView: View {
     @EnvironmentObject var stateMachine: StateMachine
     @ObservedObject private var config = ConfigManager.shared
     
+    private var isGIFSession: Bool {
+        if case .sharingPrompt(let images) = stateMachine.state {
+            let lower = images.map { $0.lowercased() }
+            return lower.contains { $0.hasSuffix(".gif") } && !lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+        }
+        return false
+    }
+    
     var body: some View {
         ZStack {
             Color.black.opacity(0.7)
@@ -17,7 +25,7 @@ struct SharingOverlayView: View {
                         VStack(spacing: 30) {
                             Spacer()
                             
-                            Text("Would you like your photos?")
+                            Text(isGIFSession ? "Would you like your GIF?" : "Would you like your photos?")
                                 .font(.system(size: 40, weight: .bold))
                                 .foregroundColor(.white)
                             
@@ -37,7 +45,8 @@ struct SharingOverlayView: View {
                             Spacer()
                             
                             let days = config.daysUntilPhotosAvailable
-                            Text("Full resolution images and animated GIFs available for download within \(days) day\(days == 1 ? "" : "s") here:")
+                            let mediaNoun = isGIFSession ? "animated GIFs" : "photos"
+                            Text("Full resolution \(mediaNoun) available for download within \(days) day\(days == 1 ? "" : "s") here:")
                                 .font(.title3)
                                 .fontWeight(.semibold)
                                 .foregroundColor(.white)
@@ -56,7 +65,7 @@ struct SharingOverlayView: View {
                     VStack(spacing: 30) {
                         Spacer()
                         
-                        Text("Would you like your photos?")
+                        Text(isGIFSession ? "Would you like your GIF?" : "Would you like your photos?")
                             .font(.system(size: 40, weight: .bold))
                             .foregroundColor(.white)
                         
@@ -405,6 +414,11 @@ struct EmailSharingView: View {
     
     let images: [String]
     
+    private var isGIFSession: Bool {
+        let lower = images.map { $0.lowercased() }
+        return lower.contains { $0.hasSuffix(".gif") } && !lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+    }
+    
     @State private var emailInput: String = ""
     @State private var confirmationCopy: EmailConfirmationCopy? = nil
     @State private var inactivityTask: Task<Void, Never>? = nil
@@ -508,13 +522,15 @@ struct EmailSharingView: View {
                     .padding(.top, 20)
                     
                     VStack(spacing: 8) {
-                        Text("Email Your Photos & GIF")
+                        Text(isGIFSession ? "Email Your GIF" : "Email Your Photos")
                             .font(.system(size: 38, weight: .bold))
                             .foregroundColor(.white)
                         
                         Text(emailQueue.isNetworkConnected
                              ? "Enter your email for instant background delivery."
-                             : "iPad is currently offline — enter your email and it will be sent automatically when the iPad connects to Wi-Fi.")
+                             : (isGIFSession
+                                ? "iPad is currently offline — enter your email and your GIF will be sent automatically when the iPad connects to Wi-Fi."
+                                : "iPad is currently offline — enter your email and your photos will be sent automatically when the iPad connects to Wi-Fi."))
                             .font(.title3)
                             .foregroundColor(.white.opacity(0.75))
                             .multilineTextAlignment(.center)
@@ -644,7 +660,8 @@ struct EmailSharingView: View {
             confirmationCopy = EmailQueueService.confirmationMessage(
                 forEmail: trimmed,
                 isOnline: onlineNow,
-                isConfigured: configuredNow
+                isConfigured: configuredNow,
+                mediaOrFilenames: images
             )
         }
         

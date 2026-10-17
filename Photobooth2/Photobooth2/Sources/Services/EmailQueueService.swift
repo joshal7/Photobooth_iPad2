@@ -812,8 +812,23 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         return mutableData as Data
     }
     
+    /// Returns the descriptive sentence matching the media captured in the session:
+    /// - Photos: "Your photos from your session are attached to this email."
+    /// - GIF: "Your gif from your session are attached to this email."
+    nonisolated static func sessionAttachmentDescription(for mediaOrFilenames: [String]) -> String {
+        let lower = mediaOrFilenames.map { $0.lowercased() }
+        let hasGIF = lower.contains { $0.hasSuffix(".gif") }
+        let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+        
+        if hasGIF && !hasPhotos {
+            return "Your gif from your session are attached to this email."
+        } else {
+            return "Your photos from your session are attached to this email."
+        }
+    }
+
     /// Builds the HTML email body containing the required hyperlinked gallery footer at the bottom.
-    nonisolated static func buildEmailHTML(galleryURLString: String) -> String {
+    nonisolated static func buildEmailHTML(galleryURLString: String, mediaOrFilenames: [String] = []) -> String {
         let normalizedURL = normalizeGalleryURL(galleryURLString)
         let escapedURL = normalizedURL
             .replacingOccurrences(of: "&", with: "&amp;")
@@ -821,25 +836,42 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
         
+        let desc = sessionAttachmentDescription(for: mediaOrFilenames)
+        let escapedDesc = desc
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        
+        let lower = mediaOrFilenames.map { $0.lowercased() }
+        let hasGIF = lower.contains { $0.hasSuffix(".gif") }
+        let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+        let footerNoun = (hasGIF && !hasPhotos) ? "gifs" : "photos"
+        
         return """
         <!DOCTYPE html>
         <html>
         <head><meta charset="UTF-8"></head>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #222222; line-height: 1.5; padding: 16px;">
-          <p>Thanks for visiting the photobooth! Your photos &amp; animated GIF from your session are attached to this email.</p>
+          <p>Thanks for visiting the photobooth! \(escapedDesc)</p>
           <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 24px 0;" />
-          <p style="font-size: 14px; color: #444444;">All full resolution images and gifs can be downloaded <a href="\(escapedURL)">here</a> a day or two after the event.</p>
+          <p style="font-size: 14px; color: #444444;">All full resolution \(footerNoun) can be downloaded <a href="\(escapedURL)">here</a> a day or two after the event.</p>
         </body>
         </html>
         """
     }
     
-    nonisolated static func buildEmailPlainText(galleryURLString: String) -> String {
+    nonisolated static func buildEmailPlainText(galleryURLString: String, mediaOrFilenames: [String] = []) -> String {
         let normalizedURL = normalizeGalleryURL(galleryURLString)
+        let desc = sessionAttachmentDescription(for: mediaOrFilenames)
+        let lower = mediaOrFilenames.map { $0.lowercased() }
+        let hasGIF = lower.contains { $0.hasSuffix(".gif") }
+        let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+        let footerNoun = (hasGIF && !hasPhotos) ? "gifs" : "photos"
+        
         return """
-        Thanks for visiting the photobooth! Your photos & animated GIF from your session are attached to this email.
+        Thanks for visiting the photobooth! \(desc)
 
-        All full resolution images and gifs can be downloaded here (\(normalizedURL)) a day or two after the event.
+        All full resolution \(footerNoun) can be downloaded here (\(normalizedURL)) a day or two after the event.
         """
     }
     
@@ -847,9 +879,24 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
     nonisolated static func confirmationMessage(
         forEmail email: String,
         isOnline: Bool,
-        isConfigured: Bool = true
+        isConfigured: Bool = true,
+        mediaOrFilenames: [String] = []
     ) -> EmailConfirmationCopy {
         let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = mediaOrFilenames.map { $0.lowercased() }
+        let hasGIF = lower.contains { $0.hasSuffix(".gif") }
+        let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+        
+        let mediaTitleNoun: String
+        let mediaSubtitleNoun: String
+        if hasGIF && !hasPhotos {
+            mediaTitleNoun = "GIF"
+            mediaSubtitleNoun = "GIF is"
+        } else {
+            mediaTitleNoun = "Photos"
+            mediaSubtitleNoun = "photos are"
+        }
+
         if !isConfigured {
             return EmailConfirmationCopy(
                 title: "Saved to iPad Queue!",
@@ -859,8 +906,8 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
             )
         } else if isOnline {
             return EmailConfirmationCopy(
-                title: "Sending Your Photos!",
-                subtitle: "Your photos & GIF are being emailed to \(cleanEmail) in the background right now.",
+                title: "Sending Your \(mediaTitleNoun)!",
+                subtitle: "Your \(mediaSubtitleNoun) being emailed to \(cleanEmail) in the background right now.",
                 isOnline: true,
                 isConfigured: true
             )
@@ -944,7 +991,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         }
         
         let normalizedGalleryURL = Self.normalizeGalleryURL(galleryURLString)
-        let resolvedSubject = customSubject ?? resolveSubject()
+        let resolvedSubject = customSubject ?? resolveSubject(for: savedFilenames)
         let now = Date()
         
         let newItem = EmailQueueItem(
@@ -1164,8 +1211,8 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
                     from: resolveFromAddress(),
                     to: currentItem.recipientEmail,
                     subject: currentItem.subject,
-                    htmlBody: Self.buildEmailHTML(galleryURLString: currentItem.galleryURLString),
-                    textBody: Self.buildEmailPlainText(galleryURLString: currentItem.galleryURLString),
+                    htmlBody: Self.buildEmailHTML(galleryURLString: currentItem.galleryURLString, mediaOrFilenames: currentItem.attachmentFilenames),
+                    textBody: Self.buildEmailPlainText(galleryURLString: currentItem.galleryURLString, mediaOrFilenames: currentItem.attachmentFilenames),
                     attachments: attachments,
                     apiKey: resolveAPIKey()
                 )
@@ -1414,12 +1461,25 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         return UserDefaults.standard.string(forKey: "emailFromAddress") ?? "Photobooth <joshal7@gmail.com>"
     }
     
-    nonisolated private func resolveSubject() -> String {
+    nonisolated private func resolveSubject(for mediaFilenames: [String] = []) -> String {
         storage.lock.lock()
         let override = storage.subjectOverride
         storage.lock.unlock()
         if let override = override { return override }
-        return UserDefaults.standard.string(forKey: "emailSubject") ?? "Your Photobooth Photos & GIF!"
+        let configured = UserDefaults.standard.string(forKey: "emailSubject") ?? "Your Photobooth Photos"
+        
+        // If subject has not been customized (or matches defaults), tailor specifically to Photos or GIF
+        if configured == "Your Photobooth Photos" || configured == "Your Photobooth Photos!" || configured == "Your Photobooth Photos & GIF!" || configured.isEmpty {
+            let lower = mediaFilenames.map { $0.lowercased() }
+            let hasGIF = lower.contains { $0.hasSuffix(".gif") }
+            let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+            if hasGIF && !hasPhotos {
+                return "Your Photobooth GIF"
+            } else {
+                return "Your Photobooth Photos"
+            }
+        }
+        return configured
     }
     
     nonisolated private func publishStateSnapshot(statusMessage: String? = nil) {

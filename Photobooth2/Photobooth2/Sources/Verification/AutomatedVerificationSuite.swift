@@ -1726,12 +1726,12 @@ enum AutomatedVerificationSuite {
         // 2. HTML Footer & Hyperlink Formatting ("here" linked to QR code URL)
         let htmlYearOnly = EmailQueueService.buildEmailHTML(galleryURLString: "https://www.joshal.com/2026")
         assertTrue(
-            htmlYearOnly.contains("All full resolution images and gifs can be downloaded <a href=\"https://www.joshal.com/2026\">here</a> a day or two after the event."),
+            htmlYearOnly.contains("All full resolution photos can be downloaded <a href=\"https://www.joshal.com/2026\">here</a> a day or two after the event."),
             "HTML email includes exact footer with 'here' hyperlinked to https://www.joshal.com/2026"
         )
         let htmlWithEvent = EmailQueueService.buildEmailHTML(galleryURLString: "https://www.joshal.com/2026/holiday-gala")
         assertTrue(
-            htmlWithEvent.contains("All full resolution images and gifs can be downloaded <a href=\"https://www.joshal.com/2026/holiday-gala\">here</a> a day or two after the event."),
+            htmlWithEvent.contains("All full resolution photos can be downloaded <a href=\"https://www.joshal.com/2026/holiday-gala\">here</a> a day or two after the event."),
             "HTML email includes exact footer with 'here' hyperlinked to https://www.joshal.com/2026/holiday-gala"
         )
         let htmlSchemeless = EmailQueueService.buildEmailHTML(galleryURLString: "www.joshal.com/2026/party")
@@ -1740,12 +1740,41 @@ enum AutomatedVerificationSuite {
             "Schemeless gallery URL automatically normalizes to https:// in hyperlink"
         )
         
-        // 3. Online vs. Offline Guest Confirmation Copy
-        let onlineCopy = EmailQueueService.confirmationMessage(forEmail: "guest@gmail.com", isOnline: true)
-        let offlineCopy = EmailQueueService.confirmationMessage(forEmail: "guest@gmail.com", isOnline: false)
+        // 2B. Media-Tailored Body & Description (Photos vs. GIF vs. Both)
+        assertEqual(
+            EmailQueueService.sessionAttachmentDescription(for: ["photo_1.jpg", "photo_2.jpg"]),
+            "Your photos from your session are attached to this email.",
+            "Photos-only session uses 'Your photos from your session are attached to this email.'"
+        )
+        assertEqual(
+            EmailQueueService.sessionAttachmentDescription(for: ["photobooth_animation.gif"]),
+            "Your gif from your session are attached to this email.",
+            "GIF-only session uses 'Your gif from your session are attached to this email.'"
+        )
+        let htmlGifOnly = EmailQueueService.buildEmailHTML(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["anim.gif"])
         assertTrue(
-            onlineCopy.isOnline && !onlineCopy.subtitle.lowercased().contains("offline"),
-            "Online confirmation copy confirms immediate background sending"
+            htmlGifOnly.contains("Your gif from your session are attached to this email.") &&
+            htmlGifOnly.contains("All full resolution gifs can be downloaded"),
+            "HTML email contains tailored GIF-only description and footer"
+        )
+        let htmlPhotosOnly = EmailQueueService.buildEmailHTML(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["p1.jpg"])
+        assertTrue(
+            htmlPhotosOnly.contains("Your photos from your session are attached to this email.") &&
+            htmlPhotosOnly.contains("All full resolution photos can be downloaded"),
+            "HTML email contains tailored Photos-only description and footer"
+        )
+        
+        // 3. Online vs. Offline Guest Confirmation Copy
+        let onlineCopy = EmailQueueService.confirmationMessage(forEmail: "guest@gmail.com", isOnline: true, mediaOrFilenames: ["p.jpg"])
+        let onlineGifCopy = EmailQueueService.confirmationMessage(forEmail: "guest@gmail.com", isOnline: true, mediaOrFilenames: ["a.gif"])
+        let offlineCopy = EmailQueueService.confirmationMessage(forEmail: "guest@gmail.com", isOnline: false, mediaOrFilenames: ["p.jpg"])
+        assertTrue(
+            onlineCopy.isOnline && onlineCopy.title == "Sending Your Photos!" && onlineCopy.subtitle.contains("Your photos are being emailed"),
+            "Online photos confirmation copy confirms immediate background sending for photos"
+        )
+        assertTrue(
+            onlineGifCopy.isOnline && onlineGifCopy.title == "Sending Your GIF!" && onlineGifCopy.subtitle.contains("Your GIF is being emailed"),
+            "Online GIF confirmation copy confirms immediate background sending for GIF"
         )
         assertTrue(
             !offlineCopy.isOnline &&
@@ -1769,7 +1798,7 @@ enum AutomatedVerificationSuite {
             maxBackoffSec: 1.0,
             apiKeyOverride: "re_test_key_123",
             fromAddressOverride: "Photobooth <photos@joshal.com>",
-            subjectOverride: "Your Photobooth Photos & GIF!"
+            subjectOverride: "Your Photobooth Photos"
         )
         
         let tmpPhoto1 = qaEmailRoot.appendingPathComponent("sony_\(UUID().uuidString).jpg")
@@ -1818,7 +1847,7 @@ enum AutomatedVerificationSuite {
             assertEqual(reqA.attachments[3].data, sampleGIFBytes, "Scenario A: GIF bytes intact")
             assertEqual(reqA.attachments[3].contentType, "image/gif", "Scenario A: GIF contentType is image/gif")
             assertTrue(
-                reqA.htmlBody.contains("All full resolution images and gifs can be downloaded <a href=\"https://www.joshal.com/2026/wedding\">here</a> a day or two after the event."),
+                reqA.htmlBody.contains("<a href=\"https://www.joshal.com/2026/wedding\">here</a>"),
                 "Scenario A: Transmitted HTML body contains hyperlinked 'here' footer"
             )
             let jobADir = scenarioADir.appendingPathComponent(jobA.id.uuidString, isDirectory: true)
@@ -2037,7 +2066,7 @@ enum AutomatedVerificationSuite {
             idempotencyKey: "idem-test-12345",
             from: "Photobooth <onboarding@resend.dev>",
             to: "guest@joshal.com",
-            subject: "Your Photobooth Photos & GIF!",
+            subject: "Your Photobooth Photos",
             htmlBody: EmailQueueService.buildEmailHTML(galleryURLString: "https://www.joshal.com/2026/gala"),
             textBody: EmailQueueService.buildEmailPlainText(galleryURLString: "https://www.joshal.com/2026/gala"),
             attachments: [

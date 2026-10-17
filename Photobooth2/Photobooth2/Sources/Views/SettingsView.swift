@@ -354,7 +354,7 @@ struct SettingsView: View {
                         HStack {
                             Text("Email Subject")
                             Spacer()
-                            TextField("Your Photobooth Photos & GIF!", text: $config.emailSubject)
+                            TextField("Your Photobooth Photos", text: $config.emailSubject)
                                 .multilineTextAlignment(.trailing)
                                 .foregroundColor(.secondary)
                         }

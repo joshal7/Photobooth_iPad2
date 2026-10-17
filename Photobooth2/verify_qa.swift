@@ -1282,32 +1282,60 @@ func qaNormalizeGalleryURL(_ rawURLString: String) -> String {
     return "https://\(trimmed)"
 }
 
-func qaBuildEmailHTML(galleryURLString: String) -> String {
+func qaSessionAttachmentDescription(for mediaOrFilenames: [String]) -> String {
+    let lower = mediaOrFilenames.map { $0.lowercased() }
+    let hasGIF = lower.contains { $0.hasSuffix(".gif") }
+    let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+    if hasPhotos && hasGIF {
+        return "Your photos & animated GIF from your session are attached to this email."
+    } else if hasGIF {
+        return "Your gif from your session are attached to this email."
+    } else {
+        return "Your photos from your session are attached to this email."
+    }
+}
+
+func qaBuildEmailHTML(galleryURLString: String, mediaOrFilenames: [String] = []) -> String {
     let normalizedURL = qaNormalizeGalleryURL(galleryURLString)
     let escapedURL = normalizedURL
         .replacingOccurrences(of: "&", with: "&amp;")
         .replacingOccurrences(of: "\"", with: "&quot;")
         .replacingOccurrences(of: "<", with: "&lt;")
         .replacingOccurrences(of: ">", with: "&gt;")
+    let desc = qaSessionAttachmentDescription(for: mediaOrFilenames)
+    let escapedDesc = desc
+        .replacingOccurrences(of: "&", with: "&amp;")
+        .replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: ">", with: "&gt;")
+    let lower = mediaOrFilenames.map { $0.lowercased() }
+    let hasGIF = lower.contains { $0.hasSuffix(".gif") }
+    let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+    let footerNoun = (hasGIF && !hasPhotos) ? "gifs" : "photos"
     return """
     <!DOCTYPE html>
     <html>
     <head><meta charset="UTF-8"></head>
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #222222; line-height: 1.5; padding: 16px;">
-      <p>Thanks for visiting the photobooth! Your photos &amp; animated GIF from your session are attached to this email.</p>
+      <p>Thanks for visiting the photobooth! \(escapedDesc)</p>
       <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 24px 0;" />
-      <p style="font-size: 14px; color: #444444;">All full resolution images and gifs can be downloaded <a href="\(escapedURL)">here</a> a day or two after the event.</p>
+      <p style="font-size: 14px; color: #444444;">All full resolution \(footerNoun) can be downloaded <a href="\(escapedURL)">here</a> a day or two after the event.</p>
     </body>
     </html>
     """
 }
 
-func qaConfirmationMessage(forEmail email: String, isOnline: Bool) -> (title: String, subtitle: String, isOnline: Bool) {
+func qaConfirmationMessage(forEmail email: String, isOnline: Bool, mediaOrFilenames: [String] = []) -> (title: String, subtitle: String, isOnline: Bool) {
     let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lower = mediaOrFilenames.map { $0.lowercased() }
+    let hasGIF = lower.contains { $0.hasSuffix(".gif") }
+    let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
+    let mediaTitle = (hasGIF && !hasPhotos) ? "GIF" : "Photos"
+    let mediaSub = (hasGIF && !hasPhotos) ? "GIF is" : "photos are"
+    
     if isOnline {
         return (
-            title: "Sending Your Photos!",
-            subtitle: "Your photos & GIF are being emailed to \(cleanEmail) in the background right now.",
+            title: "Sending Your \(mediaTitle)!",
+            subtitle: "Your \(mediaSub) being emailed to \(cleanEmail) in the background right now.",
             isOnline: true
         )
     } else {
@@ -1325,22 +1353,38 @@ assertTrue(!qaIsValidEmail("invalid-email"), "Email without @ rejected")
 assertTrue(!qaIsValidEmail("user@domain"), "Email without TLD rejected")
 assertTrue(!qaIsValidEmail("user@domain..com"), "Email with consecutive dots rejected")
 
-let qaHTML1 = qaBuildEmailHTML(galleryURLString: "https://www.joshal.com/2026")
-let qaHTML2 = qaBuildEmailHTML(galleryURLString: "https://www.joshal.com/2026/summer-party")
-assertTrue(
-    qaHTML1.contains("All full resolution images and gifs can be downloaded <a href=\"https://www.joshal.com/2026\">here</a> a day or two after the event."),
-    "HTML email footer links 'here' to https://www.joshal.com/2026"
+assertEqual(
+    qaSessionAttachmentDescription(for: ["photo.jpg"]),
+    "Your photos from your session are attached to this email.",
+    "Photos-only session produces 'Your photos from your session are attached to this email.'"
 )
-assertTrue(
-    qaHTML2.contains("All full resolution images and gifs can be downloaded <a href=\"https://www.joshal.com/2026/summer-party\">here</a> a day or two after the event."),
-    "HTML email footer links 'here' to https://www.joshal.com/2026/summer-party"
+assertEqual(
+    qaSessionAttachmentDescription(for: ["animation.gif"]),
+    "Your gif from your session are attached to this email.",
+    "GIF-only session produces 'Your gif from your session are attached to this email.'"
 )
 
-let qaOnlineMsg = qaConfirmationMessage(forEmail: "user@test.com", isOnline: true)
-let qaOfflineMsg = qaConfirmationMessage(forEmail: "user@test.com", isOnline: false)
+let qaHTML1 = qaBuildEmailHTML(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["photo.jpg"])
+let qaHTML2 = qaBuildEmailHTML(galleryURLString: "https://www.joshal.com/2026/summer-party", mediaOrFilenames: ["animation.gif"])
 assertTrue(
-    qaOnlineMsg.isOnline && !qaOnlineMsg.subtitle.lowercased().contains("offline"),
-    "Online confirmation message indicates immediate background sending"
+    qaHTML1.contains("All full resolution photos can be downloaded <a href=\"https://www.joshal.com/2026\">here</a> a day or two after the event."),
+    "HTML email footer links 'here' to https://www.joshal.com/2026 for photos"
+)
+assertTrue(
+    qaHTML2.contains("All full resolution gifs can be downloaded <a href=\"https://www.joshal.com/2026/summer-party\">here</a> a day or two after the event."),
+    "HTML email footer links 'here' to https://www.joshal.com/2026/summer-party for GIF"
+)
+
+let qaOnlineMsg = qaConfirmationMessage(forEmail: "user@test.com", isOnline: true, mediaOrFilenames: ["photo.jpg"])
+let qaOnlineGifMsg = qaConfirmationMessage(forEmail: "user@test.com", isOnline: true, mediaOrFilenames: ["anim.gif"])
+let qaOfflineMsg = qaConfirmationMessage(forEmail: "user@test.com", isOnline: false, mediaOrFilenames: ["photo.jpg"])
+assertTrue(
+    qaOnlineMsg.isOnline && qaOnlineMsg.title == "Sending Your Photos!",
+    "Online photos confirmation message indicates immediate background sending"
+)
+assertTrue(
+    qaOnlineGifMsg.isOnline && qaOnlineGifMsg.title == "Sending Your GIF!",
+    "Online GIF confirmation message indicates immediate background sending"
 )
 assertTrue(
     !qaOfflineMsg.isOnline &&

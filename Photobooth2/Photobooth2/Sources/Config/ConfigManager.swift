@@ -102,7 +102,15 @@ class ConfigManager: ObservableObject {
             UserDefaults.standard.set(resolvedFrom, forKey: "emailFromAddress")
         }
         self.emailFromAddress = resolvedFrom
-        self.emailSubject = UserDefaults.standard.string(forKey: "emailSubject") ?? "Your Photobooth Photos & GIF!"
+        let savedSubject = UserDefaults.standard.string(forKey: "emailSubject")
+        let resolvedSubject: String
+        if let savedSubject = savedSubject, savedSubject != "Your Photobooth Photos & GIF!" {
+            resolvedSubject = savedSubject
+        } else {
+            resolvedSubject = "Your Photobooth Photos"
+            UserDefaults.standard.set(resolvedSubject, forKey: "emailSubject")
+        }
+        self.emailSubject = resolvedSubject
     }
     
     func save() {
@@ -162,7 +170,7 @@ class ConfigManager: ObservableObject {
 
         self.isEmailSharingEnabled = true
         self.emailFromAddress = "Photobooth <joshal7@gmail.com>"
-        self.emailSubject = "Your Photobooth Photos & GIF!"
+        self.emailSubject = "Your Photobooth Photos"
         save()
     }
 }
