@@ -1758,8 +1758,10 @@ Task.detached {
        let cGIF = cProps[kCGImagePropertyGIFDictionary] as? [CFString: Any],
        let loopCount = cGIF[kCGImagePropertyGIFLoopCount] as? Int,
        let hasGlobalMap = cGIF[kCGImagePropertyGIFHasGlobalColorMap] as? Bool {
-        guard gw == 960 && gh == 640 && loopCount == 0 && hasGlobalMap && abs(gUnclamped - 0.45) < 0.02 else {
-            fputs("FAIL: Normalized GIF properties mismatch: \\(gw)x\\(gh) loop=\\(loopCount) globalMap=\\(hasGlobalMap) unclamped=\\(gUnclamped)\\n", stderr)
+        let headerMagic = String(data: normGIF.prefix(6), encoding: .ascii) ?? ""
+        let gAlpha = (gProps[kCGImagePropertyHasAlpha] as? Bool) ?? false
+        guard headerMagic == "GIF89a" && !gAlpha && gw == 960 && gh == 640 && loopCount == 0 && hasGlobalMap && abs(gUnclamped - 0.45) < 0.02 else {
+            fputs("FAIL: Normalized GIF properties mismatch: header=\\(headerMagic) alpha=\\(gAlpha) \\(gw)x\\(gh) loop=\\(loopCount) globalMap=\\(hasGlobalMap) unclamped=\\(gUnclamped)\\n", stderr)
             Foundation.exit(1)
         }
     } else {

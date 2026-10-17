@@ -173,6 +173,10 @@ final class GIFService: Sendable {
         }
         
         if CGImageDestinationFinalize(destination) {
+            if let rawData = try? Data(contentsOf: gifURL) {
+                let strictGIF89a = ensureStrictGIF89aData(rawData)
+                try? strictGIF89a.write(to: gifURL, options: .atomic)
+            }
             print("GIF created at \(gifURL)")
             return gifURL
         } else {
@@ -206,5 +210,69 @@ final class GIFService: Sendable {
         ctx.interpolationQuality = .high
         ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         return ctx.makeImage() ?? image
+    }
+    
+    /// Fixes Apple ImageIO's `CGImageDestination` quirk where multi-frame animated GIFs are written with a
+    /// `GIF87a` magic header (`47 49 46 38 37 61`) and `Transparent Color Flag = 1` (`HasAlpha = 1`) on opaque frames.
+    /// Converts the header to strict `GIF89a` (`47 49 46 38 39 61`) and clears the transparent flag on all GCE blocks
+    /// so Gmail iOS's Download-to-Camera-Roll handler and `PHPhotoLibrary` recognize and save it as an animated GIF.
+    nonisolated static func ensureStrictGIF89aData(_ data: Data) -> Data {
+        guard data.count >= 14 else { return data }
+        var bytes = [UInt8](data)
+        guard bytes[0] == 0x47, bytes[1] == 0x49, bytes[2] == 0x46,
+              bytes[3] == 0x38, (bytes[4] == 0x37 || bytes[4] == 0x39), bytes[5] == 0x61 else {
+            return data
+        }
+        // Force strict "GIF89a" magic signature
+        bytes[4] = 0x39
+        
+        let lsdPacked = bytes[10]
+        let hasGCT = (lsdPacked & 0x80) != 0
+        let gctEntries = hasGCT ? (1 << ((Int(lsdPacked) & 0x07) + 1)) : 0
+        var i = 13 + gctEntries * 3
+        
+        while i < bytes.count {
+            let b = bytes[i]
+            if b == 0x21 {
+                guard i + 2 < bytes.count else { break }
+                let label = bytes[i + 1]
+                if label == 0xF9 && bytes[i + 2] == 0x04 && i + 7 < bytes.count && bytes[i + 7] == 0x00 {
+                    var packed = bytes[i + 3] & 0xFE // Clear Transparent Color Flag (bit 0)
+                    if ((packed >> 2) & 0x07) == 0 {
+                        packed |= (1 << 2) // Disposal Method = 1 (Do Not Dispose)
+                    }
+                    bytes[i + 3] = packed
+                    bytes[i + 6] = 0x00
+                    i += 8
+                } else {
+                    i += 2
+                    while i < bytes.count {
+                        let subLen = Int(bytes[i])
+                        i += 1
+                        if subLen == 0 { break }
+                        i += subLen
+                    }
+                }
+            } else if b == 0x2C {
+                guard i + 10 < bytes.count else { break }
+                let lctPacked = bytes[i + 9]
+                let hasLCT = (lctPacked & 0x80) != 0
+                let lctEntries = hasLCT ? (1 << ((Int(lctPacked) & 0x07) + 1)) : 0
+                i += 10 + lctEntries * 3
+                guard i < bytes.count else { break }
+                i += 1 // LZW minimum code size
+                while i < bytes.count {
+                    let subLen = Int(bytes[i])
+                    i += 1
+                    if subLen == 0 { break }
+                    i += subLen
+                }
+            } else if b == 0x3B {
+                break
+            } else {
+                break
+            }
+        }
+        return Data(bytes)
     }
 }

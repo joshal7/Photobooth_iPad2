@@ -2211,6 +2211,10 @@ enum AutomatedVerificationSuite {
                 let containerGIF = containerProps?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
                 let loopCount = containerGIF?[kCGImagePropertyGIFLoopCount] as? Int ?? -1
                 let hasGlobalMap = containerGIF?[kCGImagePropertyGIFHasGlobalColorMap] as? Bool ?? false
+                let headerMagic = String(data: normalizedGIF.prefix(6), encoding: .ascii) ?? ""
+                let hasAlpha = (f0Props?[kCGImagePropertyHasAlpha] as? Bool) ?? false
+                assertEqual(headerMagic, "GIF89a", "Normalized email GIF starts with strict GIF89a magic signature (not GIF87a)")
+                assertTrue(!hasAlpha, "Normalized email GIF clears bogus GCE transparent color flag (HasAlpha == false)")
                 assertEqual(w, 960, "Normalized email GIF width is 960px (< 1000px mobile proxy threshold)")
                 assertEqual(h, 640, "Normalized email GIF height is 640px (exact 3:2 landscape)")
                 assertEqual(loopCount, 0, "Normalized email GIF preserves infinite LoopCount = 0")
