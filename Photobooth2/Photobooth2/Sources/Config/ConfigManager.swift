@@ -41,17 +41,13 @@ class ConfigManager: ObservableObject {
     @Published var emailAPIKey: String {
         didSet {
             save()
-            if !emailAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                EmailQueueService.shared.notifyConfigurationUpdated()
-            }
+            EmailQueueService.shared.notifyConfigurationUpdated()
         }
     }
     @Published var emailFromAddress: String {
         didSet {
             save()
-            if !emailFromAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                EmailQueueService.shared.notifyConfigurationUpdated()
-            }
+            EmailQueueService.shared.notifyConfigurationUpdated()
         }
     }
     @Published var emailSubject: String { didSet { save() } }
@@ -86,8 +82,26 @@ class ConfigManager: ObservableObject {
 
         // Email Sharing Defaults (Enabled by default)
         self.isEmailSharingEnabled = UserDefaults.standard.object(forKey: "isEmailSharingEnabled") as? Bool ?? true
-        self.emailAPIKey = UserDefaults.standard.string(forKey: "emailAPIKey") ?? ""
-        self.emailFromAddress = UserDefaults.standard.string(forKey: "emailFromAddress") ?? "Photobooth <photos@joshal.com>"
+        let savedKey = UserDefaults.standard.string(forKey: "emailAPIKey") ?? ""
+        let defaultKey = "cmocfjvercrypmlj"
+        let resolvedKey: String
+        if savedKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            resolvedKey = defaultKey
+            UserDefaults.standard.set(resolvedKey, forKey: "emailAPIKey")
+        } else {
+            resolvedKey = savedKey
+        }
+        self.emailAPIKey = resolvedKey
+        let savedFrom = UserDefaults.standard.string(forKey: "emailFromAddress")
+        let resolvedFrom: String
+        if let savedFrom = savedFrom,
+           !(savedFrom == "Photobooth <photos@joshal.com>" && !resolvedKey.lowercased().hasPrefix("re_")) {
+            resolvedFrom = savedFrom
+        } else {
+            resolvedFrom = "Photobooth <joshal7@gmail.com>"
+            UserDefaults.standard.set(resolvedFrom, forKey: "emailFromAddress")
+        }
+        self.emailFromAddress = resolvedFrom
         self.emailSubject = UserDefaults.standard.string(forKey: "emailSubject") ?? "Your Photobooth Photos & GIF!"
     }
     
@@ -147,7 +161,7 @@ class ConfigManager: ObservableObject {
         self.persistentBackdropSelection = false
 
         self.isEmailSharingEnabled = true
-        self.emailFromAddress = "Photobooth <photos@joshal.com>"
+        self.emailFromAddress = "Photobooth <joshal7@gmail.com>"
         self.emailSubject = "Your Photobooth Photos & GIF!"
         save()
     }

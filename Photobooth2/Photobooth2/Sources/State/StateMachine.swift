@@ -148,6 +148,7 @@ class StateMachine: ObservableObject {
             }
             .store(in: &cancellables)
             
+        _ = EmailQueueService.shared
         bindCameraStreams()
     }
     

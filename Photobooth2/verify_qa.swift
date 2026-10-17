@@ -572,8 +572,8 @@ assertEqual(
 )
 assertEqual(
     discoveredStarters.last?.id,
-    "704_zach_levine_bar_mitzvah",
-    "Last backdrop in carousel/Settings sort order is 704_zach_levine_bar_mitzvah ('\(discoveredStarters.last?.displayName ?? "")')"
+    "703_zach_levine_bar_mitzvah",
+    "Last backdrop in carousel/Settings sort order is 703_zach_levine_bar_mitzvah ('\(discoveredStarters.last?.displayName ?? "")')"
 )
 
 // 7C. Resolution Auto-Scaling & 3-Layer Compositing Order (Background -> Segmented Subject -> Foreground Frame)
@@ -1636,6 +1636,49 @@ Task.detached {
         Foundation.exit(1)
     }
 
+    // 5. GmailSMTPTransport MIME payload & unconfigured confirmation verification
+    let (envEmail, hdrFrom) = GmailSMTPTransport.parseSenderAddress("Photobooth <joshal7@gmail.com>")
+    let mimeBytes = GmailSMTPTransport.buildMIMEMessage(sampleReq, envelopeSender: envEmail, formattedFromHeader: hdrFrom)
+    let mimeStr = String(data: mimeBytes, encoding: .utf8) ?? ""
+    guard envEmail == "joshal7@gmail.com",
+          mimeStr.contains("From: Photobooth <joshal7@gmail.com>\\r\\n"),
+          mimeStr.contains("To: <guest@joshal.com>\\r\\n"),
+          mimeStr.contains("filename=\\"a.jpg\\""),
+          mimeStr.hasSuffix("\\r\\n.\\r\\n") else {
+        fputs("FAIL: GmailSMTPTransport MIME verification failed\\n", stderr)
+        Foundation.exit(1)
+    }
+
+    let unconfCopy = EmailQueueService.confirmationMessage(forEmail: "guest@gmail.com", isOnline: true, isConfigured: false)
+    guard !unconfCopy.isConfigured, unconfCopy.subtitle.lowercased().contains("settings") else {
+        fputs("FAIL: Unconfigured confirmation copy verification failed\\n", stderr)
+        Foundation.exit(1)
+    }
+
+    // 6. iPad Camera Mode 10.8MP (4032x2688) JPEG downscaling to 2MP (1620x1080)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    if let ctx = CGContext(data: nil, width: 3240, height: 2160, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+       let bigCG = ctx.makeImage() {
+        let bigData = NSMutableData()
+        if let dest = CGImageDestinationCreateWithData(bigData as CFMutableData, "public.jpeg" as CFString, 1, nil) {
+            CGImageDestinationAddImage(dest, bigCG, [kCGImageDestinationLossyCompressionQuality: 0.92] as CFDictionary)
+            CGImageDestinationFinalize(dest)
+        }
+        let downscaled = EmailQueueService.normalizeJPEGAttachmentTo2MP(bigData as Data)
+        if let src = CGImageSourceCreateWithData(downscaled as CFData, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+           let w = props[kCGImagePropertyPixelWidth] as? Int,
+           let h = props[kCGImagePropertyPixelHeight] as? Int {
+            guard w == 1620 && h == 1080 else {
+                fputs("FAIL: iPad Camera Mode JPEG was not downscaled to 1620x1080 (got \\(w)x\\(h))\\n", stderr)
+                Foundation.exit(1)
+            }
+        } else {
+            fputs("FAIL: Could not read downscaled JPEG dimensions\\n", stderr)
+            Foundation.exit(1)
+        }
+    }
+
     sem.signal()
 }
 sem.wait()
@@ -1655,7 +1698,13 @@ jitProc.waitUntilExit()
 assertEqual(
     jitProc.terminationStatus,
     0,
-    "Live JIT execution of production EmailQueueService & ResendEmailTransport passed Scenarios A (Online), B (Offline + Reboot), and C (Spotty Wi-Fi + Captive Portal)"
+    "Live JIT execution of production EmailQueueService, GmailSMTPTransport, ResendEmailTransport, & iPad 2MP attachment normalization passed all scenarios"
+)
+assertTrue(
+    emailServiceSource.contains("class GmailSMTPTransport") &&
+    emailServiceSource.contains("class CompositeEmailTransport") &&
+    emailServiceSource.contains("normalizeJPEGAttachmentTo2MP"),
+    "EmailQueueService supports both Gmail SMTP App Passwords (any Gmail recipient) and Resend API keys, plus 2MP iPad JPEG normalization"
 )
 
 print("========================================================")

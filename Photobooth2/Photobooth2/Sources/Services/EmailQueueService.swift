@@ -1,6 +1,9 @@
 import Foundation
 import Combine
 import Network
+import CoreGraphics
+import ImageIO
+import UniformTypeIdentifiers
 
 // MARK: - Email Queue Models & Transport Protocol
 
@@ -61,6 +64,14 @@ nonisolated struct EmailConfirmationCopy: Equatable, Sendable {
     let title: String
     let subtitle: String
     let isOnline: Bool
+    let isConfigured: Bool
+    
+    nonisolated init(title: String, subtitle: String, isOnline: Bool, isConfigured: Bool = true) {
+        self.title = title
+        self.subtitle = subtitle
+        self.isOnline = isOnline
+        self.isConfigured = isConfigured
+    }
 }
 
 protocol EmailTransport: AnyObject, Sendable {
@@ -93,7 +104,7 @@ final class ResendEmailTransport: EmailTransport, @unchecked Sendable {
     nonisolated func sendEmail(_ request: EmailDeliveryRequest) async -> EmailSendOutcome {
         let trimmedKey = request.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedKey.isEmpty else {
-            return .configurationPaused(reason: "Email API Key not configured in Settings")
+            return .configurationPaused(reason: "Email credentials not configured — open Settings > Sharing to enter your Gmail App Password or Resend API Key")
         }
         
         let trimmedFrom = request.from.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -158,7 +169,7 @@ final class ResendEmailTransport: EmailTransport, @unchecked Sendable {
             
             switch statusCode {
             case 401, 403:
-                return .configurationPaused(reason: "Email authentication error (\(statusCode)): \(serverMessage)")
+                return .configurationPaused(reason: "Resend error (\(statusCode)): \(serverMessage)")
             case 408, 425, 429, 500...599:
                 let retryAfterHeader = httpResponse.value(forHTTPHeaderField: "Retry-After")
                 let parsedRetryAfter = retryAfterHeader.flatMap { TimeInterval($0) }
@@ -194,6 +205,387 @@ final class ResendEmailTransport: EmailTransport, @unchecked Sendable {
     }
 }
 
+// MARK: - Production Native Gmail / TLS SMTP Transport (smtp.gmail.com:465)
+
+final class GmailSMTPTransport: EmailTransport, @unchecked Sendable {
+    private nonisolated let host: String
+    private nonisolated let port: UInt16
+    private nonisolated let timeoutSec: TimeInterval
+    
+    nonisolated init(
+        host: String = "smtp.gmail.com",
+        port: UInt16 = 465,
+        timeoutSec: TimeInterval = 35.0
+    ) {
+        self.host = host
+        self.port = port
+        self.timeoutSec = timeoutSec
+    }
+    
+    /// Extracts the bare email address and formatted From header from strings like `"Photobooth <joshal7@gmail.com>"` or `"joshal7@gmail.com"`.
+    nonisolated static func parseSenderAddress(_ rawFrom: String) -> (envelopeEmail: String, formattedHeader: String) {
+        let trimmed = rawFrom.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let openIdx = trimmed.firstIndex(of: "<"),
+           let closeIdx = trimmed.firstIndex(of: ">"),
+           openIdx < closeIdx {
+            let email = String(trimmed[trimmed.index(after: openIdx)..<closeIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (email, trimmed)
+        }
+        if trimmed.contains("@") {
+            return (trimmed, "Photobooth <\(trimmed)>")
+        }
+        return (trimmed, trimmed)
+    }
+    
+    /// Builds an RFC 5322 / MIME `multipart/mixed` message with 76-character Base64 chunks.
+    nonisolated static func buildMIMEMessage(
+        _ request: EmailDeliveryRequest,
+        envelopeSender: String,
+        formattedFromHeader: String
+    ) -> Data {
+        let mixedBoundary = "Boundary_Mixed_\(request.jobID.uuidString.replacingOccurrences(of: "-", with: ""))"
+        let altBoundary = "Boundary_Alt_\(request.jobID.uuidString.replacingOccurrences(of: "-", with: ""))"
+        
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dateFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let rfc2822Date = dateFormatter.string(from: Date())
+        
+        let subjectB64 = Data(request.subject.utf8).base64EncodedString()
+        let plainB64 = Data(request.textBody.utf8).base64EncodedString(options: [.lineLength76Characters, .endLineWithCarriageReturn, .endLineWithLineFeed])
+        let htmlB64 = Data(request.htmlBody.utf8).base64EncodedString(options: [.lineLength76Characters, .endLineWithCarriageReturn, .endLineWithLineFeed])
+        
+        var out = Data()
+        func appendLine(_ line: String) {
+            out.append(contentsOf: line.utf8)
+            out.append(contentsOf: [0x0D, 0x0A]) // \r\n
+        }
+        
+        appendLine("From: \(formattedFromHeader)")
+        appendLine("To: <\(request.to)>")
+        appendLine("Subject: =?UTF-8?B?\(subjectB64)?=")
+        appendLine("Message-ID: <\(request.idempotencyKey)@photobooth.joshal.com>")
+        appendLine("Date: \(rfc2822Date)")
+        appendLine("MIME-Version: 1.0")
+        appendLine("Content-Type: multipart/mixed; boundary=\"\(mixedBoundary)\"")
+        appendLine("")
+        appendLine("--\(mixedBoundary)")
+        appendLine("Content-Type: multipart/alternative; boundary=\"\(altBoundary)\"")
+        appendLine("")
+        appendLine("--\(altBoundary)")
+        appendLine("Content-Type: text/plain; charset=\"UTF-8\"")
+        appendLine("Content-Transfer-Encoding: base64")
+        appendLine("")
+        out.append(contentsOf: plainB64.utf8)
+        out.append(contentsOf: [0x0D, 0x0A])
+        appendLine("--\(altBoundary)")
+        appendLine("Content-Type: text/html; charset=\"UTF-8\"")
+        appendLine("Content-Transfer-Encoding: base64")
+        appendLine("")
+        out.append(contentsOf: htmlB64.utf8)
+        out.append(contentsOf: [0x0D, 0x0A])
+        appendLine("--\(altBoundary)--")
+        
+        for att in request.attachments {
+            let safeName = att.filename.replacingOccurrences(of: "\"", with: "")
+            appendLine("--\(mixedBoundary)")
+            appendLine("Content-Type: \(att.contentType); name=\"\(safeName)\"")
+            appendLine("Content-Disposition: attachment; filename=\"\(safeName)\"")
+            appendLine("Content-Transfer-Encoding: base64")
+            appendLine("")
+            let b64 = att.data.base64EncodedString(options: [.lineLength76Characters, .endLineWithCarriageReturn, .endLineWithLineFeed])
+            out.append(contentsOf: b64.utf8)
+            out.append(contentsOf: [0x0D, 0x0A])
+        }
+        
+        appendLine("--\(mixedBoundary)--")
+        appendLine(".")
+        return out
+    }
+    
+    nonisolated func sendEmail(_ request: EmailDeliveryRequest) async -> EmailSendOutcome {
+        let cleanedPassword = request.apiKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        guard !cleanedPassword.isEmpty else {
+            return .configurationPaused(
+                reason: "Email credentials not configured — open Settings > Sharing to enter your 16-character Gmail App Password or Resend API Key"
+            )
+        }
+        
+        let (envelopeSender, formattedFrom) = Self.parseSenderAddress(request.from)
+        guard EmailQueueService.isValidEmail(envelopeSender) else {
+            return .configurationPaused(
+                reason: "Invalid Sender Address '\(request.from)' — set Sender Address in Settings to your @gmail.com address"
+            )
+        }
+        
+        let mimePayload = autoreleasepool {
+            Self.buildMIMEMessage(request, envelopeSender: envelopeSender, formattedFromHeader: formattedFrom)
+        }
+        
+        let session = SMTPTLSSession(host: host, port: port, timeoutSec: timeoutSec)
+        defer { session.cancel() }
+        
+        do {
+            try await session.connect()
+            
+            // 1. Read 220 Greeting
+            let greeting = try await session.readResponse()
+            guard greeting.code == 220 else {
+                return Self.classifySMTPError(step: "Greeting", response: greeting)
+            }
+            
+            // 2. EHLO
+            try await session.sendLine("EHLO photobooth.local")
+            let ehloResp = try await session.readResponse()
+            guard (200...299).contains(ehloResp.code) else {
+                return Self.classifySMTPError(step: "EHLO", response: ehloResp)
+            }
+            
+            // 3. AUTH PLAIN \0username\0password
+            var authBytes = Data([0x00])
+            authBytes.append(contentsOf: envelopeSender.utf8)
+            authBytes.append(0x00)
+            authBytes.append(contentsOf: cleanedPassword.utf8)
+            let authPlainB64 = authBytes.base64EncodedString()
+            
+            try await session.sendLine("AUTH PLAIN \(authPlainB64)")
+            let authResp = try await session.readResponse()
+            guard authResp.code == 235 else {
+                if authResp.code == 535 || authResp.code == 534 || authResp.code == 530 {
+                    return .configurationPaused(
+                        reason: "Gmail login rejected (\(authResp.code)): Ensure 'Sender Address' is your @gmail.com address and 'App Password / API Key' is a 16-char Google App Password (myaccount.google.com/apppasswords)."
+                    )
+                }
+                return Self.classifySMTPError(step: "AUTH", response: authResp)
+            }
+            
+            // 4. MAIL FROM
+            try await session.sendLine("MAIL FROM:<\(envelopeSender)>")
+            let mailResp = try await session.readResponse()
+            guard (200...299).contains(mailResp.code) else {
+                return Self.classifySMTPError(step: "MAIL FROM", response: mailResp)
+            }
+            
+            // 5. RCPT TO
+            try await session.sendLine("RCPT TO:<\(request.to)>")
+            let rcptResp = try await session.readResponse()
+            guard (200...299).contains(rcptResp.code) else {
+                if rcptResp.code == 550 || rcptResp.code == 553 || rcptResp.code == 501 {
+                    return .permanentRecipientFailure(reason: "Recipient rejected (\(rcptResp.code)): \(rcptResp.message)")
+                }
+                return Self.classifySMTPError(step: "RCPT TO", response: rcptResp)
+            }
+            
+            // 6. DATA command
+            try await session.sendLine("DATA")
+            let dataResp = try await session.readResponse()
+            guard dataResp.code == 354 else {
+                return Self.classifySMTPError(step: "DATA", response: dataResp)
+            }
+            
+            // 7. Stream MIME body + trailing .\r\n
+            try await session.sendRawData(mimePayload)
+            let finalResp = try await session.readResponse()
+            guard (200...299).contains(finalResp.code) else {
+                return Self.classifySMTPError(step: "MIME DATA", response: finalResp)
+            }
+            
+            // 8. Best-effort QUIT
+            try? await session.sendLine("QUIT")
+            return .sent(providerMessageID: "smtp_\(request.jobID.uuidString)")
+        } catch {
+            return .transientFailure(reason: "SMTP network error: \(error.localizedDescription)", retryAfterSec: nil)
+        }
+    }
+    
+    nonisolated private static func classifySMTPError(step: String, response: (code: Int, message: String)) -> EmailSendOutcome {
+        if response.code == 535 || response.code == 534 || response.code == 530 {
+            return .configurationPaused(reason: "SMTP auth error (\(response.code)): \(response.message)")
+        }
+        if (400...499).contains(response.code) {
+            return .transientFailure(reason: "SMTP \(step) transient (\(response.code)): \(response.message)", retryAfterSec: nil)
+        }
+        return .transientFailure(reason: "SMTP \(step) error (\(response.code)): \(response.message)", retryAfterSec: nil)
+    }
+}
+
+/// Thread-safe async TLS socket wrapper around `NWConnection` for SMTP over port 465.
+private nonisolated final class SMTPTLSSession: @unchecked Sendable {
+    private let connection: NWConnection
+    private let queue = DispatchQueue(label: "com.photobooth2.smtpTLSSession", qos: .utility)
+    private let timeoutSec: TimeInterval
+    private var readBuffer = Data()
+    
+    init(host: String, port: UInt16, timeoutSec: TimeInterval) {
+        let nwHost = NWEndpoint.Host(host)
+        let nwPort = NWEndpoint.Port(rawValue: port) ?? .imaps
+        self.connection = NWConnection(host: nwHost, port: nwPort, using: .tls)
+        self.timeoutSec = timeoutSec
+    }
+    
+    func cancel() {
+        connection.cancel()
+    }
+    
+    private nonisolated final class OneShotGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fired = false
+        func tryAcquire() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if fired { return false }
+            fired = true
+            return true
+        }
+    }
+    
+    func connect() async throws {
+        try await withTimeout(seconds: timeoutSec) {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                let gate = OneShotGate()
+                
+                self.connection.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        if gate.tryAcquire() {
+                            cont.resume()
+                        }
+                    case .failed(let err):
+                        if gate.tryAcquire() {
+                            cont.resume(throwing: err)
+                        }
+                    case .cancelled:
+                        if gate.tryAcquire() {
+                            cont.resume(throwing: URLError(.cancelled))
+                        }
+                    default:
+                        break
+                    }
+                }
+                self.connection.start(queue: self.queue)
+            }
+        }
+    }
+    
+    func sendLine(_ line: String) async throws {
+        var data = Data(line.utf8)
+        data.append(contentsOf: [0x0D, 0x0A])
+        try await sendRawData(data)
+    }
+    
+    func sendRawData(_ data: Data) async throws {
+        try await withTimeout(seconds: timeoutSec) {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                self.connection.send(content: data, completion: .contentProcessed { error in
+                    if let error = error {
+                        cont.resume(throwing: error)
+                    } else {
+                        cont.resume()
+                    }
+                })
+            }
+        }
+    }
+    
+    /// Reads a complete single-line or multi-line SMTP response (`XYZ-...` followed by `XYZ ...`).
+    func readResponse() async throws -> (code: Int, message: String) {
+        return try await withTimeout(seconds: timeoutSec) {
+            var collectedLines: [String] = []
+            while true {
+                if let line = self.popNextLineFromBuffer() {
+                    collectedLines.append(line)
+                    if line.count >= 3,
+                       let code = Int(line.prefix(3)) {
+                        let fourthIndex = line.index(line.startIndex, offsetBy: 3)
+                        if line.count == 3 || line[fourthIndex] == " " {
+                            return (code, collectedLines.joined(separator: " | "))
+                        }
+                    }
+                    continue
+                }
+                let chunk = try await self.receiveChunk()
+                if chunk.isEmpty {
+                    throw URLError(.networkConnectionLost)
+                }
+                self.readBuffer.append(chunk)
+            }
+        }
+    }
+    
+    private func popNextLineFromBuffer() -> String? {
+        guard let range = readBuffer.range(of: Data([0x0D, 0x0A])) ?? readBuffer.range(of: Data([0x0A])) else {
+            return nil
+        }
+        let lineData = readBuffer.subdata(in: 0..<range.lowerBound)
+        readBuffer.removeSubrange(0..<range.upperBound)
+        return String(data: lineData, encoding: .utf8) ?? ""
+    }
+    
+    private func receiveChunk() async throws -> Data {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data, Error>) in
+            self.connection.receive(minimumIncompleteLength: 1, maximumLength: 16384) { data, _, isComplete, error in
+                if let error = error {
+                    cont.resume(throwing: error)
+                } else if let data = data, !data.isEmpty {
+                    cont.resume(returning: data)
+                } else if isComplete {
+                    cont.resume(returning: Data())
+                } else {
+                    cont.resume(returning: Data())
+                }
+            }
+        }
+    }
+    
+    private func withTimeout<T: Sendable>(seconds: TimeInterval, operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw URLError(.timedOut)
+            }
+            guard let first = try await group.next() else {
+                throw URLError(.timedOut)
+            }
+            group.cancelAll()
+            return first
+        }
+    }
+}
+
+/// Automatically routes `re_...` API keys to `ResendEmailTransport` and Gmail App Passwords to `GmailSMTPTransport`.
+final class CompositeEmailTransport: EmailTransport, @unchecked Sendable {
+    private nonisolated let resendTransport: ResendEmailTransport
+    private nonisolated let gmailTransport: GmailSMTPTransport
+    
+    nonisolated init(
+        resendTransport: ResendEmailTransport = ResendEmailTransport(),
+        gmailTransport: GmailSMTPTransport = GmailSMTPTransport()
+    ) {
+        self.resendTransport = resendTransport
+        self.gmailTransport = gmailTransport
+    }
+    
+    nonisolated func sendEmail(_ request: EmailDeliveryRequest) async -> EmailSendOutcome {
+        let trimmedKey = request.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else {
+            return .configurationPaused(
+                reason: "Email Sender not configured — open Settings > Sharing to enter your 16-char Gmail App Password or Resend API Key"
+            )
+        }
+        if trimmedKey.lowercased().hasPrefix("re_") {
+            return await resendTransport.sendEmail(request)
+        } else {
+            return await gmailTransport.sendEmail(request)
+        }
+    }
+}
+
 // MARK: - EmailQueueService
 
 final class EmailQueueService: ObservableObject, @unchecked Sendable {
@@ -204,6 +596,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
     @Published private(set) var failedCount: Int = 0
     @Published private(set) var totalSentCount: Int = 0
     @Published private(set) var isNetworkConnected: Bool = false
+    @Published private(set) var isConfigured: Bool = false
     @Published private(set) var lastStatusMessage: String? = nil
     @Published private(set) var queueItems: [EmailQueueItem] = []
     
@@ -213,6 +606,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         let manifestFileURL: URL
         var document: EmailQueueManifestDocument
         var isNetworkConnected: Bool
+        var hasReceivedInitialNetworkReading: Bool = false
         var isFlushing: Bool = false
         var needsFollowUpFlush: Bool = false
         var flushWaiters: [CheckedContinuation<Void, Never>] = []
@@ -258,7 +652,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
     
     nonisolated init(
         customDirectoryURL: URL? = nil,
-        transport: EmailTransport = ResendEmailTransport(),
+        transport: EmailTransport = CompositeEmailTransport(),
         useSystemNetworkMonitor: Bool = true,
         initialNetworkConnected: Bool = false,
         networkDebounceSec: TimeInterval = 2.0,
@@ -316,7 +710,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
             self.pathMonitor = monitor
             self.monitorQueue = queue
             monitor.pathUpdateHandler = { [weak self] path in
-                self?.handleNetworkStatusChange(isConnected: path.status == .satisfied)
+                self?.handleNetworkStatusChange(isConnected: path.status == .satisfied, isSystemMonitorCallback: true)
             }
             monitor.start(queue: queue)
         } else {
@@ -341,7 +735,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         wakeup?.cancel()
     }
     
-    // MARK: - Static Formatting & Validation Helpers
+    // MARK: - Static Formatting, Validation & 2MP Normalization Helpers
     
     nonisolated static func isValidEmail(_ rawEmail: String) -> Bool {
         let trimmed = rawEmail.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -372,6 +766,50 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
             return trimmed
         }
         return "https://\(trimmed)"
+    }
+    
+    /// Ensures any oversized JPEG attachment (e.g. 12MP `4032x2688` from iPad Camera Mode) is downscaled
+    /// to standard 2MP (`1620x1080`) at `0.85` JPEG quality before sending, while leaving already-2MP Sony JPEGs untouched.
+    nonisolated static func normalizeJPEGAttachmentTo2MP(
+        _ data: Data,
+        maxPixelDimension: Int = 1620,
+        compressionQuality: Double = 0.85
+    ) -> Data {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int else {
+            return data
+        }
+        guard max(width, height) > maxPixelDimension else {
+            return data
+        }
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelDimension
+        ]
+        guard let downscaledCG = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else {
+            return data
+        }
+        let mutableData = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            mutableData,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
+        ) else {
+            return data
+        }
+        let encodeProps: [CFString: Any] = [
+            kCGImageDestinationLossyCompressionQuality: compressionQuality
+        ]
+        CGImageDestinationAddImage(dest, downscaledCG, encodeProps as CFDictionary)
+        guard CGImageDestinationFinalize(dest), mutableData.length > 0 else {
+            return data
+        }
+        return mutableData as Data
     }
     
     /// Builds the HTML email body containing the required hyperlinked gallery footer at the bottom.
@@ -405,20 +843,33 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         """
     }
     
-    /// Generates clear, unambiguous confirmation copy distinguishing online vs. offline iPad status.
-    nonisolated static func confirmationMessage(forEmail email: String, isOnline: Bool) -> EmailConfirmationCopy {
+    /// Generates clear, unambiguous confirmation copy distinguishing online vs. offline iPad status (and unconfigured credentials).
+    nonisolated static func confirmationMessage(
+        forEmail email: String,
+        isOnline: Bool,
+        isConfigured: Bool = true
+    ) -> EmailConfirmationCopy {
         let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isOnline {
+        if !isConfigured {
+            return EmailConfirmationCopy(
+                title: "Saved to iPad Queue!",
+                subtitle: "Queued for \(cleanEmail). Open Settings (⚙️) > Sharing and enter your Gmail App Password or Resend API Key to send queued emails.",
+                isOnline: isOnline,
+                isConfigured: false
+            )
+        } else if isOnline {
             return EmailConfirmationCopy(
                 title: "Sending Your Photos!",
                 subtitle: "Your photos & GIF are being emailed to \(cleanEmail) in the background right now.",
-                isOnline: true
+                isOnline: true,
+                isConfigured: true
             )
         } else {
             return EmailConfirmationCopy(
                 title: "Saved for Wi-Fi Delivery!",
                 subtitle: "The iPad is currently offline. You will receive your email at \(cleanEmail) shortly after the iPad connects to Wi-Fi.",
-                isOnline: false
+                isOnline: false,
+                isConfigured: true
             )
         }
     }
@@ -515,10 +966,13 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         let isOnline = storage.isNetworkConnected
         storage.lock.unlock()
         
+        let hasCredentials = checkHasConfiguredCredentials()
         publishStateSnapshot(
-            statusMessage: isOnline
-                ? "Queued email to \(trimmedEmail) — sending in background..."
-                : "Queued email to \(trimmedEmail) — waiting for Wi-Fi connection"
+            statusMessage: !hasCredentials
+                ? "Queued email to \(trimmedEmail) — enter Gmail App Password or Resend API Key in Settings to send"
+                : (isOnline
+                    ? "Queued email to \(trimmedEmail) — sending in background..."
+                    : "Queued email to \(trimmedEmail) — waiting for Wi-Fi connection")
         )
         
         if isOnline {
@@ -531,12 +985,14 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
     // MARK: - Network Connectivity & Spotty Wi-Fi Handling
     
     nonisolated func setSimulatedNetworkConnected(_ connected: Bool) {
-        handleNetworkStatusChange(isConnected: connected)
+        handleNetworkStatusChange(isConnected: connected, isSystemMonitorCallback: false)
     }
     
-    nonisolated private func handleNetworkStatusChange(isConnected: Bool) {
+    nonisolated private func handleNetworkStatusChange(isConnected: Bool, isSystemMonitorCallback: Bool) {
         storage.lock.lock()
         let previous = storage.isNetworkConnected
+        let isInitialReading = isSystemMonitorCallback && !storage.hasReceivedInitialNetworkReading
+        storage.hasReceivedInitialNetworkReading = true
         storage.isNetworkConnected = isConnected
         storage.debounceTask?.cancel()
         storage.debounceTask = nil
@@ -552,7 +1008,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         )
         
         if isConnected {
-            if debounceSec <= 0 {
+            if debounceSec <= 0 || isInitialReading {
                 triggerBackgroundFlush(ignoreBackoff: false)
             } else {
                 let task = Task.detached(priority: .utility) { [weak self] in
@@ -575,6 +1031,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
     // MARK: - Serialized Background Queue Flush & Exponential Backoff
     
     nonisolated func notifyConfigurationUpdated() {
+        publishStateSnapshot()
         storage.lock.lock()
         let isOnline = storage.isNetworkConnected
         let hasPending = storage.document.items.contains { $0.status == .pending }
@@ -680,9 +1137,11 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
                     var loaded: [EmailAttachmentPayload] = []
                     for fname in currentItem.attachmentFilenames {
                         let fileURL = jobDir.appendingPathComponent(fname)
-                        if let data = try? Data(contentsOf: fileURL), !data.isEmpty {
-                            let contentType = fname.lowercased().hasSuffix(".gif") ? "image/gif" : "image/jpeg"
-                            loaded.append(EmailAttachmentPayload(filename: fname, contentType: contentType, data: data))
+                        if let rawData = try? Data(contentsOf: fileURL), !rawData.isEmpty {
+                            let isGIF = fname.lowercased().hasSuffix(".gif")
+                            let contentType = isGIF ? "image/gif" : "image/jpeg"
+                            let finalData = isGIF ? rawData : Self.normalizeJPEGAttachmentTo2MP(rawData)
+                            loaded.append(EmailAttachmentPayload(filename: fname, contentType: contentType, data: finalData))
                         }
                     }
                     return loaded
@@ -815,7 +1274,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         storage.lock.unlock()
     }
     
-    // MARK: - Queue Management & Maintenance
+    // MARK: - Queue Management, Diagnostics & Maintenance
     
     nonisolated func retryFailedAndPendingJobs() async {
         storage.lock.withLock {
@@ -829,6 +1288,50 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         
         publishStateSnapshot(statusMessage: "Retrying queued emails...")
         await flushQueue(ignoreBackoff: true)
+    }
+    
+    /// Sends a live diagnostic test email to verify credentials and network connectivity from Settings.
+    nonisolated func sendDiagnosticTestEmail(to recipientOverride: String? = nil, galleryURLString: String) async -> (success: Bool, message: String) {
+        let fromAddr = resolveFromAddress()
+        let (parsedSenderEmail, _) = GmailSMTPTransport.parseSenderAddress(fromAddr)
+        let targetEmail = (recipientOverride?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? parsedSenderEmail
+        
+        guard Self.isValidEmail(targetEmail) else {
+            let msg = "Enter a valid Sender Address (e.g. your @gmail.com address) in Settings first."
+            publishStateSnapshot(statusMessage: msg)
+            return (false, msg)
+        }
+        
+        publishStateSnapshot(statusMessage: "Sending test email to \(targetEmail)...")
+        let testID = UUID()
+        let req = EmailDeliveryRequest(
+            jobID: testID,
+            idempotencyKey: testID.uuidString,
+            from: fromAddr,
+            to: targetEmail,
+            subject: "Photobooth Test Email",
+            htmlBody: Self.buildEmailHTML(galleryURLString: galleryURLString),
+            textBody: Self.buildEmailPlainText(galleryURLString: galleryURLString),
+            attachments: [],
+            apiKey: resolveAPIKey()
+        )
+        
+        let outcome = await transport.sendEmail(req)
+        switch outcome {
+        case .sent:
+            let msg = "✅ Test email sent to \(targetEmail)!"
+            publishStateSnapshot(statusMessage: msg)
+            // Also flush any pending jobs now that credentials are verified
+            await flushQueue(ignoreBackoff: true)
+            return (true, msg)
+        case .configurationPaused(let reason),
+             .transientFailure(let reason, _),
+             .permanentRecipientFailure(let reason):
+            let msg = "❌ \(reason)"
+            publishStateSnapshot(statusMessage: msg)
+            return (false, msg)
+        }
     }
     
     /// Purges permanently failed jobs older than `maxAgeDays` (default 7 days) and removes any unreferenced job folders.
@@ -887,6 +1390,12 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         return (pending, sending, failed, storage.document.totalSentCount, storage.isNetworkConnected)
     }
     
+    nonisolated func checkHasConfiguredCredentials() -> Bool {
+        let key = resolveAPIKey().trimmingCharacters(in: .whitespacesAndNewlines)
+        let (senderEmail, _) = GmailSMTPTransport.parseSenderAddress(resolveFromAddress())
+        return !key.isEmpty && Self.isValidEmail(senderEmail)
+    }
+    
     // MARK: - Private Helpers
     
     nonisolated private func resolveAPIKey() -> String {
@@ -902,7 +1411,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         let override = storage.fromAddressOverride
         storage.lock.unlock()
         if let override = override { return override }
-        return UserDefaults.standard.string(forKey: "emailFromAddress") ?? "Photobooth <photos@joshal.com>"
+        return UserDefaults.standard.string(forKey: "emailFromAddress") ?? "Photobooth <joshal7@gmail.com>"
     }
     
     nonisolated private func resolveSubject() -> String {
@@ -920,6 +1429,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         let online = storage.isNetworkConnected
         storage.lock.unlock()
         
+        let configured = checkHasConfiguredCredentials()
         let pending = items.filter { $0.status == .pending }.count
         let sending = items.filter { $0.status == .sending }.count
         let failed = items.filter { $0.status == .failedPermanent }.count
@@ -932,6 +1442,7 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
             self.failedCount = failed
             self.totalSentCount = sent
             self.isNetworkConnected = online
+            self.isConfigured = configured
             if let statusMessage = statusMessage {
                 self.lastStatusMessage = statusMessage
             }

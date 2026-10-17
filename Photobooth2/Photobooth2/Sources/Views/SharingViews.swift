@@ -434,11 +434,15 @@ struct EmailSharingView: View {
                 .edgesIgnoringSafeArea(.all)
             
             if let confirmation = confirmationCopy {
-                // Confirmation card shown briefly (~2.2s) while background worker sends or queues the email
+                // Confirmation card shown briefly while background worker sends or queues the email
                 VStack(spacing: 24) {
-                    Image(systemName: confirmation.isOnline ? "paperplane.circle.fill" : "wifi.circle.fill")
-                        .font(.system(size: 84))
-                        .foregroundColor(confirmation.isOnline ? .green : .teal)
+                    Image(
+                        systemName: !confirmation.isConfigured
+                            ? "exclamationmark.triangle.fill"
+                            : (confirmation.isOnline ? "paperplane.circle.fill" : "wifi.circle.fill")
+                    )
+                    .font(.system(size: 84))
+                    .foregroundColor(!confirmation.isConfigured ? .orange : (confirmation.isOnline ? .green : .teal))
                     
                     Text(confirmation.title)
                         .font(.system(size: 40, weight: .bold))
@@ -469,8 +473,21 @@ struct EmailSharingView: View {
                 .transition(.scale.combined(with: .opacity))
             } else {
                 // Email Entry UI positioned cleanly in top portion of screen above the iPad landscape keyboard
-                VStack(spacing: 22) {
+                VStack(spacing: 18) {
                     HStack {
+                        if !emailQueue.isConfigured {
+                            HStack(spacing: 8) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
+                                Text("Setup Needed in Settings (⚙️): Enter Gmail App Password or Resend Key to send queued emails")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundColor(.orange)
+                            }
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 8)
+                            .background(Color.orange.opacity(0.16))
+                            .cornerRadius(12)
+                        }
                         Spacer()
                         Button(action: {
                             cancelAndReturnToSharingPrompt()
@@ -488,7 +505,7 @@ struct EmailSharingView: View {
                         }
                     }
                     .padding(.horizontal, 36)
-                    .padding(.top, 24)
+                    .padding(.top, 20)
                     
                     VStack(spacing: 8) {
                         Text("Email Your Photos & GIF")
@@ -614,6 +631,7 @@ struct EmailSharingView: View {
         inactivityTask = nil
         
         let onlineNow = emailQueue.isNetworkConnected
+        let configuredNow = emailQueue.checkHasConfiguredCredentials()
         
         // Synchronously hard-link / copy session media (< 2ms) before transitioning back to .idle
         _ = EmailQueueService.shared.enqueue(
@@ -625,13 +643,15 @@ struct EmailSharingView: View {
         withAnimation(.easeInOut(duration: 0.2)) {
             confirmationCopy = EmailQueueService.confirmationMessage(
                 forEmail: trimmed,
-                isOnline: onlineNow
+                isOnline: onlineNow,
+                isConfigured: configuredNow
             )
         }
         
+        let autoDismissNs: UInt64 = configuredNow ? 1_500_000_000 : 3_500_000_000
         autoReturnTask?.cancel()
         autoReturnTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            try? await Task.sleep(nanoseconds: autoDismissNs)
             guard !Task.isCancelled else { return }
             finishAndReturnToIdle()
         }

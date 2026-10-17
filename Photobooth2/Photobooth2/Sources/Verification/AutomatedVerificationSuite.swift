@@ -2106,6 +2106,37 @@ enum AutomatedVerificationSuite {
         } else {
             assertTrue(false, "ResendEmailTransport expected .permanentRecipientFailure on HTTP 422, got \(outcome422)")
         }
+        
+        // C8: GmailSMTPTransport MIME Builder & Unconfigured Credential Warning
+        let (parsedEmail, parsedHeader) = GmailSMTPTransport.parseSenderAddress("Photobooth <joshal7@gmail.com>")
+        assertEqual(parsedEmail, "joshal7@gmail.com", "GmailSMTPTransport extracts bare sender email from display header")
+        assertEqual(parsedHeader, "Photobooth <joshal7@gmail.com>", "GmailSMTPTransport preserves display From header")
+        
+        let mimeData = GmailSMTPTransport.buildMIMEMessage(
+            sampleReq,
+            envelopeSender: parsedEmail,
+            formattedFromHeader: parsedHeader
+        )
+        let mimeString = String(data: mimeData, encoding: .utf8) ?? ""
+        assertTrue(
+            mimeString.contains("From: Photobooth <joshal7@gmail.com>\r\n") &&
+            mimeString.contains("To: <guest@joshal.com>\r\n") &&
+            mimeString.contains("Content-Type: multipart/mixed;") &&
+            mimeString.contains("filename=\"photobooth_photo_1.jpg\"") &&
+            mimeString.contains("filename=\"photobooth_animation.gif\"") &&
+            mimeString.hasSuffix("\r\n.\r\n"),
+            "GmailSMTPTransport builds standards-compliant RFC 5322 multipart/mixed MIME payload ending with CRLF.CRLF"
+        )
+        
+        let unconfiguredCopy = EmailQueueService.confirmationMessage(
+            forEmail: "guest@gmail.com",
+            isOnline: true,
+            isConfigured: false
+        )
+        assertTrue(
+            !unconfiguredCopy.isConfigured && unconfiguredCopy.subtitle.lowercased().contains("settings"),
+            "Unconfigured email confirmation explicitly warns user to enter Gmail App Password or Resend Key in Settings"
+        )
     }
 }
 

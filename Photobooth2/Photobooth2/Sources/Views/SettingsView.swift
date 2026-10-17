@@ -333,12 +333,22 @@ struct SettingsView: View {
                         HStack {
                             Text("Sender Address")
                             Spacer()
-                            TextField("Photobooth <photos@joshal.com>", text: $config.emailFromAddress)
+                            TextField("Photobooth <joshal7@gmail.com>", text: $config.emailFromAddress)
                                 .multilineTextAlignment(.trailing)
                                 .autocapitalization(.none)
                                 .disableAutocorrection(true)
                                 .keyboardType(.emailAddress)
-                                .foregroundColor(.gray)
+                                .foregroundColor(.primary)
+                        }
+                        
+                        HStack {
+                            Text("Gmail App Password / API Key")
+                            Spacer()
+                            SecureField("16-char Gmail App Password or re_...", text: $config.emailAPIKey)
+                                .multilineTextAlignment(.trailing)
+                                .autocapitalization(.none)
+                                .disableAutocorrection(true)
+                                .foregroundColor(.primary)
                         }
                         
                         HStack {
@@ -346,17 +356,26 @@ struct SettingsView: View {
                             Spacer()
                             TextField("Your Photobooth Photos & GIF!", text: $config.emailSubject)
                                 .multilineTextAlignment(.trailing)
-                                .foregroundColor(.gray)
+                                .foregroundColor(.secondary)
                         }
                         
                         HStack {
-                            Text("Resend API Key")
+                            Text("Sender Setup Status")
                             Spacer()
-                            SecureField("re_...", text: $config.emailAPIKey)
-                                .multilineTextAlignment(.trailing)
-                                .autocapitalization(.none)
-                                .disableAutocorrection(true)
-                                .foregroundColor(.gray)
+                            let trimmedKey = config.emailAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if trimmedKey.isEmpty {
+                                Text("⚠️ Enter Gmail App Password or Resend Key above")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundColor(.orange)
+                            } else if trimmedKey.lowercased().hasPrefix("re_") {
+                                Text("Ready (Resend HTTPS API)")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundColor(.green)
+                            } else {
+                                Text("Ready (Gmail SMTP over TLS)")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundColor(.green)
+                            }
                         }
                         
                         HStack {
@@ -381,8 +400,32 @@ struct SettingsView: View {
                         
                         if let statusMsg = emailQueue.lastStatusMessage, !statusMsg.isEmpty {
                             Text(statusMsg)
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                                .font(.caption)
+                                .foregroundColor(
+                                    statusMsg.hasPrefix("❌") || statusMsg.lowercased().contains("error") || statusMsg.lowercased().contains("not configured") || statusMsg.lowercased().contains("rejected")
+                                        ? .orange
+                                        : .secondary
+                                )
+                        }
+                        
+                        Text("Tip: To send from Gmail to any recipient for free with zero DNS setup, visit myaccount.google.com/apppasswords, create a 16-character App Password, and paste it into 'Gmail App Password / API Key' above.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        
+                        Button(action: {
+                            Task {
+                                let (_, msg) = await emailQueue.sendDiagnosticTestEmail(
+                                    galleryURLString: config.qrCodeURLString
+                                )
+                                await MainActor.run {
+                                    statusAlertMessage = msg
+                                }
+                            }
+                        }) {
+                            HStack {
+                                Image(systemName: "checkmark.seal.fill")
+                                Text("Send Test Email & Flush Queue")
+                            }
                         }
                         
                         if emailQueue.pendingCount > 0 || emailQueue.failedCount > 0 {
