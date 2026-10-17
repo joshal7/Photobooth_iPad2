@@ -4,6 +4,7 @@ import Combine
 import UIKit
 import CoreImage
 import ImageIO
+import UniformTypeIdentifiers
 
 /// Automated Tier 2 & Tier 3 Verification Suite executed when `--verify` is passed on launch.
 enum AutomatedVerificationSuite {
