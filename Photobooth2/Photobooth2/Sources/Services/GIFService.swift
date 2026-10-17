@@ -34,13 +34,15 @@ final class GIFService: Sendable {
     ) -> URL? {
         let fileProperties: [String: Any] = [
             kCGImagePropertyGIFDictionary as String: [
-                kCGImagePropertyGIFLoopCount as String: 0 // 0 = infinite loop
+                kCGImagePropertyGIFLoopCount as String: 0, // 0 = infinite loop
+                kCGImagePropertyGIFHasGlobalColorMap as String: true
             ]
         ]
         
         let frameProperties: [String: Any] = [
             kCGImagePropertyGIFDictionary as String: [
-                kCGImagePropertyGIFDelayTime as String: frameDuration
+                kCGImagePropertyGIFDelayTime as String: frameDuration,
+                kCGImagePropertyGIFUnclampedDelayTime as String: frameDuration
             ]
         ]
         
@@ -166,7 +168,8 @@ final class GIFService: Sendable {
                 finalCG = equalizedSubjectCG
             }
             
-            CGImageDestinationAddImage(destination, finalCG, frameProperties as CFDictionary)
+            let opaqueFinalCG = makeOpaqueRGBCGImage(finalCG)
+            CGImageDestinationAddImage(destination, opaqueFinalCG, frameProperties as CFDictionary)
         }
         
         if CGImageDestinationFinalize(destination) {
@@ -176,5 +179,32 @@ final class GIFService: Sendable {
             print("Failed to finalize GIF")
             return nil
         }
+    }
+    
+    /// Ensures a CGImage uses an opaque RGB bitmap layout (`noneSkipLast`) without an active alpha channel
+    /// so ImageIO's GIF89a encoder does not allocate a transparent palette index or mark frames `HasAlpha = 1`.
+    nonisolated static func makeOpaqueRGBCGImage(_ image: CGImage) -> CGImage {
+        let alphaInfo = image.alphaInfo
+        if alphaInfo == .none || alphaInfo == .noneSkipLast || alphaInfo == .noneSkipFirst {
+            return image
+        }
+        let width = image.width
+        let height = image.height
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        guard let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else {
+            return image
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage() ?? image
     }
 }

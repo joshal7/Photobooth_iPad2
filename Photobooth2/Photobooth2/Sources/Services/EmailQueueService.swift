@@ -812,6 +812,114 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         return mutableData as Data
     }
     
+    /// Normalizes animated GIF attachments for email delivery (`960x640` at 3:2 landscape, opaque RGB frames,
+    /// explicit `DelayTime` + `UnclampedDelayTime`, global color table, and infinite loop `LoopCount = 0`).
+    /// This prevents mobile email attachment proxies (Gmail iOS) and iOS `PHAnimatedImage` / Photos from
+    /// flattening oversized (`1620x1080`) multi-megabyte GIFs into a static first-frame image on iPhone,
+    /// while preserving inline email animation, Google Photos upload, and Mac download.
+    nonisolated static func normalizeGIFAttachmentForEmail(
+        _ data: Data,
+        maxPixelDimension: Int = 960
+    ) -> Data {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return data
+        }
+        let frameCount = CGImageSourceGetCount(source)
+        guard frameCount > 1,
+              let firstProps = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let srcWidth = firstProps[kCGImagePropertyPixelWidth] as? Int,
+              let srcHeight = firstProps[kCGImagePropertyPixelHeight] as? Int,
+              srcWidth > 0, srcHeight > 0 else {
+            return data
+        }
+        
+        let maxSrcDim = max(srcWidth, srcHeight)
+        let containerProps = CGImageSourceCopyProperties(source, nil) as? [CFString: Any]
+        let containerGIFDict = containerProps?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+        let loopCount = containerGIFDict?[kCGImagePropertyGIFLoopCount] as? Int
+        let hasGlobalMap = (containerGIFDict?[kCGImagePropertyGIFHasGlobalColorMap] as? Bool) ?? false
+        let firstFrameGIFDict = firstProps[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+        let hasUnclampedDelay = (firstFrameGIFDict?[kCGImagePropertyGIFUnclampedDelayTime] as? Double) != nil
+        if maxSrcDim <= maxPixelDimension && loopCount == 0 && hasGlobalMap && hasUnclampedDelay {
+            return data
+        }
+        
+        let scale: Double = maxSrcDim > maxPixelDimension
+            ? Double(maxPixelDimension) / Double(maxSrcDim)
+            : 1.0
+        let dstWidth = max(1, Int((Double(srcWidth) * scale).rounded()))
+        let dstHeight = max(1, Int((Double(srcHeight) * scale).rounded()))
+        
+        let mutableData = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            mutableData,
+            UTType.gif.identifier as CFString,
+            frameCount,
+            nil
+        ) else {
+            return data
+        }
+        
+        let fileProperties: [String: Any] = [
+            kCGImagePropertyGIFDictionary as String: [
+                kCGImagePropertyGIFLoopCount as String: 0,
+                kCGImagePropertyGIFHasGlobalColorMap as String: true
+            ]
+        ]
+        CGImageDestinationSetProperties(dest, fileProperties as CFDictionary)
+        
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        
+        var encodedFrames = 0
+        for index in 0..<frameCount {
+            guard let frameCG = CGImageSourceCreateImageAtIndex(source, index, nil) else {
+                continue
+            }
+            
+            var delayTime: Double = 0.5
+            if let frameProps = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+               let gifDict = frameProps[kCGImagePropertyGIFDictionary] as? [CFString: Any] {
+                if let unclamped = gifDict[kCGImagePropertyGIFUnclampedDelayTime] as? Double, unclamped > 0.01 {
+                    delayTime = unclamped
+                } else if let clamped = gifDict[kCGImagePropertyGIFDelayTime] as? Double, clamped > 0.01 {
+                    delayTime = clamped
+                }
+            }
+            
+            guard let ctx = CGContext(
+                data: nil,
+                width: dstWidth,
+                height: dstHeight,
+                bitsPerComponent: 8,
+                bytesPerRow: dstWidth * 4,
+                space: colorSpace,
+                bitmapInfo: bitmapInfo
+            ) else {
+                continue
+            }
+            ctx.interpolationQuality = .high
+            ctx.draw(frameCG, in: CGRect(x: 0, y: 0, width: dstWidth, height: dstHeight))
+            guard let scaledOpaqueCG = ctx.makeImage() else {
+                continue
+            }
+            
+            let frameProperties: [String: Any] = [
+                kCGImagePropertyGIFDictionary as String: [
+                    kCGImagePropertyGIFDelayTime as String: delayTime,
+                    kCGImagePropertyGIFUnclampedDelayTime as String: delayTime
+                ]
+            ]
+            CGImageDestinationAddImage(dest, scaledOpaqueCG, frameProperties as CFDictionary)
+            encodedFrames += 1
+        }
+        
+        guard encodedFrames > 1, CGImageDestinationFinalize(dest), mutableData.length > 0 else {
+            return data
+        }
+        return mutableData as Data
+    }
+    
     /// Returns the descriptive sentence matching the media captured in the session:
     /// - Photos: "Your photos from your session are attached to this email."
     /// - GIF: "Your gif from your session are attached to this email."
@@ -919,6 +1027,20 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
                 isConfigured: true
             )
         }
+    }
+    
+    /// Returns the display duration in nanoseconds for the post-email confirmation screen before returning to idle:
+    /// - Online ("Sending Your Photos/GIF!"): 1.5s (`1_500_000_000` ns)
+    /// - Offline ("Saved for Wi-Fi Delivery!"): 2.5s (`2_500_000_000` ns, +1 second so guests can read the Wi-Fi details)
+    /// - Unconfigured credentials: 3.5s (`3_500_000_000` ns)
+    nonisolated static func postSubmitDismissDurationNanoseconds(
+        isOnline: Bool,
+        isConfigured: Bool = true
+    ) -> UInt64 {
+        if !isConfigured {
+            return 3_500_000_000
+        }
+        return isOnline ? 1_500_000_000 : 2_500_000_000
     }
     
     // MARK: - Enqueue (Zero Main-Thread Delay via APFS Hard-Link)
@@ -1187,7 +1309,9 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
                         if let rawData = try? Data(contentsOf: fileURL), !rawData.isEmpty {
                             let isGIF = fname.lowercased().hasSuffix(".gif")
                             let contentType = isGIF ? "image/gif" : "image/jpeg"
-                            let finalData = isGIF ? rawData : Self.normalizeJPEGAttachmentTo2MP(rawData)
+                            let finalData = isGIF
+                                ? Self.normalizeGIFAttachmentForEmail(rawData)
+                                : Self.normalizeJPEGAttachmentTo2MP(rawData)
                             loaded.append(EmailAttachmentPayload(filename: fname, contentType: contentType, data: finalData))
                         }
                     }

@@ -665,7 +665,10 @@ struct EmailSharingView: View {
             )
         }
         
-        let autoDismissNs: UInt64 = configuredNow ? 1_500_000_000 : 3_500_000_000
+        let autoDismissNs = EmailQueueService.postSubmitDismissDurationNanoseconds(
+            isOnline: onlineNow,
+            isConfigured: configuredNow
+        )
         autoReturnTask?.cancel()
         autoReturnTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: autoDismissNs)

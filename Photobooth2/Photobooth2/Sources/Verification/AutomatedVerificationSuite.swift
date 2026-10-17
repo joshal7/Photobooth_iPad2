@@ -2166,6 +2166,59 @@ enum AutomatedVerificationSuite {
             !unconfiguredCopy.isConfigured && unconfiguredCopy.subtitle.lowercased().contains("settings"),
             "Unconfigured email confirmation explicitly warns user to enter Gmail App Password or Resend Key in Settings"
         )
+        
+        // C9: Post-email confirmation screen timing (1.5s online vs 2.5s offline +1s)
+        assertEqual(
+            EmailQueueService.postSubmitDismissDurationNanoseconds(isOnline: true, isConfigured: true),
+            1_500_000_000,
+            "Post-email confirmation screen stays at 1.5s when online ('Sending now')"
+        )
+        assertEqual(
+            EmailQueueService.postSubmitDismissDurationNanoseconds(isOnline: false, isConfigured: true),
+            2_500_000_000,
+            "Post-email confirmation screen adds 1s (2.5s total) when offline ('Saved for Wi-Fi Delivery')"
+        )
+        
+        // C10: Animated GIF email normalization (1620x1080 -> 960x640 opaque RGB multi-frame GIF89a for iPhone Gmail preview/download)
+        let rawFourFrameGIFData: Data? = {
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+            let buf = NSMutableData()
+            guard let dest = CGImageDestinationCreateWithData(buf, UTType.gif.identifier as CFString, 4, nil) else { return nil }
+            CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFLoopCount as String: 0]] as CFDictionary)
+            for idx in 0..<4 {
+                guard let ctx = CGContext(data: nil, width: 1620, height: 1080, bitsPerComponent: 8, bytesPerRow: 1620 * 4, space: colorSpace, bitmapInfo: bitmapInfo) else { return nil }
+                ctx.setFillColor(red: CGFloat(idx) * 0.25, green: 0.4, blue: 0.8, alpha: 1.0)
+                ctx.fill(CGRect(x: 0, y: 0, width: 1620, height: 1080))
+                guard let cg = ctx.makeImage() else { return nil }
+                CGImageDestinationAddImage(dest, cg, [kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFDelayTime as String: 0.45]] as CFDictionary)
+            }
+            guard CGImageDestinationFinalize(dest) else { return nil }
+            return buf as Data
+        }()
+        if let rawGIF = rawFourFrameGIFData {
+            let normalizedGIF = EmailQueueService.normalizeGIFAttachmentForEmail(rawGIF)
+            if let gifSrc = CGImageSourceCreateWithData(normalizedGIF as CFData, nil) {
+                let count = CGImageSourceGetCount(gifSrc)
+                assertEqual(count, 4, "Normalized email GIF preserves all 4 animated frames")
+                let f0Props = CGImageSourceCopyPropertiesAtIndex(gifSrc, 0, nil) as? [CFString: Any]
+                let w = f0Props?[kCGImagePropertyPixelWidth] as? Int ?? 0
+                let h = f0Props?[kCGImagePropertyPixelHeight] as? Int ?? 0
+                let gifDict = f0Props?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+                let unclamped = gifDict?[kCGImagePropertyGIFUnclampedDelayTime] as? Double ?? 0
+                let containerProps = CGImageSourceCopyProperties(gifSrc, nil) as? [CFString: Any]
+                let containerGIF = containerProps?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+                let loopCount = containerGIF?[kCGImagePropertyGIFLoopCount] as? Int ?? -1
+                let hasGlobalMap = containerGIF?[kCGImagePropertyGIFHasGlobalColorMap] as? Bool ?? false
+                assertEqual(w, 960, "Normalized email GIF width is 960px (< 1000px mobile proxy threshold)")
+                assertEqual(h, 640, "Normalized email GIF height is 640px (exact 3:2 landscape)")
+                assertEqual(loopCount, 0, "Normalized email GIF preserves infinite LoopCount = 0")
+                assertTrue(hasGlobalMap, "Normalized email GIF sets HasGlobalColorMap = true")
+                assertTrue(abs(unclamped - 0.45) < 0.02, "Normalized email GIF frame preserves UnclampedDelayTime (0.45s)")
+            } else {
+                assertTrue(false, "Normalized email GIF data must be a valid CGImageSource")
+            }
+        }
     }
 }
 
