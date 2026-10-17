@@ -36,6 +36,26 @@ class ConfigManager: ObservableObject {
     @Published var defaultBackdropID: String { didSet { save() } }
     @Published var persistentBackdropSelection: Bool { didSet { save() } }
 
+    // Email Sharing Configuration
+    @Published var isEmailSharingEnabled: Bool { didSet { save() } }
+    @Published var emailAPIKey: String {
+        didSet {
+            save()
+            if !emailAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                EmailQueueService.shared.notifyConfigurationUpdated()
+            }
+        }
+    }
+    @Published var emailFromAddress: String {
+        didSet {
+            save()
+            if !emailFromAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                EmailQueueService.shared.notifyConfigurationUpdated()
+            }
+        }
+    }
+    @Published var emailSubject: String { didSet { save() } }
+
     private init() {
         self.initialCountdownSec = UserDefaults.standard.object(forKey: "initialCountdownSec") as? Int ?? 5
         self.interShotCountdownSec = UserDefaults.standard.object(forKey: "interShotCountdownSec") as? Int ?? 3
@@ -63,6 +83,12 @@ class ConfigManager: ObservableObject {
         self.daysUntilPhotosAvailable = UserDefaults.standard.object(forKey: "daysUntilPhotosAvailable") as? Int ?? 2
         self.defaultBackdropID = UserDefaults.standard.string(forKey: "defaultBackdropID") ?? BackdropItem.noneID
         self.persistentBackdropSelection = UserDefaults.standard.object(forKey: "persistentBackdropSelection") as? Bool ?? false
+
+        // Email Sharing Defaults (Enabled by default)
+        self.isEmailSharingEnabled = UserDefaults.standard.object(forKey: "isEmailSharingEnabled") as? Bool ?? true
+        self.emailAPIKey = UserDefaults.standard.string(forKey: "emailAPIKey") ?? ""
+        self.emailFromAddress = UserDefaults.standard.string(forKey: "emailFromAddress") ?? "Photobooth <photos@joshal.com>"
+        self.emailSubject = UserDefaults.standard.string(forKey: "emailSubject") ?? "Your Photobooth Photos & GIF!"
     }
     
     func save() {
@@ -88,6 +114,11 @@ class ConfigManager: ObservableObject {
         UserDefaults.standard.set(daysUntilPhotosAvailable, forKey: "daysUntilPhotosAvailable")
         UserDefaults.standard.set(defaultBackdropID, forKey: "defaultBackdropID")
         UserDefaults.standard.set(persistentBackdropSelection, forKey: "persistentBackdropSelection")
+
+        UserDefaults.standard.set(isEmailSharingEnabled, forKey: "isEmailSharingEnabled")
+        UserDefaults.standard.set(emailAPIKey, forKey: "emailAPIKey")
+        UserDefaults.standard.set(emailFromAddress, forKey: "emailFromAddress")
+        UserDefaults.standard.set(emailSubject, forKey: "emailSubject")
     }
     
     func resetToDefaults() {
@@ -114,6 +145,10 @@ class ConfigManager: ObservableObject {
         self.daysUntilPhotosAvailable = 2
         self.defaultBackdropID = BackdropItem.noneID
         self.persistentBackdropSelection = false
+
+        self.isEmailSharingEnabled = true
+        self.emailFromAddress = "Photobooth <photos@joshal.com>"
+        self.emailSubject = "Your Photobooth Photos & GIF!"
         save()
     }
 }

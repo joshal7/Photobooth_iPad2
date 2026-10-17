@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>Workouts — joshal.com</title>
+  <meta name="description" content="Minimalist HIIT & Strength Workout Generator PWA with multi-frame exercise diagrams and smart muscle balancing." />
+  
+  <!-- iOS PWA Meta Tags -->
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Workouts" />
+  <meta name="theme-color" content="#0a0a0c" />
+
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="./diagrams/app-icon.svg" />
+  <link rel="apple-touch-icon" href="./diagrams/app-icon.svg" />
+  <link rel="stylesheet" href="./src/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Minimalist Top Navigation -->
+    <header class="top-nav">
+      <div class="brand-group">
+        <h1 class="brand-title">Workouts</h1>
+        <span class="excluded-pill" id="excludedCountBadge" hidden>0 Excluded</span>
+      </div>
+
+      <div class="nav-actions">
+        <button id="profileBtn" class="pill-btn profile-btn" type="button" aria-label="Switch user profile or settings">
+          <span class="profile-avatar" id="activeProfileAvatar">J</span>
+          <span id="activeProfileName">Josh</span>
+          <span class="OptionBadge" id="activeProfileOptionBadge">1x</span>
+        </button>
+        <button id="settingsBtn" class="icon-btn" type="button" aria-label="User Settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="4" y1="21" x2="4" y2="14"></line>
+            <line x1="4" y1="10" x2="4" y2="3"></line>
+            <line x1="12" y1="21" x2="12" y2="12"></line>
+            <line x1="12" y1="8" x2="12" y2="3"></line>
+            <line x1="20" y1="21" x2="20" y2="16"></line>
+            <line x1="20" y1="12" x2="20" y2="3"></line>
+            <line x1="1" y1="14" x2="7" y2="14"></line>
+            <line x1="9" y1="8" x2="15" y2="8"></line>
+            <line x1="17" y1="16" x2="23" y2="16"></line>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="main-content">
+      <!-- Generator Inputs Card -->
+      <section class="card inputs-card" aria-label="Workout Generator Inputs">
+        <div class="inputs-grid">
+          <div class="input-row">
+            <label for="workoutCategorySelect">Category</label>
+            <div class="select-wrapper">
+              <select id="workoutCategorySelect">
+                <option value="HIIT">HIIT</option>
+                <option value="Strength">Strength</option>
+                <option value="Either">Either</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="input-row">
+            <label for="bodyCategorySelect">Focus</label>
+            <div class="select-wrapper">
+              <select id="bodyCategorySelect">
+                <option value="All">All (Balanced)</option>
+                <option value="Upper Body">Upper Body</option>
+                <option value="Core">Core</option>
+                <option value="Legs">Legs</option>
+                <option value="Upper Body and Core">Upper Body &amp; Core</option>
+                <option value="Legs and Core">Legs &amp; Core</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="input-row">
+            <label for="equipmentSelect">Equipment</label>
+            <div class="select-wrapper">
+              <select id="equipmentSelect">
+                <option value="Any">Any</option>
+                <option value="Weights">Weights</option>
+                <option value="Bands">Bands</option>
+                <option value="Nothing">Nothing (Bodyweight)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="input-row">
+            <label for="workoutTypeSelect">Workout Type</label>
+            <div class="select-wrapper">
+              <select id="workoutTypeSelect">
+                <option value="Random">Random</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="generate-btn-row">
+          <button id="generateWorkoutBtn" class="generate-btn" type="button">
+            Generate Workout
+          </button>
+        </div>
+      </section>
+
+      <!-- Active Workout Section -->
+      <section id="workoutSection" class="workout-section" aria-live="polite">
+        <!-- Workout Header (Tap Workout Type Name Directly for Format Guide) -->
+        <div class="card workout-header-card">
+          <div class="workout-title-row">
+            <div class="workout-heading-group">
+              <span class="eyebrow-label">WORKOUT TYPE</span>
+              <button id="workoutTitleBtn" class="workout-title-btn" type="button" title="Tap workout type for format details">
+                <span id="workoutNameText">Timed Trios (40/20)</span>
+              </button>
+            </div>
+            <button id="copySummaryBtn" class="secondary-pill-btn" type="button" title="Copy Workout Summary text">
+              Copy
+            </button>
+          </div>
+
+          <!-- Minimalist Meta Summary Line -->
+          <div class="workout-meta-pills" id="workoutMetaPills"></div>
+
+          <!-- Sheet Comments (if present) -->
+          <div id="workoutCommentsBox" class="workout-comments-box" hidden></div>
+        </div>
+
+        <!-- Hidden Legacy Muscle Load Summary Container (kept for DOM compatibility) -->
+        <div id="muscleLoadSummaryBar" class="muscle-summary-bar" hidden></div>
+
+        <!-- Dynamic Rounds Container -->
+        <div id="roundsContainer" class="rounds-container"></div>
+
+        <!-- Spreadsheet Parity Summary & Details Accordion -->
+        <details class="card sheet-details-card" id="sheetDetailsAccordion">
+          <summary class="sheet-details-summary">
+            <span>Spreadsheet Summary</span>
+            <span class="chevron">▾</span>
+          </summary>
+          <div class="sheet-details-body">
+            <div class="sheet-table">
+              <div class="sheet-row">
+                <div class="sheet-cell-label">Workout</div>
+                <div class="sheet-cell-val" id="sheetWorkoutNameCell"></div>
+              </div>
+              <div class="sheet-row">
+                <div class="sheet-cell-label">Exercises</div>
+                <pre class="sheet-cell-val mono-pre" id="sheetExercisesCell"></pre>
+              </div>
+              <div class="sheet-row">
+                <div class="sheet-cell-label">Details</div>
+                <pre class="sheet-cell-val mono-pre" id="sheetWorkoutInfoCell"></pre>
+              </div>
+              <div class="sheet-row">
+                <div class="sheet-cell-label">Notes</div>
+                <div class="sheet-cell-val" id="sheetWorkoutCommentsCell"></div>
+              </div>
+            </div>
+          </div>
+        </details>
+      </section>
+    </main>
+
+    <!-- Bottom Sheet Modal Backdrop -->
+    <div id="modalBackdrop" class="modal-backdrop" hidden></div>
+
+    <!-- 1. Exercise Memory Refresher Modal (Description + Pre-Generated Multi-Frame Diagram) -->
+    <div id="exerciseModal" class="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="exerciseModalTitle" hidden>
+      <div class="sheet-handle"></div>
+      <div class="sheet-header">
+        <div>
+          <span class="eyebrow-label" id="exerciseModalCategory">EXERCISE</span>
+          <h2 id="exerciseModalTitle" class="sheet-title">Exercise Name</h2>
+        </div>
+        <button class="close-sheet-btn" data-close-modal="exerciseModal" type="button" aria-label="Close">✕</button>
+      </div>
+      <div class="sheet-content">
+        <div class="diagram-container">
+          <img id="exerciseModalDiagram" src="" alt="Exercise movement and muscle diagram" class="exercise-diagram-img" />
+        </div>
+        <div id="exerciseModalBadges" class="badge-row"></div>
+        <p id="exerciseModalSummary" class="modal-lead"></p>
+
+        <div class="modal-section">
+          <h3>Instructions</h3>
+          <ol id="exerciseModalSteps" class="steps-list"></ol>
+        </div>
+
+        <div class="form-tip-box" id="exerciseModalTipBox">
+          <strong>Form Cue:</strong> <span id="exerciseModalTip"></span>
+        </div>
+
+        <div class="audit-note-box" id="exerciseModalAuditBox" hidden>
+          <strong>Muscle Note:</strong> <span id="exerciseModalAuditNote"></span>
+        </div>
+
+        <div class="sheet-footer-actions" id="exerciseModalFooterActions">
+          <button id="openSwapFromExerciseModalBtn" class="primary-action-btn" type="button">
+            Swap Exercise
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. Workout Type Memory Refresher Modal -->
+    <div id="workoutTypeModal" class="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="workoutTypeModalTitle" hidden>
+      <div class="sheet-handle"></div>
+      <div class="sheet-header">
+        <div>
+          <span class="eyebrow-label" id="workoutTypeModalCategory">WORKOUT FORMAT</span>
+          <h2 id="workoutTypeModalTitle" class="sheet-title">Workout Type</h2>
+        </div>
+        <button class="close-sheet-btn" data-close-modal="workoutTypeModal" type="button" aria-label="Close">✕</button>
+      </div>
+      <div class="sheet-content">
+        <div id="workoutTypeModalPills" class="workout-meta-pills"></div>
+        <p id="workoutTypeModalSummary" class="modal-lead"></p>
+
+        <div id="workoutTypeSheetCommentsBox" class="workout-comments-box" hidden></div>
+
+        <div class="modal-section">
+          <h3>How It Works</h3>
+          <ol id="workoutTypeModalSteps" class="steps-list"></ol>
+        </div>
+
+        <div class="form-tip-box">
+          <strong>Structure:</strong> <span id="workoutTypeModalTimer"></span>
+        </div>
+
+        <div class="form-tip-box tip-secondary">
+          <strong>Pacing:</strong> <span id="workoutTypeModalPacing"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. Exercise Swap Dropdown / Picker Sheet -->
+    <div id="swapModal" class="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="swapModalTitle" hidden>
+      <div class="sheet-handle"></div>
+      <div class="sheet-header">
+        <div>
+          <span class="eyebrow-label" id="swapModalSlotLabel">ROUND 1 • EXERCISE 1</span>
+          <h2 id="swapModalTitle" class="sheet-title">Swap Exercise</h2>
+        </div>
+        <button class="close-sheet-btn" data-close-modal="swapModal" type="button" aria-label="Close">✕</button>
+      </div>
+      <div class="sheet-content">
+        <div class="swap-controls">
+          <button id="randomSwapBtn" class="random-swap-btn" type="button">
+            Pick Random Valid Replacement
+          </button>
+
+          <div class="search-and-toggle">
+            <input id="swapSearchInput" type="search" placeholder="Search exercises or muscles..." class="search-input" />
+            <div class="segmented-control" role="tablist">
+              <button id="swapFilterMatchingBtn" class="seg-btn active" type="button">Matching Filters</button>
+              <button id="swapFilterAllBtn" class="seg-btn" type="button">All Exercises</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="swapExerciseList" class="swap-exercise-list"></div>
+      </div>
+    </div>
+
+    <!-- 4. Muscle Overload Balance Recommendations Modal -->
+    <div id="balanceModal" class="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="balanceModalTitle" hidden>
+      <div class="sheet-handle"></div>
+      <div class="sheet-header">
+        <div>
+          <span class="eyebrow-label warning-eyebrow">MUSCLE LOAD BALANCER</span>
+          <h2 id="balanceModalTitle" class="sheet-title">Recommended Alternatives</h2>
+        </div>
+        <button class="close-sheet-btn" data-close-modal="balanceModal" type="button" aria-label="Close">✕</button>
+      </div>
+      <div class="sheet-content">
+        <p id="balanceModalDescription" class="modal-lead"></p>
+        <div id="balanceRecommendationsList" class="swap-exercise-list"></div>
+      </div>
+    </div>
+
+    <!-- 5. Per-User Profile & Settings Modal -->
+    <div id="settingsModal" class="bottom-sheet" role="dialog" aria-modal="true" aria-labelledby="settingsModalTitle" hidden>
+      <div class="sheet-handle"></div>
+      <div class="sheet-header">
+        <div>
+          <span class="eyebrow-label">PREFERENCES</span>
+          <h2 id="settingsModalTitle" class="sheet-title">Settings</h2>
+        </div>
+        <button class="close-sheet-btn" data-close-modal="settingsModal" type="button" aria-label="Close">✕</button>
+      </div>
+      <div class="sheet-content">
+        <!-- User Profile Switcher -->
+        <div class="settings-block">
+          <h3>Profile</h3>
+          <p class="settings-help">Each profile saves its own excluded exercises, options per slot, and active workout.</p>
+          <div id="profileListContainer" class="profile-chips-row"></div>
+          <div class="new-profile-row">
+            <input id="newProfileNameInput" type="text" placeholder="New profile name..." class="search-input" />
+            <button id="addProfileBtn" class="secondary-pill-btn" type="button">Add</button>
+          </div>
+        </div>
+
+        <!-- Multi-Option Exercise Slots Setting (1, 2, or 3 exercises per slide) -->
+        <div class="settings-block">
+          <h3>Options per Exercise Slot</h3>
+          <p class="settings-help">Provide 1 single exercise or 2–3 balanced options per slot.</p>
+          <div class="segmented-control options-per-slot-control">
+            <button class="seg-btn" data-options-count="1" type="button">1 Option</button>
+            <button class="seg-btn" data-options-count="2" type="button">2 Options</button>
+            <button class="seg-btn" data-options-count="3" type="button">3 Options</button>
+          </div>
+        </div>
+
+        <!-- Exercise Exclusion List -->
+        <div class="settings-block">
+          <div class="exclusion-header-row">
+            <h3>Exercise Exclusion List</h3>
+            <button id="clearExclusionsBtn" class="text-link-btn" type="button">Include All</button>
+          </div>
+          <p class="settings-help">Uncheck exercises to exclude them for <strong id="exclusionUserNameLabel">Josh</strong>.</p>
+          <input id="exclusionSearchInput" type="search" placeholder="Filter exercises..." class="search-input" />
+          <div id="exclusionChecklist" class="exclusion-checklist"></div>
+        </div>
+
+        <div class="settings-block qa-link-block">
+          <a href="./qa-gallery.html" class="secondary-pill-btn full-width-link">
+            View All 68 Exercise Diagrams →
+          </a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast" hidden>Copied to clipboard</div>
+  </div>
+
+  <script type="module" src="./src/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,964 @@
+import Foundation
+import Combine
+import Network
+
+// MARK: - Email Queue Models & Transport Protocol
+
+nonisolated enum EmailJobStatus: String, Codable, Equatable, Sendable {
+    case pending
+    case sending
+    case failedPermanent
+}
+
+nonisolated struct EmailQueueItem: Codable, Identifiable, Equatable, Sendable {
+    let id: UUID
+    let recipientEmail: String
+    let galleryURLString: String
+    let subject: String
+    let attachmentFilenames: [String]
+    let createdAt: Date
+    var status: EmailJobStatus
+    var attemptCount: Int
+    var nextAttemptAt: Date
+    var lastError: String?
+}
+
+nonisolated struct EmailQueueManifestDocument: Codable, Equatable, Sendable {
+    static let currentSchemaVersion: Int = 1
+    static let defaultFilename: String = "email_queue_manifest.json"
+    
+    var schemaVersion: Int = EmailQueueManifestDocument.currentSchemaVersion
+    var totalSentCount: Int = 0
+    var items: [EmailQueueItem] = []
+}
+
+nonisolated struct EmailAttachmentPayload: Equatable, Sendable {
+    let filename: String
+    let contentType: String
+    let data: Data
+}
+
+nonisolated struct EmailDeliveryRequest: Equatable, Sendable {
+    let jobID: UUID
+    let idempotencyKey: String
+    let from: String
+    let to: String
+    let subject: String
+    let htmlBody: String
+    let textBody: String
+    let attachments: [EmailAttachmentPayload]
+    let apiKey: String
+}
+
+nonisolated enum EmailSendOutcome: Equatable, Sendable {
+    case sent(providerMessageID: String)
+    case transientFailure(reason: String, retryAfterSec: TimeInterval?)
+    case configurationPaused(reason: String)
+    case permanentRecipientFailure(reason: String)
+}
+
+nonisolated struct EmailConfirmationCopy: Equatable, Sendable {
+    let title: String
+    let subtitle: String
+    let isOnline: Bool
+}
+
+protocol EmailTransport: AnyObject, Sendable {
+    nonisolated func sendEmail(_ request: EmailDeliveryRequest) async -> EmailSendOutcome
+}
+
+// MARK: - Production Resend HTTPS Transport
+
+final class ResendEmailTransport: EmailTransport, @unchecked Sendable {
+    private nonisolated let session: URLSession
+    private nonisolated let endpointURL: URL
+    
+    nonisolated init(
+        endpointURL: URL = URL(string: "https://api.resend.com/emails")!,
+        requestTimeoutSec: TimeInterval = 20.0,
+        resourceTimeoutSec: TimeInterval = 45.0,
+        protocolClasses: [AnyClass]? = nil
+    ) {
+        let config = URLSessionConfiguration.ephemeral
+        config.waitsForConnectivity = false
+        config.timeoutIntervalForRequest = requestTimeoutSec
+        config.timeoutIntervalForResource = resourceTimeoutSec
+        if let protocolClasses = protocolClasses {
+            config.protocolClasses = protocolClasses
+        }
+        self.session = URLSession(configuration: config)
+        self.endpointURL = endpointURL
+    }
+    
+    nonisolated func sendEmail(_ request: EmailDeliveryRequest) async -> EmailSendOutcome {
+        let trimmedKey = request.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else {
+            return .configurationPaused(reason: "Email API Key not configured in Settings")
+        }
+        
+        let trimmedFrom = request.from.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedFrom.isEmpty else {
+            return .configurationPaused(reason: "Sender email address not configured in Settings")
+        }
+        
+        var urlRequest = URLRequest(url: endpointURL)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        urlRequest.setValue(request.idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        
+        let bodyData: Data? = autoreleasepool {
+            let encodedAttachments: [[String: String]] = request.attachments.map { att in
+                [
+                    "filename": att.filename,
+                    "content": att.data.base64EncodedString()
+                ]
+            }
+            
+            let payload: [String: Any] = [
+                "from": trimmedFrom,
+                "to": [request.to],
+                "subject": request.subject,
+                "html": request.htmlBody,
+                "text": request.textBody,
+                "attachments": encodedAttachments
+            ]
+            
+            return try? JSONSerialization.data(withJSONObject: payload, options: [])
+        }
+        
+        guard let serializedBody = bodyData else {
+            return .permanentRecipientFailure(reason: "Failed to serialize email JSON payload")
+        }
+        urlRequest.httpBody = serializedBody
+        
+        do {
+            let (data, response) = try await session.data(for: urlRequest)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return .transientFailure(reason: "Non-HTTP network response", retryAfterSec: nil)
+            }
+            
+            let statusCode = httpResponse.statusCode
+            let contentType = (httpResponse.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+            
+            if (200...299).contains(statusCode) {
+                // Guard against captive portals returning HTTP 200 OK with an HTML login page
+                if contentType.contains("text/html") {
+                    return .transientFailure(reason: "Captive portal HTML response detected", retryAfterSec: nil)
+                }
+                if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let messageID = json["id"] as? String, !messageID.isEmpty {
+                    return .sent(providerMessageID: messageID)
+                }
+                return .transientFailure(reason: "Invalid 2xx JSON response (possible captive portal)", retryAfterSec: nil)
+            }
+            
+            let serverMessage = Self.extractErrorMessage(from: data) ?? "HTTP \(statusCode)"
+            
+            switch statusCode {
+            case 401, 403:
+                return .configurationPaused(reason: "Email authentication error (\(statusCode)): \(serverMessage)")
+            case 408, 425, 429, 500...599:
+                let retryAfterHeader = httpResponse.value(forHTTPHeaderField: "Retry-After")
+                let parsedRetryAfter = retryAfterHeader.flatMap { TimeInterval($0) }
+                return .transientFailure(reason: "Server transient error (\(statusCode)): \(serverMessage)", retryAfterSec: parsedRetryAfter)
+            case 400, 422:
+                return .permanentRecipientFailure(reason: "Recipient rejected (\(statusCode)): \(serverMessage)")
+            default:
+                return .transientFailure(reason: "Unexpected HTTP \(statusCode): \(serverMessage)", retryAfterSec: nil)
+            }
+        } catch let urlError as URLError {
+            return .transientFailure(reason: "Network error (\(urlError.code.rawValue)): \(urlError.localizedDescription)", retryAfterSec: nil)
+        } catch {
+            return .transientFailure(reason: "Transport error: \(error.localizedDescription)", retryAfterSec: nil)
+        }
+    }
+    
+    nonisolated private static func extractErrorMessage(from data: Data) -> String? {
+        guard !data.isEmpty else { return nil }
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let message = json["message"] as? String, !message.isEmpty {
+                return message
+            }
+            if let errorStr = json["error"] as? String, !errorStr.isEmpty {
+                return errorStr
+            }
+        }
+        if let raw = String(data: data.prefix(200), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty,
+           !raw.lowercased().contains("<html") {
+            return raw
+        }
+        return nil
+    }
+}
+
+// MARK: - EmailQueueService
+
+final class EmailQueueService: ObservableObject, @unchecked Sendable {
+    nonisolated static let shared = EmailQueueService()
+    
+    @Published private(set) var pendingCount: Int = 0
+    @Published private(set) var sendingCount: Int = 0
+    @Published private(set) var failedCount: Int = 0
+    @Published private(set) var totalSentCount: Int = 0
+    @Published private(set) var isNetworkConnected: Bool = false
+    @Published private(set) var lastStatusMessage: String? = nil
+    @Published private(set) var queueItems: [EmailQueueItem] = []
+    
+    private nonisolated final class Storage: @unchecked Sendable {
+        let lock = NSLock()
+        let rootDirectoryURL: URL
+        let manifestFileURL: URL
+        var document: EmailQueueManifestDocument
+        var isNetworkConnected: Bool
+        var isFlushing: Bool = false
+        var needsFollowUpFlush: Bool = false
+        var flushWaiters: [CheckedContinuation<Void, Never>] = []
+        var apiKeyOverride: String?
+        var fromAddressOverride: String?
+        var subjectOverride: String?
+        var networkDebounceSec: TimeInterval
+        var baseBackoffSec: TimeInterval
+        var maxBackoffSec: TimeInterval
+        var debounceTask: Task<Void, Never>?
+        var retryWakeupTask: Task<Void, Never>?
+        
+        init(
+            rootDirectoryURL: URL,
+            manifestFileURL: URL,
+            initialDocument: EmailQueueManifestDocument,
+            initialNetworkConnected: Bool,
+            networkDebounceSec: TimeInterval,
+            baseBackoffSec: TimeInterval,
+            maxBackoffSec: TimeInterval
+        ) {
+            self.rootDirectoryURL = rootDirectoryURL
+            self.manifestFileURL = manifestFileURL
+            self.document = initialDocument
+            self.isNetworkConnected = initialNetworkConnected
+            self.networkDebounceSec = networkDebounceSec
+            self.baseBackoffSec = baseBackoffSec
+            self.maxBackoffSec = maxBackoffSec
+        }
+    }
+    
+    private nonisolated let storage: Storage
+    private nonisolated let transport: EmailTransport
+    private nonisolated let pathMonitor: NWPathMonitor?
+    private nonisolated let monitorQueue: DispatchQueue?
+    
+    nonisolated static var defaultQueueRootDirectory: URL {
+        let baseDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return baseDir.appendingPathComponent("PhotoboothEmailQueue", isDirectory: true)
+    }
+    
+    nonisolated init(
+        customDirectoryURL: URL? = nil,
+        transport: EmailTransport = ResendEmailTransport(),
+        useSystemNetworkMonitor: Bool = true,
+        initialNetworkConnected: Bool = false,
+        networkDebounceSec: TimeInterval = 2.0,
+        baseBackoffSec: TimeInterval = 5.0,
+        maxBackoffSec: TimeInterval = 300.0,
+        apiKeyOverride: String? = nil,
+        fromAddressOverride: String? = nil,
+        subjectOverride: String? = nil
+    ) {
+        let rootDir = customDirectoryURL ?? Self.defaultQueueRootDirectory
+        try? FileManager.default.createDirectory(at: rootDir, withIntermediateDirectories: true)
+        let manifestURL = rootDir.appendingPathComponent(EmailQueueManifestDocument.defaultFilename)
+        
+        var loadedDoc: EmailQueueManifestDocument
+        if let data = try? Data(contentsOf: manifestURL),
+           let decoded = try? Self.makeJSONDecoder().decode(EmailQueueManifestDocument.self, from: data) {
+            loadedDoc = decoded
+        } else {
+            loadedDoc = EmailQueueManifestDocument()
+        }
+        
+        // Crash / Reboot Recovery: reset any job left in `.sending` back to `.pending`
+        // so interrupted uploads automatically resume.
+        var didRecoverInterrupted = false
+        let now = Date()
+        for i in loadedDoc.items.indices {
+            if loadedDoc.items[i].status == .sending {
+                loadedDoc.items[i].status = .pending
+                loadedDoc.items[i].nextAttemptAt = now
+                didRecoverInterrupted = true
+            }
+        }
+        
+        self.transport = transport
+        self.storage = Storage(
+            rootDirectoryURL: rootDir,
+            manifestFileURL: manifestURL,
+            initialDocument: loadedDoc,
+            initialNetworkConnected: initialNetworkConnected,
+            networkDebounceSec: networkDebounceSec,
+            baseBackoffSec: baseBackoffSec,
+            maxBackoffSec: maxBackoffSec
+        )
+        self.storage.apiKeyOverride = apiKeyOverride
+        self.storage.fromAddressOverride = fromAddressOverride
+        self.storage.subjectOverride = subjectOverride
+        
+        if didRecoverInterrupted {
+            Self.saveDocumentLocked(storage.document, to: manifestURL)
+        }
+        
+        if useSystemNetworkMonitor {
+            let monitor = NWPathMonitor()
+            let queue = DispatchQueue(label: "com.photobooth2.emailQueueNetworkMonitor", qos: .utility)
+            self.pathMonitor = monitor
+            self.monitorQueue = queue
+            monitor.pathUpdateHandler = { [weak self] path in
+                self?.handleNetworkStatusChange(isConnected: path.status == .satisfied)
+            }
+            monitor.start(queue: queue)
+        } else {
+            self.pathMonitor = nil
+            self.monitorQueue = nil
+        }
+        
+        publishStateSnapshot()
+        
+        if initialNetworkConnected {
+            triggerBackgroundFlush(ignoreBackoff: false)
+        }
+    }
+    
+    deinit {
+        pathMonitor?.cancel()
+        storage.lock.lock()
+        let debounce = storage.debounceTask
+        let wakeup = storage.retryWakeupTask
+        storage.lock.unlock()
+        debounce?.cancel()
+        wakeup?.cancel()
+    }
+    
+    // MARK: - Static Formatting & Validation Helpers
+    
+    nonisolated static func isValidEmail(_ rawEmail: String) -> Bool {
+        let trimmed = rawEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 5, trimmed.count <= 254, !trimmed.contains(" ") else {
+            return false
+        }
+        let parts = trimmed.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2 else { return false }
+        let local = parts[0]
+        let domain = parts[1]
+        guard !local.isEmpty, domain.count >= 3 else { return false }
+        guard !domain.hasPrefix("."), !domain.hasSuffix("."), !domain.contains("..") else { return false }
+        let domainLabels = domain.split(separator: ".")
+        guard domainLabels.count >= 2, let tld = domainLabels.last, tld.count >= 2 else {
+            return false
+        }
+        return true
+    }
+    
+    nonisolated static func normalizeGalleryURL(_ rawURLString: String) -> String {
+        let trimmed = rawURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            let currentYear = Calendar.current.component(.year, from: Date())
+            return "https://www.joshal.com/\(currentYear)"
+        }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+            return trimmed
+        }
+        return "https://\(trimmed)"
+    }
+    
+    /// Builds the HTML email body containing the required hyperlinked gallery footer at the bottom.
+    nonisolated static func buildEmailHTML(galleryURLString: String) -> String {
+        let normalizedURL = normalizeGalleryURL(galleryURLString)
+        let escapedURL = normalizedURL
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+        
+        return """
+        <!DOCTYPE html>
+        <html>
+        <head><meta charset="UTF-8"></head>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #222222; line-height: 1.5; padding: 16px;">
+          <p>Thanks for visiting the photobooth! Your photos &amp; animated GIF from your session are attached to this email.</p>
+          <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 24px 0;" />
+          <p style="font-size: 14px; color: #444444;">All full resolution images and gifs can be downloaded <a href="\(escapedURL)">here</a> a day or two after the event.</p>
+        </body>
+        </html>
+        """
+    }
+    
+    nonisolated static func buildEmailPlainText(galleryURLString: String) -> String {
+        let normalizedURL = normalizeGalleryURL(galleryURLString)
+        return """
+        Thanks for visiting the photobooth! Your photos & animated GIF from your session are attached to this email.
+
+        All full resolution images and gifs can be downloaded here (\(normalizedURL)) a day or two after the event.
+        """
+    }
+    
+    /// Generates clear, unambiguous confirmation copy distinguishing online vs. offline iPad status.
+    nonisolated static func confirmationMessage(forEmail email: String, isOnline: Bool) -> EmailConfirmationCopy {
+        let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        if isOnline {
+            return EmailConfirmationCopy(
+                title: "Sending Your Photos!",
+                subtitle: "Your photos & GIF are being emailed to \(cleanEmail) in the background right now.",
+                isOnline: true
+            )
+        } else {
+            return EmailConfirmationCopy(
+                title: "Saved for Wi-Fi Delivery!",
+                subtitle: "The iPad is currently offline. You will receive your email at \(cleanEmail) shortly after the iPad connects to Wi-Fi.",
+                isOnline: false
+            )
+        }
+    }
+    
+    // MARK: - Enqueue (Zero Main-Thread Delay via APFS Hard-Link)
+    
+    /// Synchronously hard-links (or copies) session media from `/tmp` into `Application Support/PhotoboothEmailQueue/<id>/`,
+    /// persists the queue manifest atomically, and kicks off asynchronous background delivery.
+    @discardableResult
+    nonisolated func enqueue(
+        recipientEmail: String,
+        mediaPaths: [String],
+        galleryURLString: String,
+        customSubject: String? = nil
+    ) -> EmailQueueItem? {
+        let trimmedEmail = recipientEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isValidEmail(trimmedEmail) else { return nil }
+        
+        let fm = FileManager.default
+        let jobID = UUID()
+        let jobDir = storage.rootDirectoryURL.appendingPathComponent(jobID.uuidString, isDirectory: true)
+        
+        do {
+            try fm.createDirectory(at: jobDir, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        
+        var savedFilenames: [String] = []
+        var photoIndex = 1
+        var gifIndex = 1
+        
+        for rawPath in mediaPaths {
+            let sourceURL: URL
+            if rawPath.hasPrefix("file://"), let parsed = URL(string: rawPath) {
+                sourceURL = URL(fileURLWithPath: parsed.path)
+            } else {
+                sourceURL = URL(fileURLWithPath: rawPath)
+            }
+            
+            guard fm.fileExists(atPath: sourceURL.path) else { continue }
+            
+            let ext = sourceURL.pathExtension.lowercased()
+            let cleanFilename: String
+            if ext == "gif" {
+                cleanFilename = gifIndex == 1 ? "photobooth_animation.gif" : "photobooth_animation_\(gifIndex).gif"
+                gifIndex += 1
+            } else {
+                let effectiveExt = ext.isEmpty ? "jpg" : ext
+                cleanFilename = "photobooth_photo_\(photoIndex).\(effectiveExt)"
+                photoIndex += 1
+            }
+            
+            let destURL = jobDir.appendingPathComponent(cleanFilename)
+            // Fast path: APFS hard-link (O(1) metadata operation, < 0.2ms, 0 extra bytes while /tmp lives,
+            // and survives after StateMachine deletes the /tmp file).
+            do {
+                try fm.linkItem(at: sourceURL, to: destURL)
+                savedFilenames.append(cleanFilename)
+            } catch {
+                // Fallback for cross-volume paths: regular file copy
+                try? fm.removeItem(at: destURL)
+                if (try? fm.copyItem(at: sourceURL, to: destURL)) != nil {
+                    savedFilenames.append(cleanFilename)
+                }
+            }
+        }
+        
+        guard !savedFilenames.isEmpty else {
+            try? fm.removeItem(at: jobDir)
+            return nil
+        }
+        
+        let normalizedGalleryURL = Self.normalizeGalleryURL(galleryURLString)
+        let resolvedSubject = customSubject ?? resolveSubject()
+        let now = Date()
+        
+        let newItem = EmailQueueItem(
+            id: jobID,
+            recipientEmail: trimmedEmail,
+            galleryURLString: normalizedGalleryURL,
+            subject: resolvedSubject,
+            attachmentFilenames: savedFilenames,
+            createdAt: now,
+            status: .pending,
+            attemptCount: 0,
+            nextAttemptAt: now,
+            lastError: nil
+        )
+        
+        storage.lock.lock()
+        storage.document.items.append(newItem)
+        Self.saveDocumentLocked(storage.document, to: storage.manifestFileURL)
+        let isOnline = storage.isNetworkConnected
+        storage.lock.unlock()
+        
+        publishStateSnapshot(
+            statusMessage: isOnline
+                ? "Queued email to \(trimmedEmail) — sending in background..."
+                : "Queued email to \(trimmedEmail) — waiting for Wi-Fi connection"
+        )
+        
+        if isOnline {
+            triggerBackgroundFlush(ignoreBackoff: false)
+        }
+        
+        return newItem
+    }
+    
+    // MARK: - Network Connectivity & Spotty Wi-Fi Handling
+    
+    nonisolated func setSimulatedNetworkConnected(_ connected: Bool) {
+        handleNetworkStatusChange(isConnected: connected)
+    }
+    
+    nonisolated private func handleNetworkStatusChange(isConnected: Bool) {
+        storage.lock.lock()
+        let previous = storage.isNetworkConnected
+        storage.isNetworkConnected = isConnected
+        storage.debounceTask?.cancel()
+        storage.debounceTask = nil
+        
+        let debounceSec = storage.networkDebounceSec
+        let hasPending = storage.document.items.contains { $0.status == .pending }
+        storage.lock.unlock()
+        
+        publishStateSnapshot(
+            statusMessage: isConnected
+                ? (hasPending ? "Wi-Fi connected — preparing to send queued emails..." : "Online")
+                : (hasPending ? "Offline — queued emails will send when iPad connects to Wi-Fi" : "Offline")
+        )
+        
+        if isConnected {
+            if debounceSec <= 0 {
+                triggerBackgroundFlush(ignoreBackoff: false)
+            } else {
+                let task = Task.detached(priority: .utility) { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(debounceSec * 1_000_000_000))
+                    guard let self = self, !Task.isCancelled else { return }
+                    self.triggerBackgroundFlush(ignoreBackoff: !previous)
+                }
+                storage.lock.lock()
+                storage.debounceTask = task
+                storage.lock.unlock()
+            }
+        } else {
+            storage.lock.lock()
+            storage.retryWakeupTask?.cancel()
+            storage.retryWakeupTask = nil
+            storage.lock.unlock()
+        }
+    }
+    
+    // MARK: - Serialized Background Queue Flush & Exponential Backoff
+    
+    nonisolated func notifyConfigurationUpdated() {
+        storage.lock.lock()
+        let isOnline = storage.isNetworkConnected
+        let hasPending = storage.document.items.contains { $0.status == .pending }
+        storage.lock.unlock()
+        if isOnline && hasPending {
+            triggerBackgroundFlush(ignoreBackoff: true)
+        }
+    }
+    
+    nonisolated func triggerBackgroundFlush(ignoreBackoff: Bool = false) {
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.flushQueue(ignoreBackoff: ignoreBackoff)
+        }
+    }
+    
+    nonisolated func flushQueue(ignoreBackoff: Bool = false) async {
+        let shouldWaitForActiveFlush: Bool = storage.lock.withLock {
+            if ignoreBackoff {
+                let now = Date()
+                for idx in storage.document.items.indices where storage.document.items[idx].status == .pending {
+                    storage.document.items[idx].nextAttemptAt = now
+                }
+            }
+            if storage.isFlushing {
+                storage.needsFollowUpFlush = true
+                return true
+            }
+            storage.isFlushing = true
+            storage.needsFollowUpFlush = false
+            storage.retryWakeupTask?.cancel()
+            storage.retryWakeupTask = nil
+            return false
+        }
+        
+        if shouldWaitForActiveFlush {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let shouldResumeImmediately: Bool = storage.lock.withLock {
+                    if storage.isFlushing {
+                        storage.flushWaiters.append(continuation)
+                        return false
+                    }
+                    return true
+                }
+                if shouldResumeImmediately {
+                    continuation.resume()
+                }
+            }
+            return
+        }
+        
+        defer {
+            let waiters: [CheckedContinuation<Void, Never>] = storage.lock.withLock {
+                storage.isFlushing = false
+                storage.needsFollowUpFlush = false
+                let queuedWaiters = storage.flushWaiters
+                storage.flushWaiters.removeAll()
+                return queuedWaiters
+            }
+            
+            publishStateSnapshot()
+            scheduleNextBackoffWakeupIfNeeded()
+            
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+        
+        var didPauseForConfiguration = false
+        
+        repeat {
+            storage.lock.withLock {
+                storage.needsFollowUpFlush = false
+            }
+            
+            while true {
+                if Task.isCancelled { break }
+                
+                let nextCandidate: EmailQueueItem? = storage.lock.withLock {
+                    guard storage.isNetworkConnected else {
+                        return nil
+                    }
+                    let now = Date()
+                    guard let itemIndex = storage.document.items.indices.first(where: { idx in
+                        let item = storage.document.items[idx]
+                        return item.status == .pending && item.nextAttemptAt <= now
+                    }) else {
+                        return nil
+                    }
+                    storage.document.items[itemIndex].status = .sending
+                    let currentItem = storage.document.items[itemIndex]
+                    Self.saveDocumentLocked(storage.document, to: storage.manifestFileURL)
+                    return currentItem
+                }
+                
+                guard let currentItem = nextCandidate else {
+                    break
+                }
+                
+                publishStateSnapshot(statusMessage: "Sending email to \(currentItem.recipientEmail)...")
+                
+                let jobDir = storage.rootDirectoryURL.appendingPathComponent(currentItem.id.uuidString, isDirectory: true)
+                let attachments: [EmailAttachmentPayload] = autoreleasepool {
+                    var loaded: [EmailAttachmentPayload] = []
+                    for fname in currentItem.attachmentFilenames {
+                        let fileURL = jobDir.appendingPathComponent(fname)
+                        if let data = try? Data(contentsOf: fileURL), !data.isEmpty {
+                            let contentType = fname.lowercased().hasSuffix(".gif") ? "image/gif" : "image/jpeg"
+                            loaded.append(EmailAttachmentPayload(filename: fname, contentType: contentType, data: data))
+                        }
+                    }
+                    return loaded
+                }
+                
+                // If attachment files were externally deleted/missing, clean up the orphaned record so it cannot block the queue
+                if attachments.isEmpty {
+                    storage.lock.withLock {
+                        storage.document.items.removeAll { $0.id == currentItem.id }
+                        Self.saveDocumentLocked(storage.document, to: storage.manifestFileURL)
+                    }
+                    try? FileManager.default.removeItem(at: jobDir)
+                    publishStateSnapshot(statusMessage: "Removed orphaned email job with missing attachments")
+                    continue
+                }
+                
+                let deliveryRequest = EmailDeliveryRequest(
+                    jobID: currentItem.id,
+                    idempotencyKey: currentItem.id.uuidString,
+                    from: resolveFromAddress(),
+                    to: currentItem.recipientEmail,
+                    subject: currentItem.subject,
+                    htmlBody: Self.buildEmailHTML(galleryURLString: currentItem.galleryURLString),
+                    textBody: Self.buildEmailPlainText(galleryURLString: currentItem.galleryURLString),
+                    attachments: attachments,
+                    apiKey: resolveAPIKey()
+                )
+                
+                let outcome = await transport.sendEmail(deliveryRequest)
+                
+                switch outcome {
+                case .sent:
+                    // 1. Delete job's local media folder immediately upon verified 2xx delivery
+                    try? FileManager.default.removeItem(at: jobDir)
+                    
+                    // 2. Remove from pending manifest & increment sent counter atomically
+                    storage.lock.withLock {
+                        storage.document.items.removeAll { $0.id == currentItem.id }
+                        storage.document.totalSentCount += 1
+                        Self.saveDocumentLocked(storage.document, to: storage.manifestFileURL)
+                    }
+                    
+                    publishStateSnapshot(statusMessage: "Sent email to \(currentItem.recipientEmail)")
+                    
+                case .transientFailure(let reason, let serverRetryAfter):
+                    storage.lock.withLock {
+                        if let idx = storage.document.items.firstIndex(where: { $0.id == currentItem.id }) {
+                            let newAttempt = storage.document.items[idx].attemptCount + 1
+                            storage.document.items[idx].attemptCount = newAttempt
+                            storage.document.items[idx].status = .pending
+                            storage.document.items[idx].lastError = reason
+                            
+                            let computedBackoff = min(
+                                storage.maxBackoffSec,
+                                storage.baseBackoffSec * pow(2.0, Double(max(0, newAttempt - 1)))
+                            )
+                            let delaySec = max(computedBackoff, serverRetryAfter ?? 0)
+                            storage.document.items[idx].nextAttemptAt = Date().addingTimeInterval(delaySec)
+                            Self.saveDocumentLocked(storage.document, to: storage.manifestFileURL)
+                        }
+                    }
+                    
+                    publishStateSnapshot(statusMessage: "Spotty connection — will retry \(currentItem.recipientEmail) automatically (\(reason))")
+                    
+                case .configurationPaused(let reason):
+                    storage.lock.withLock {
+                        if let idx = storage.document.items.firstIndex(where: { $0.id == currentItem.id }) {
+                            storage.document.items[idx].status = .pending
+                            storage.document.items[idx].lastError = reason
+                            Self.saveDocumentLocked(storage.document, to: storage.manifestFileURL)
+                        }
+                    }
+                    
+                    publishStateSnapshot(statusMessage: reason)
+                    didPauseForConfiguration = true
+                    break
+                    
+                case .permanentRecipientFailure(let reason):
+                    storage.lock.withLock {
+                        if let idx = storage.document.items.firstIndex(where: { $0.id == currentItem.id }) {
+                            storage.document.items[idx].attemptCount += 1
+                            storage.document.items[idx].status = .failedPermanent
+                            storage.document.items[idx].lastError = reason
+                            Self.saveDocumentLocked(storage.document, to: storage.manifestFileURL)
+                        }
+                    }
+                    
+                    publishStateSnapshot(statusMessage: "Failed delivery to \(currentItem.recipientEmail): \(reason)")
+                }
+                
+                if didPauseForConfiguration {
+                    break
+                }
+            }
+            
+            let shouldLoopAgain: Bool = storage.lock.withLock {
+                !didPauseForConfiguration && storage.needsFollowUpFlush && storage.isNetworkConnected
+            }
+            if !shouldLoopAgain {
+                break
+            }
+        } while true
+    }
+    
+    nonisolated private func scheduleNextBackoffWakeupIfNeeded() {
+        storage.lock.lock()
+        storage.retryWakeupTask?.cancel()
+        storage.retryWakeupTask = nil
+        
+        guard storage.isNetworkConnected else {
+            storage.lock.unlock()
+            return
+        }
+        
+        let pendingDates = storage.document.items
+            .filter { $0.status == .pending }
+            .map(\.nextAttemptAt)
+        guard let earliestNext = pendingDates.min() else {
+            storage.lock.unlock()
+            return
+        }
+        
+        let waitSec = max(0.02, earliestNext.timeIntervalSinceNow)
+        let task = Task.detached(priority: .utility) { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(waitSec * 1_000_000_000))
+            guard let self = self, !Task.isCancelled else { return }
+            await self.flushQueue(ignoreBackoff: false)
+        }
+        storage.retryWakeupTask = task
+        storage.lock.unlock()
+    }
+    
+    // MARK: - Queue Management & Maintenance
+    
+    nonisolated func retryFailedAndPendingJobs() async {
+        storage.lock.withLock {
+            let now = Date()
+            for idx in storage.document.items.indices {
+                storage.document.items[idx].status = .pending
+                storage.document.items[idx].nextAttemptAt = now
+            }
+            Self.saveDocumentLocked(storage.document, to: storage.manifestFileURL)
+        }
+        
+        publishStateSnapshot(statusMessage: "Retrying queued emails...")
+        await flushQueue(ignoreBackoff: true)
+    }
+    
+    /// Purges permanently failed jobs older than `maxAgeDays` (default 7 days) and removes any unreferenced job folders.
+    nonisolated func purgeExpiredFailedJobs(maxAgeDays: Int = 7) {
+        let cutoff = Date().addingTimeInterval(-Double(max(1, maxAgeDays)) * 24 * 3600)
+        var removedIDs: [UUID] = []
+        
+        storage.lock.lock()
+        storage.document.items.removeAll { item in
+            if item.status == .failedPermanent && item.createdAt < cutoff {
+                removedIDs.append(item.id)
+                return true
+            }
+            return false
+        }
+        if !removedIDs.isEmpty {
+            Self.saveDocumentLocked(storage.document, to: storage.manifestFileURL)
+        }
+        let activeIDs = Set(storage.document.items.map { $0.id.uuidString })
+        let rootDir = storage.rootDirectoryURL
+        storage.lock.unlock()
+        
+        let fm = FileManager.default
+        for id in removedIDs {
+            try? fm.removeItem(at: rootDir.appendingPathComponent(id.uuidString, isDirectory: true))
+        }
+        
+        // Clean up any orphaned subdirectories not referenced in the manifest
+        if let contents = try? fm.contentsOfDirectory(at: rootDir, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
+            for url in contents {
+                if url.lastPathComponent == EmailQueueManifestDocument.defaultFilename { continue }
+                if !activeIDs.contains(url.lastPathComponent) {
+                    try? fm.removeItem(at: url)
+                }
+            }
+        }
+        
+        if !removedIDs.isEmpty {
+            publishStateSnapshot()
+        }
+    }
+    
+    nonisolated func currentItemsSnapshot() -> [EmailQueueItem] {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        return storage.document.items
+    }
+    
+    nonisolated func currentStatsSnapshot() -> (pending: Int, sending: Int, failed: Int, sent: Int, isOnline: Bool) {
+        storage.lock.lock()
+        defer { storage.lock.unlock() }
+        let items = storage.document.items
+        let pending = items.filter { $0.status == .pending }.count
+        let sending = items.filter { $0.status == .sending }.count
+        let failed = items.filter { $0.status == .failedPermanent }.count
+        return (pending, sending, failed, storage.document.totalSentCount, storage.isNetworkConnected)
+    }
+    
+    // MARK: - Private Helpers
+    
+    nonisolated private func resolveAPIKey() -> String {
+        storage.lock.lock()
+        let override = storage.apiKeyOverride
+        storage.lock.unlock()
+        if let override = override { return override }
+        return UserDefaults.standard.string(forKey: "emailAPIKey") ?? ""
+    }
+    
+    nonisolated private func resolveFromAddress() -> String {
+        storage.lock.lock()
+        let override = storage.fromAddressOverride
+        storage.lock.unlock()
+        if let override = override { return override }
+        return UserDefaults.standard.string(forKey: "emailFromAddress") ?? "Photobooth <photos@joshal.com>"
+    }
+    
+    nonisolated private func resolveSubject() -> String {
+        storage.lock.lock()
+        let override = storage.subjectOverride
+        storage.lock.unlock()
+        if let override = override { return override }
+        return UserDefaults.standard.string(forKey: "emailSubject") ?? "Your Photobooth Photos & GIF!"
+    }
+    
+    nonisolated private func publishStateSnapshot(statusMessage: String? = nil) {
+        storage.lock.lock()
+        let items = storage.document.items
+        let sent = storage.document.totalSentCount
+        let online = storage.isNetworkConnected
+        storage.lock.unlock()
+        
+        let pending = items.filter { $0.status == .pending }.count
+        let sending = items.filter { $0.status == .sending }.count
+        let failed = items.filter { $0.status == .failedPermanent }.count
+        
+        let applyOnMain = { @MainActor [weak self] in
+            guard let self = self else { return }
+            self.queueItems = items
+            self.pendingCount = pending
+            self.sendingCount = sending
+            self.failedCount = failed
+            self.totalSentCount = sent
+            self.isNetworkConnected = online
+            if let statusMessage = statusMessage {
+                self.lastStatusMessage = statusMessage
+            }
+        }
+        
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { applyOnMain() }
+        } else {
+            Task { @MainActor in applyOnMain() }
+        }
+    }
+    
+    nonisolated private static func makeJSONEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return encoder
+    }
+    
+    nonisolated private static func makeJSONDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+    
+    nonisolated private static func saveDocumentLocked(_ document: EmailQueueManifestDocument, to url: URL) {
+        guard let data = try? makeJSONEncoder().encode(document) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+}

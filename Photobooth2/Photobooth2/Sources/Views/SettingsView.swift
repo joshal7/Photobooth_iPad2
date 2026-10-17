@@ -6,6 +6,7 @@ struct SettingsView: View {
     @ObservedObject var config = ConfigManager.shared
     @ObservedObject var backdropManager = BackdropManager.shared
     @ObservedObject var manifestStore = BackdropManifestStore.shared
+    @ObservedObject var emailQueue = EmailQueueService.shared
     @Environment(\.presentationMode) var presentationMode
     @EnvironmentObject var stateMachine: StateMachine
     
@@ -324,6 +325,78 @@ struct SettingsView: View {
                             Text("7 days").tag(7)
                         }
                         .pickerStyle(.menu)
+                    }
+                    
+                    Toggle("Enable Email Sharing", isOn: $config.isEmailSharingEnabled)
+                    
+                    if config.isEmailSharingEnabled {
+                        HStack {
+                            Text("Sender Address")
+                            Spacer()
+                            TextField("Photobooth <photos@joshal.com>", text: $config.emailFromAddress)
+                                .multilineTextAlignment(.trailing)
+                                .autocapitalization(.none)
+                                .disableAutocorrection(true)
+                                .keyboardType(.emailAddress)
+                                .foregroundColor(.gray)
+                        }
+                        
+                        HStack {
+                            Text("Email Subject")
+                            Spacer()
+                            TextField("Your Photobooth Photos & GIF!", text: $config.emailSubject)
+                                .multilineTextAlignment(.trailing)
+                                .foregroundColor(.gray)
+                        }
+                        
+                        HStack {
+                            Text("Resend API Key")
+                            Spacer()
+                            SecureField("re_...", text: $config.emailAPIKey)
+                                .multilineTextAlignment(.trailing)
+                                .autocapitalization(.none)
+                                .disableAutocorrection(true)
+                                .foregroundColor(.gray)
+                        }
+                        
+                        HStack {
+                            Text("Network Status")
+                            Spacer()
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(emailQueue.isNetworkConnected ? Color.green : Color.orange)
+                                    .frame(width: 9, height: 9)
+                                Text(emailQueue.isNetworkConnected ? "Online (Wi-Fi)" : "Offline (Queuing)")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        
+                        HStack {
+                            Text("Email Queue")
+                            Spacer()
+                            Text("Pending: \(emailQueue.pendingCount + emailQueue.sendingCount) • Sent: \(emailQueue.totalSentCount) • Failed: \(emailQueue.failedCount)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        if let statusMsg = emailQueue.lastStatusMessage, !statusMsg.isEmpty {
+                            Text(statusMsg)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        if emailQueue.pendingCount > 0 || emailQueue.failedCount > 0 {
+                            Button(action: {
+                                Task {
+                                    await emailQueue.retryFailedAndPendingJobs()
+                                }
+                            }) {
+                                HStack {
+                                    Image(systemName: "paperplane.fill")
+                                    Text("Flush / Retry Queued Emails Now (\(emailQueue.pendingCount + emailQueue.failedCount))")
+                                }
+                            }
+                        }
                     }
                 }
                 

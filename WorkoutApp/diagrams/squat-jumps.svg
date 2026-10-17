@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 248" width="100%" height="100%" role="img" aria-label="Squat Jumps multi-step exercise diagram">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#34d399" />
+    </marker>
+  </defs>
+
+  <!-- Minimalist Dark Canvas -->
+  <rect width="680" height="248" rx="16" fill="#090d16" stroke="#1e293b" stroke-width="1.5" />
+
+  <!-- Multi-Frame Motion Sequence Panels -->
+  <g transform="translate(12, 10)"><rect width="323" height="186" rx="12" fill="#0d1322" stroke="#1e293b" stroke-width="1.2" /><text x="12" y="21" fill="#e2e8f0" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11" font-weight="700">1. Loaded Squat Countermovement</text><line x1="14" y1="168" x2="309" y2="168" stroke="#334155" stroke-width="1.5" stroke-dasharray="4 4" /><g transform="translate(59, 0)"><path d="M 81.1 136.4 Q 100.5 117.7 117.8 97.0 A 10.5 10.5 0 0 1 102.2 83.0 Q 83.5 102.3 66.9 123.6 A 9.5 9.5 0 0 1 81.1 136.4 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><path d="M 73.6 138.5 Q 95.6 140.5 117.7 138.0 A 6 6 0 0 1 118.3 126.0 Q 96.4 121.5 74.4 121.5 A 8.5 8.5 0 0 1 73.6 138.5 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><g opacity="0.85"><path d="M 73.7 136.0 Q 95.7 138.5 117.8 136.5 A 4.5 4.5 0 0 1 118.2 127.5 Q 96.3 123.5 74.3 124.0 A 6 6 0 0 1 73.7 136.0 Z" fill="#f97316" stroke="#fb923c" stroke-width="1.3" /></g><circle cx="74.0" cy="130.0" r="8" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><circle cx="74.0" cy="130.0" r="9.5" fill="#38bdf8" opacity="0.58" stroke="#fed7aa" stroke-width="0.8" /><path d="M 112.8 130.1 Q 106.4 146.4 102.4 163.7 A 3.8 3.8 0 0 1 109.6 166.3 Q 117.6 150.6 123.2 133.9 A 5.5 5.5 0 0 1 112.8 130.1 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><ellipse cx="110.0" cy="165.0" rx="6.5" ry="3.5" fill="#cbd5e1" /><path d="M 105.8 94.2 Q 112.2 101.8 120.6 107.4 A 4.8 4.8 0 0 1 127.4 100.6 Q 121.8 92.2 114.2 85.8 A 6 6 0 0 1 105.8 94.2 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><path d="M 125.4 108.3 Q 137.5 104.6 149.0 99.0 A 3.2 3.2 0 0 1 147.0 93.0 Q 134.5 95.4 122.6 99.7 A 4.5 4.5 0 0 1 125.4 108.3 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><circle cx="110.0" cy="90.0" r="7" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><g transform="translate(118.0, 72.0) rotate(-15)">
+    <ellipse cx="0" cy="0" rx="11" ry="12.5" fill="#475569" stroke="#cbd5e1" stroke-width="1.5" />
+    <path d="M -10 -4 Q 0 -7 10 -4" stroke="#38bdf8" stroke-width="2.5" fill="none" opacity="0.75" />
+  </g></g></g>
+<g transform="translate(345, 10)"><rect width="323" height="186" rx="12" fill="#0d1322" stroke="#1e293b" stroke-width="1.2" /><text x="12" y="21" fill="#e2e8f0" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11" font-weight="700">2. Explosive Vertical Launch</text><line x1="14" y1="168" x2="309" y2="168" stroke="#334155" stroke-width="1.5" stroke-dasharray="4 4" /><g transform="translate(59, 0)"><path d="M 111.5 92.7 Q 115.0 71.8 115.5 50.7 A 10.5 10.5 0 0 1 94.5 49.3 Q 92.0 70.2 92.5 91.3 A 9.5 9.5 0 0 1 111.5 92.7 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><path d="M 93.5 92.7 Q 93.5 105.7 98.0 118.5 A 6 6 0 0 1 110.0 117.5 Q 112.5 104.3 110.5 91.3 A 8.5 8.5 0 0 1 93.5 92.7 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><g opacity="0.85"><path d="M 96.0 92.5 Q 95.5 105.6 99.5 118.3 A 4.5 4.5 0 0 1 108.5 117.7 Q 110.5 104.4 108.0 91.5 A 6 6 0 0 1 96.0 92.5 Z" fill="#f97316" stroke="#fb923c" stroke-width="1.3" /></g><circle cx="102.0" cy="92.0" r="8" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><circle cx="102.0" cy="92.0" r="9.5" fill="#38bdf8" opacity="0.58" stroke="#fed7aa" stroke-width="0.8" /><path d="M 98.5 117.6 Q 97.0 130.5 98.2 143.7 A 3.8 3.8 0 0 1 105.8 144.3 Q 109.0 131.5 109.5 118.4 A 5.5 5.5 0 0 1 98.5 117.6 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><ellipse cx="106.0" cy="144.0" rx="6.5" ry="3.5" fill="#cbd5e1" /><path d="M 99.4 47.7 Q 94.2 58.4 91.6 70.2 A 4.8 4.8 0 0 1 100.4 73.8 Q 106.8 63.6 110.6 52.3 A 6 6 0 0 1 99.4 47.7 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><path d="M 92.0 70.0 Q 86.7 79.9 83.1 90.6 A 3.2 3.2 0 0 1 88.9 93.4 Q 95.3 84.1 100.0 74.0 A 4.5 4.5 0 0 1 92.0 70.0 Z" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><circle cx="105.0" cy="50.0" r="7" fill="#334155" stroke="#94a3b8" stroke-width="1.3" /><g transform="translate(105.0, 30.0) rotate(0)">
+    <ellipse cx="0" cy="0" rx="11" ry="12.5" fill="#475569" stroke="#cbd5e1" stroke-width="1.5" />
+    <path d="M -10 -4 Q 0 -7 10 -4" stroke="#38bdf8" stroke-width="2.5" fill="none" opacity="0.75" />
+  </g><path d="M 184 142 L 184 74" stroke="#34d399" stroke-width="2.5" stroke-linecap="round" marker-end="url(#arrow)" /></g></g>
+
+  <!-- Minimalist Footer Bar: Target Muscles & Equipment -->
+  <text x="16" y="220" fill="#cbd5e1" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="11">
+    <tspan fill="#f97316" font-weight="700">● Quads (PRI)</tspan>  <tspan fill="#38bdf8" font-weight="600">  ○ Glutes (SEC)</tspan>
+  </text>
+  <text x="664" y="220" text-anchor="end" fill="#64748b" font-family="-apple-system, BlinkMacSystemFont, sans-serif" font-size="10.5" font-weight="600">
+    PLYO JUMP SQUAT · Equip: Nothing · Cat: HIIT
+  </text>
+</svg>

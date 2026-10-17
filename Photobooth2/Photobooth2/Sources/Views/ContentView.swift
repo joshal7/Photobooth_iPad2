@@ -156,6 +156,9 @@ struct ContentView: View {
                 
             case .airDrop(let images):
                 AirDropInstructionsView(images: images)
+                
+            case .emailSharing(let images):
+                EmailSharingView(images: images)
             }
             
             // Low Storage Warning Banner (< 2 GB free)

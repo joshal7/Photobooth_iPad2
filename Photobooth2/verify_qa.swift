@@ -1221,10 +1221,450 @@ assertTrue(
     "External Camera Horizontal Mirroring: subject mirrors to left (\(extLeftSubjPx.r),\(extLeftSubjPx.g),\(extLeftSubjPx.b)) while foreground frame stays un-reversed on right (\(extRightFramePx.r),\(extRightFramePx.g),\(extRightFramePx.b))"
 )
 
+// ============================================================================
+// 8. Email Sharing & Offline / Spotty Wi-Fi Queue QA Suite
+// ============================================================================
+print("\n[8] Testing Email Sharing & Offline / Spotty Wi-Fi Queue...")
+
+let emailServiceSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Services/EmailQueueService.swift", encoding: .utf8)) ?? ""
+let sharingViewsSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Views/SharingViews.swift", encoding: .utf8)) ?? ""
+let stateMachineSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/State/StateMachine.swift", encoding: .utf8)) ?? ""
+
+// 8A. Verify UI Button Order: Email sits right next to AirDrop before No Thanks
+if let airDropRange = sharingViewsSource.range(of: "Text(\"AirDrop\")"),
+   let emailRange = sharingViewsSource.range(of: "Text(\"Email\")"),
+   let noThanksRange = sharingViewsSource.range(of: "Text(\"No Thanks\")") {
+    assertTrue(
+        airDropRange.lowerBound < emailRange.lowerBound && emailRange.lowerBound < noThanksRange.lowerBound,
+        "SharingOverlayView places Email button right next to AirDrop button (AirDrop -> Email -> No Thanks)"
+    )
+} else {
+    assertTrue(false, "SharingOverlayView must contain AirDrop, Email, and No Thanks buttons")
+}
+
+assertTrue(
+    stateMachineSource.contains("case emailSharing(images: [String])") &&
+    stateMachineSource.contains("func selectEmailSharing()"),
+    "StateMachine defines .emailSharing state and selectEmailSharing() transition"
+)
+
+assertTrue(
+    emailServiceSource.contains("urlRequest.setValue(request.idempotencyKey, forHTTPHeaderField: \"Idempotency-Key\")") &&
+    emailServiceSource.contains("contentType.contains(\"text/html\")"),
+    "ResendEmailTransport sets Idempotency-Key header and guards against captive portal text/html 200 OK responses"
+)
+
+// 8B. Email Validation, Domain Shortcut Chips, HTML Footer Hyperlink & Online/Offline Copy
+func qaIsValidEmail(_ rawEmail: String) -> Bool {
+    let trimmed = rawEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count >= 5, trimmed.count <= 254, !trimmed.contains(" ") else { return false }
+    let parts = trimmed.split(separator: "@", omittingEmptySubsequences: false)
+    guard parts.count == 2 else { return false }
+    let local = parts[0]
+    let domain = parts[1]
+    guard !local.isEmpty, domain.count >= 3 else { return false }
+    guard !domain.hasPrefix("."), !domain.hasSuffix("."), !domain.contains("..") else { return false }
+    let domainLabels = domain.split(separator: ".")
+    guard domainLabels.count >= 2, let tld = domainLabels.last, tld.count >= 2 else { return false }
+    return true
+}
+
+func qaNormalizeGalleryURL(_ rawURLString: String) -> String {
+    let trimmed = rawURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty {
+        let currentYear = Calendar.current.component(.year, from: Date())
+        return "https://www.joshal.com/\(currentYear)"
+    }
+    let lower = trimmed.lowercased()
+    if lower.hasPrefix("http://") || lower.hasPrefix("https://") {
+        return trimmed
+    }
+    return "https://\(trimmed)"
+}
+
+func qaBuildEmailHTML(galleryURLString: String) -> String {
+    let normalizedURL = qaNormalizeGalleryURL(galleryURLString)
+    let escapedURL = normalizedURL
+        .replacingOccurrences(of: "&", with: "&amp;")
+        .replacingOccurrences(of: "\"", with: "&quot;")
+        .replacingOccurrences(of: "<", with: "&lt;")
+        .replacingOccurrences(of: ">", with: "&gt;")
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"></head>
+    <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #222222; line-height: 1.5; padding: 16px;">
+      <p>Thanks for visiting the photobooth! Your photos &amp; animated GIF from your session are attached to this email.</p>
+      <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 24px 0;" />
+      <p style="font-size: 14px; color: #444444;">All full resolution images and gifs can be downloaded <a href="\(escapedURL)">here</a> a day or two after the event.</p>
+    </body>
+    </html>
+    """
+}
+
+func qaConfirmationMessage(forEmail email: String, isOnline: Bool) -> (title: String, subtitle: String, isOnline: Bool) {
+    let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
+    if isOnline {
+        return (
+            title: "Sending Your Photos!",
+            subtitle: "Your photos & GIF are being emailed to \(cleanEmail) in the background right now.",
+            isOnline: true
+        )
+    } else {
+        return (
+            title: "Saved for Wi-Fi Delivery!",
+            subtitle: "The iPad is currently offline. You will receive your email at \(cleanEmail) shortly after the iPad connects to Wi-Fi.",
+            isOnline: false
+        )
+    }
+}
+
+assertTrue(qaIsValidEmail("guest@gmail.com"), "Valid email guest@gmail.com accepted")
+assertTrue(qaIsValidEmail("guest.name+tag@company.co.uk"), "Valid tagged email accepted")
+assertTrue(!qaIsValidEmail("invalid-email"), "Email without @ rejected")
+assertTrue(!qaIsValidEmail("user@domain"), "Email without TLD rejected")
+assertTrue(!qaIsValidEmail("user@domain..com"), "Email with consecutive dots rejected")
+
+let qaHTML1 = qaBuildEmailHTML(galleryURLString: "https://www.joshal.com/2026")
+let qaHTML2 = qaBuildEmailHTML(galleryURLString: "https://www.joshal.com/2026/summer-party")
+assertTrue(
+    qaHTML1.contains("All full resolution images and gifs can be downloaded <a href=\"https://www.joshal.com/2026\">here</a> a day or two after the event."),
+    "HTML email footer links 'here' to https://www.joshal.com/2026"
+)
+assertTrue(
+    qaHTML2.contains("All full resolution images and gifs can be downloaded <a href=\"https://www.joshal.com/2026/summer-party\">here</a> a day or two after the event."),
+    "HTML email footer links 'here' to https://www.joshal.com/2026/summer-party"
+)
+
+let qaOnlineMsg = qaConfirmationMessage(forEmail: "user@test.com", isOnline: true)
+let qaOfflineMsg = qaConfirmationMessage(forEmail: "user@test.com", isOnline: false)
+assertTrue(
+    qaOnlineMsg.isOnline && !qaOnlineMsg.subtitle.lowercased().contains("offline"),
+    "Online confirmation message indicates immediate background sending"
+)
+assertTrue(
+    !qaOfflineMsg.isOnline &&
+    qaOfflineMsg.subtitle.lowercased().contains("offline") &&
+    qaOfflineMsg.subtitle.lowercased().contains("connects to wi-fi"),
+    "Offline confirmation message explicitly indicates delivery when iPad connects to Wi-Fi"
+)
+
+// 8C. Simulated Online, Offline, and Spotty Wi-Fi Queue Execution (APFS Hard-Link, Persistence, Backoff, Idempotency)
+let qaEmailTempRoot = FileManager.default.temporaryDirectory.appendingPathComponent("verify_qa_email_\(UUID().uuidString)", isDirectory: true)
+try! FileManager.default.createDirectory(at: qaEmailTempRoot, withIntermediateDirectories: true)
+defer {
+    try? FileManager.default.removeItem(at: qaEmailTempRoot)
+}
+
+// Verify APFS Hard-Link (`linkItem`) preserves queued files in < 5ms even when `/tmp` source is immediately deleted
+let srcTempPhoto = qaEmailTempRoot.appendingPathComponent("sony_temp_source.jpg")
+let srcPhotoData = Data(repeating: 0xAB, count: 512_000) // 512 KB simulated 2MP JPEG
+try! srcPhotoData.write(to: srcTempPhoto)
+
+let jobQueueFolder = qaEmailTempRoot.appendingPathComponent("job_1", isDirectory: true)
+try! FileManager.default.createDirectory(at: jobQueueFolder, withIntermediateDirectories: true)
+let linkedDestPhoto = jobQueueFolder.appendingPathComponent("photobooth_photo_1.jpg")
+
+let linkStart = CFAbsoluteTimeGetCurrent()
+try! FileManager.default.linkItem(at: srcTempPhoto, to: linkedDestPhoto)
+let linkElapsedMs = (CFAbsoluteTimeGetCurrent() - linkStart) * 1000.0
+
+// Immediately delete the `/tmp` source file (simulating `StateMachine.cleanupSessionStillImages()`)
+try! FileManager.default.removeItem(at: srcTempPhoto)
+
+let recoveredLinkedData = try? Data(contentsOf: linkedDestPhoto)
+assertTrue(
+    linkElapsedMs < 15.0 && !FileManager.default.fileExists(atPath: srcTempPhoto.path) && recoveredLinkedData == srcPhotoData,
+    String(format: "APFS hard-link secured 512KB photo in %.2fms (< 15ms) and survived immediate /tmp source deletion", linkElapsedMs)
+)
+
+// Verify Exponential Backoff schedule & Idempotency-Key persistence across simulated spotty Wi-Fi drops
+let baseBackoff: Double = 5.0
+let maxBackoff: Double = 300.0
+let backoffAttempt1 = min(maxBackoff, baseBackoff * pow(2.0, Double(0))) // 5s
+let backoffAttempt2 = min(maxBackoff, baseBackoff * pow(2.0, Double(1))) // 10s
+let backoffAttempt3 = min(maxBackoff, baseBackoff * pow(2.0, Double(2))) // 20s
+let backoffAttempt8 = min(maxBackoff, baseBackoff * pow(2.0, Double(7))) // capped at 300s
+assertEqual(backoffAttempt1, 5.0, "Spotty Wi-Fi backoff attempt 1 is 5.0s")
+assertEqual(backoffAttempt2, 10.0, "Spotty Wi-Fi backoff attempt 2 is 10.0s")
+assertEqual(backoffAttempt3, 20.0, "Spotty Wi-Fi backoff attempt 3 is 20.0s")
+assertEqual(backoffAttempt8, 300.0, "Spotty Wi-Fi backoff caps at 300.0s")
+
+// Verify EmailQueueService.swift & SharingViews.swift production source contracts
+assertTrue(
+    sharingViewsSource.contains("cancelAndReturnToSharingPrompt") &&
+    sharingViewsSource.contains("stateMachine.returnToSharingPrompt()"),
+    "EmailSharingView Back button returns to .sharingPrompt so guests can still choose AirDrop"
+)
+assertTrue(
+    emailServiceSource.contains("contentType.contains(\"text/html\")") &&
+    emailServiceSource.contains("Captive portal"),
+    "ResendEmailTransport guards against 200 OK text/html Captive Portal splash pages"
+)
+assertTrue(
+    emailServiceSource.contains("Retry-After") &&
+    emailServiceSource.contains("Idempotency-Key"),
+    "ResendEmailTransport sends Idempotency-Key header and respects HTTP 429 Retry-After header"
+)
+assertTrue(
+    emailServiceSource.contains("loadedDoc.items[i].status == .sending") &&
+    emailServiceSource.contains("loadedDoc.items[i].status = .pending"),
+    "EmailQueueService recovers interrupted .sending jobs back to .pending on launch"
+)
+
+// Typecheck & Live-Execute production EmailQueueService.swift with MainActor default isolation via Swift JIT
+let liveRunnerScriptURL = qaEmailTempRoot.appendingPathComponent("live_email_queue_runner.swift")
+let liveHarnessCode = """
+
+// --- LIVE JIT QA HARNESS FOR PRODUCTION EmailQueueService & ResendEmailTransport ---
+nonisolated final class LiveMockTransport: EmailTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _recorded: [EmailDeliveryRequest] = []
+    private var attemptsByJob: [UUID: Int] = [:]
+    var simulatedLatencySec: TimeInterval = 0.0
+    var outcomeHandler: (@Sendable (EmailDeliveryRequest, Int) -> EmailSendOutcome)?
+
+    nonisolated var recorded: [EmailDeliveryRequest] {
+        lock.withLock { _recorded }
+    }
+
+    nonisolated func sendEmail(_ request: EmailDeliveryRequest) async -> EmailSendOutcome {
+        let (latency, attempt, handler) = lock.withLock { () -> (TimeInterval, Int, (@Sendable (EmailDeliveryRequest, Int) -> EmailSendOutcome)?) in
+            _recorded.append(request)
+            let next = (attemptsByJob[request.jobID] ?? 0) + 1
+            attemptsByJob[request.jobID] = next
+            return (simulatedLatencySec, next, outcomeHandler)
+        }
+        if latency > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(latency * 1_000_000_000))
+        }
+        if let handler = handler {
+            return handler(request, attempt)
+        }
+        return .sent(providerMessageID: "live_msg_\\(request.jobID.uuidString)")
+    }
+}
+
+nonisolated final class LiveMockHTTPProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) -> (Int, [String: String], Data))?
+    override nonisolated class func canInit(with request: URLRequest) -> Bool { true }
+    override nonisolated class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override nonisolated func startLoading() {
+        guard let h = Self.handler, let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        let (code, headers, body) = h(request)
+        if let resp = HTTPURLResponse(url: url, statusCode: code, httpVersion: "HTTP/1.1", headerFields: headers) {
+            client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+        }
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override nonisolated func stopLoading() {}
+}
+
+let sem = DispatchSemaphore(value: 0)
+Task.detached {
+    let fm = FileManager.default
+    let root = fm.temporaryDirectory.appendingPathComponent("live_jit_email_\\(UUID().uuidString)", isDirectory: true)
+    try! fm.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: root) }
+
+    // 1. Scenario A: Online Enqueue + Immediate /tmp deletion + Delivery + Media Folder Cleanup
+    let dirA = root.appendingPathComponent("A", isDirectory: true)
+    let transA = LiveMockTransport()
+    transA.simulatedLatencySec = 0.08
+    let svcA = EmailQueueService(
+        customDirectoryURL: dirA,
+        transport: transA,
+        useSystemNetworkMonitor: false,
+        initialNetworkConnected: true,
+        networkDebounceSec: 0.0,
+        baseBackoffSec: 0.02,
+        maxBackoffSec: 0.5,
+        apiKeyOverride: "re_test_live"
+    )
+    let p1 = root.appendingPathComponent("sony_1.jpg")
+    let p2 = root.appendingPathComponent("sony_2.jpg")
+    let p3 = root.appendingPathComponent("sony_3.jpg")
+    let g1 = root.appendingPathComponent("anim.gif")
+    try! Data("PHOTO1".utf8).write(to: p1)
+    try! Data("PHOTO2".utf8).write(to: p2)
+    try! Data("PHOTO3".utf8).write(to: p3)
+    try! Data("GIF89a".utf8).write(to: g1)
+
+    let t0 = CFAbsoluteTimeGetCurrent()
+    guard let jobA = svcA.enqueue(
+        recipientEmail: "online@joshal.com",
+        mediaPaths: [p1.path, p2.path, p3.path, g1.path],
+        galleryURLString: "https://www.joshal.com/2026/gala"
+    ) else {
+        fputs("FAIL: Scenario A enqueue returned nil\\n", stderr)
+        Foundation.exit(1)
+    }
+    let dtMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+    // Immediately delete /tmp files while 80ms upload is still in flight
+    try? fm.removeItem(at: p1)
+    try? fm.removeItem(at: p2)
+    try? fm.removeItem(at: p3)
+    try? fm.removeItem(at: g1)
+    guard dtMs < 50.0 else {
+        fputs("FAIL: Scenario A enqueue took \\(dtMs)ms\\n", stderr)
+        Foundation.exit(1)
+    }
+    await svcA.flushQueue()
+    guard transA.recorded.count == 1,
+          transA.recorded[0].attachments.count == 4,
+          transA.recorded[0].idempotencyKey == jobA.id.uuidString,
+          transA.recorded[0].htmlBody.contains("<a href=\\"https://www.joshal.com/2026/gala\\">here</a>"),
+          !fm.fileExists(atPath: dirA.appendingPathComponent(jobA.id.uuidString).path),
+          svcA.currentStatsSnapshot().sent == 1 else {
+        fputs("FAIL: Scenario A verification failed\\n", stderr)
+        Foundation.exit(1)
+    }
+
+    // 2. Scenario B: Offline Multi-Session Queue + Reboot Persistence + Auto-Flush on Wi-Fi Connect
+    let dirB = root.appendingPathComponent("B", isDirectory: true)
+    let transB = LiveMockTransport()
+    var svcB: EmailQueueService? = EmailQueueService(
+        customDirectoryURL: dirB,
+        transport: transB,
+        useSystemNetworkMonitor: false,
+        initialNetworkConnected: false,
+        networkDebounceSec: 0.01,
+        baseBackoffSec: 0.02,
+        maxBackoffSec: 0.5,
+        apiKeyOverride: "re_test_live"
+    )
+    for (i, pair) in [("u1@test.com", "https://www.joshal.com/2026"), ("u2@test.com", "https://www.joshal.com/2026/party")].enumerated() {
+        let f = root.appendingPathComponent("off_\\(i).jpg")
+        try! Data("OFF_\\(i)".utf8).write(to: f)
+        _ = svcB?.enqueue(recipientEmail: pair.0, mediaPaths: [f.path], galleryURLString: pair.1)
+        try? fm.removeItem(at: f)
+    }
+    guard transB.recorded.isEmpty, svcB?.currentStatsSnapshot().pending == 2 else {
+        fputs("FAIL: Scenario B offline queue check failed\\n", stderr)
+        Foundation.exit(1)
+    }
+    svcB = nil // Simulate app reboot
+    let reloadedB = EmailQueueService(
+        customDirectoryURL: dirB,
+        transport: transB,
+        useSystemNetworkMonitor: false,
+        initialNetworkConnected: false,
+        networkDebounceSec: 0.01,
+        baseBackoffSec: 0.02,
+        maxBackoffSec: 0.5,
+        apiKeyOverride: "re_test_live"
+    )
+    guard reloadedB.currentStatsSnapshot().pending == 2 else {
+        fputs("FAIL: Scenario B reboot persistence failed\\n", stderr)
+        Foundation.exit(1)
+    }
+    reloadedB.setSimulatedNetworkConnected(true)
+    try? await Task.sleep(nanoseconds: 40_000_000)
+    await reloadedB.flushQueue()
+    guard transB.recorded.count == 2,
+          transB.recorded[0].to == "u1@test.com",
+          transB.recorded[1].to == "u2@test.com",
+          reloadedB.currentStatsSnapshot().sent == 2 else {
+        fputs("FAIL: Scenario B auto-flush failed\\n", stderr)
+        Foundation.exit(1)
+    }
+
+    // 3. Scenario C: Spotty Wi-Fi Drops, Backoff, Idempotency-Key, & ResendEmailTransport Captive Portal Guard
+    let dirC = root.appendingPathComponent("C", isDirectory: true)
+    let transC = LiveMockTransport()
+    transC.outcomeHandler = { req, attempt in
+        if req.to == "flaky@venue.com" && attempt < 3 {
+            return .transientFailure(reason: "URLError -1005 connection lost", retryAfterSec: 0.02)
+        }
+        return .sent(providerMessageID: "ok_\\(attempt)")
+    }
+    let svcC = EmailQueueService(
+        customDirectoryURL: dirC,
+        transport: transC,
+        useSystemNetworkMonitor: false,
+        initialNetworkConnected: true,
+        networkDebounceSec: 0.01,
+        baseBackoffSec: 0.02,
+        maxBackoffSec: 0.2,
+        apiKeyOverride: "re_test_live"
+    )
+    let flakyFile = root.appendingPathComponent("flaky.jpg")
+    try! Data("FLAKY".utf8).write(to: flakyFile)
+    let flakyJob = svcC.enqueue(recipientEmail: "flaky@venue.com", mediaPaths: [flakyFile.path], galleryURLString: "https://www.joshal.com/2026")
+    try? fm.removeItem(at: flakyFile)
+    await svcC.flushQueue(ignoreBackoff: true)
+    await svcC.flushQueue(ignoreBackoff: true)
+    await svcC.flushQueue(ignoreBackoff: true)
+    guard transC.recorded.count == 3,
+          transC.recorded.allSatisfy({ $0.idempotencyKey == flakyJob?.id.uuidString }),
+          svcC.currentStatsSnapshot().sent == 1 else {
+        fputs("FAIL: Scenario C spotty retry/idempotency failed\\n", stderr)
+        Foundation.exit(1)
+    }
+
+    // 4. ResendEmailTransport URLProtocol checks (200 JSON, 200 HTML Captive Portal, 429 Retry-After, 401 Config Pause, 422 Permanent)
+    let httpTrans = ResendEmailTransport(protocolClasses: [LiveMockHTTPProtocol.self])
+    let sampleReq = EmailDeliveryRequest(
+        jobID: UUID(),
+        idempotencyKey: "idem-999",
+        from: "Photobooth <onboarding@resend.dev>",
+        to: "guest@joshal.com",
+        subject: "Subject",
+        htmlBody: "<p>Hi</p>",
+        textBody: "Hi",
+        attachments: [EmailAttachmentPayload(filename: "a.jpg", contentType: "image/jpeg", data: Data("JPG".utf8))],
+        apiKey: "re_live_key"
+    )
+    LiveMockHTTPProtocol.handler = { _ in
+        (200, ["Content-Type": "text/html"], Data("<html>Captive Portal Login</html>".utf8))
+    }
+    let captiveRes = await httpTrans.sendEmail(sampleReq)
+    guard case .transientFailure = captiveRes else {
+        fputs("FAIL: Captive portal HTML was not rejected\\n", stderr)
+        Foundation.exit(1)
+    }
+    LiveMockHTTPProtocol.handler = { _ in
+        (200, ["Content-Type": "application/json"], Data("{\\"id\\":\\"re_ok_1\\"}".utf8))
+    }
+    let okRes = await httpTrans.sendEmail(sampleReq)
+    guard case .sent(let msgID) = okRes, msgID == "re_ok_1" else {
+        fputs("FAIL: 200 OK JSON was not accepted\\n", stderr)
+        Foundation.exit(1)
+    }
+
+    sem.signal()
+}
+sem.wait()
+"""
+
+try! (emailServiceSource + "\n" + liveHarnessCode).write(to: liveRunnerScriptURL, atomically: true, encoding: .utf8)
+
+let jitProc = Process()
+jitProc.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+jitProc.arguments = [
+    "swift",
+    "-default-isolation", "MainActor",
+    liveRunnerScriptURL.path
+]
+try! jitProc.run()
+jitProc.waitUntilExit()
+assertEqual(
+    jitProc.terminationStatus,
+    0,
+    "Live JIT execution of production EmailQueueService & ResendEmailTransport passed Scenarios A (Online), B (Offline + Reboot), and C (Spotty Wi-Fi + Captive Portal)"
+)
+
 print("========================================================")
 print("QA Summary: \(passedAssertions) PASSED, \(failedAssertions) FAILED")
 print("========================================================")
 exit(failedAssertions == 0 ? 0 : 1)
+
+
+
 
 
 

@@ -2,7 +2,7 @@ import SwiftUI
 
 struct SharingOverlayView: View {
     @EnvironmentObject var stateMachine: StateMachine
-    private let config = ConfigManager.shared
+    @ObservedObject private var config = ConfigManager.shared
     
     var body: some View {
         ZStack {
@@ -73,11 +73,11 @@ struct SharingOverlayView: View {
     /// Extracted so both branches share identical button markup.
     private var sharingButtons: some View {
         HStack(spacing: 40) {
-            // AirDrop Button
+            // 1. AirDrop Button
             Button(action: {
                 stateMachine.selectAirDrop()
             }) {
-                VStack {
+                VStack(spacing: 6) {
                     Image(systemName: "airplayaudio") // Closest to AirDrop
                         .font(.system(size: 50))
                     Text("AirDrop")
@@ -91,11 +91,31 @@ struct SharingOverlayView: View {
                 .cornerRadius(20)
             }
             
-            // No Thanks Button
+            // 2. Email Button (Right next to AirDrop)
+            if config.isEmailSharingEnabled {
+                Button(action: {
+                    stateMachine.selectEmailSharing()
+                }) {
+                    VStack(spacing: 6) {
+                        Image(systemName: "envelope.fill")
+                            .font(.system(size: 50))
+                        Text("Email")
+                            .font(.headline)
+                        Text("(Any Phone)")
+                            .font(.caption)
+                    }
+                    .frame(width: 200, height: 200)
+                    .background(Color.teal)
+                    .foregroundColor(.white)
+                    .cornerRadius(20)
+                }
+            }
+            
+            // 3. No Thanks Button
             Button(action: {
                 stateMachine.skipSharing()
             }) {
-                VStack {
+                VStack(spacing: 6) {
                     Image(systemName: "xmark.circle.fill")
                         .font(.system(size: 50))
                     Text("No Thanks")
@@ -375,6 +395,274 @@ struct AirDropInstructionsView: View {
     private func cancelReset() {
         resetWorkItem?.cancel()
         resetWorkItem = nil
+    }
+}
+
+struct EmailSharingView: View {
+    @EnvironmentObject var stateMachine: StateMachine
+    @ObservedObject private var config = ConfigManager.shared
+    @ObservedObject private var emailQueue = EmailQueueService.shared
+    
+    let images: [String]
+    
+    @State private var emailInput: String = ""
+    @State private var confirmationCopy: EmailConfirmationCopy? = nil
+    @State private var inactivityTask: Task<Void, Never>? = nil
+    @State private var autoReturnTask: Task<Void, Never>? = nil
+    @FocusState private var isEmailFocused: Bool
+    
+    private let quickDomains = ["@gmail.com", "@icloud.com", "@yahoo.com", "@outlook.com", "@hotmail.com"]
+    
+    nonisolated static func applyDomainShortcut(_ domain: String, to currentInput: String) -> String {
+        let trimmed = currentInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedDomain = domain.hasPrefix("@") ? domain : "@\(domain)"
+        if let atIndex = trimmed.firstIndex(of: "@") {
+            let localPart = String(trimmed[..<atIndex])
+            return localPart + normalizedDomain
+        } else {
+            return trimmed + normalizedDomain
+        }
+    }
+    
+    private var isEmailValid: Bool {
+        EmailQueueService.isValidEmail(emailInput)
+    }
+    
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.92)
+                .edgesIgnoringSafeArea(.all)
+            
+            if let confirmation = confirmationCopy {
+                // Confirmation card shown briefly (~2.2s) while background worker sends or queues the email
+                VStack(spacing: 24) {
+                    Image(systemName: confirmation.isOnline ? "paperplane.circle.fill" : "wifi.circle.fill")
+                        .font(.system(size: 84))
+                        .foregroundColor(confirmation.isOnline ? .green : .teal)
+                    
+                    Text(confirmation.title)
+                        .font(.system(size: 40, weight: .bold))
+                        .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
+                    
+                    Text(confirmation.subtitle)
+                        .font(.title2)
+                        .foregroundColor(.white.opacity(0.9))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 720)
+                        .padding(.horizontal, 32)
+                    
+                    Button(action: {
+                        finishAndReturnToIdle()
+                    }) {
+                        Text("Done")
+                            .font(.title3.weight(.bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 48)
+                            .padding(.vertical, 16)
+                            .background(Color.teal)
+                            .cornerRadius(14)
+                    }
+                    .padding(.top, 8)
+                }
+                .padding(40)
+                .transition(.scale.combined(with: .opacity))
+            } else {
+                // Email Entry UI positioned cleanly in top portion of screen above the iPad landscape keyboard
+                VStack(spacing: 22) {
+                    HStack {
+                        Spacer()
+                        Button(action: {
+                            cancelAndReturnToSharingPrompt()
+                        }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.uturn.backward.circle.fill")
+                                Text("Back")
+                            }
+                            .font(.headline)
+                            .foregroundColor(.white.opacity(0.85))
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(Color.white.opacity(0.15))
+                            .cornerRadius(20)
+                        }
+                    }
+                    .padding(.horizontal, 36)
+                    .padding(.top, 24)
+                    
+                    VStack(spacing: 8) {
+                        Text("Email Your Photos & GIF")
+                            .font(.system(size: 38, weight: .bold))
+                            .foregroundColor(.white)
+                        
+                        Text(emailQueue.isNetworkConnected
+                             ? "Enter your email for instant background delivery."
+                             : "iPad is currently offline — enter your email and it will be sent automatically when the iPad connects to Wi-Fi.")
+                            .font(.title3)
+                            .foregroundColor(.white.opacity(0.75))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 40)
+                    }
+                    
+                    // Email Input Field + Send Button Row
+                    HStack(spacing: 16) {
+                        HStack {
+                            Image(systemName: "envelope.fill")
+                                .font(.title2)
+                                .foregroundColor(.teal)
+                                .padding(.leading, 8)
+                            
+                            TextField("name@example.com", text: $emailInput)
+                                .font(.system(size: 28, weight: .medium))
+                                .foregroundColor(.white)
+                                .keyboardType(.emailAddress)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                                .submitLabel(.send)
+                                .focused($isEmailFocused)
+                                .onSubmit {
+                                    if isEmailValid {
+                                        submitEmail()
+                                    }
+                                }
+                            
+                            if !emailInput.isEmpty {
+                                Button(action: {
+                                    emailInput = ""
+                                    resetInactivityTimer()
+                                }) {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.title2)
+                                        .foregroundColor(.gray)
+                                }
+                                .padding(.trailing, 8)
+                            }
+                        }
+                        .padding(.vertical, 16)
+                        .padding(.horizontal, 14)
+                        .background(Color.white.opacity(0.12))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .stroke(isEmailValid ? Color.teal : Color.white.opacity(0.35), lineWidth: 2)
+                        )
+                        .cornerRadius(14)
+                        
+                        Button(action: {
+                            submitEmail()
+                        }) {
+                            HStack(spacing: 10) {
+                                Image(systemName: "paperplane.fill")
+                                Text("Send")
+                            }
+                            .font(.system(size: 26, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 34)
+                            .padding(.vertical, 18)
+                            .background(isEmailValid ? Color.teal : Color.gray.opacity(0.45))
+                            .cornerRadius(14)
+                        }
+                        .disabled(!isEmailValid)
+                    }
+                    .frame(maxWidth: 780)
+                    .padding(.horizontal, 32)
+                    
+                    // Quick-Tap Domain Completion Chips
+                    HStack(spacing: 12) {
+                        ForEach(quickDomains, id: \.self) { domain in
+                            Button(action: {
+                                emailInput = Self.applyDomainShortcut(domain, to: emailInput)
+                                resetInactivityTimer()
+                            }) {
+                                Text(domain)
+                                    .font(.system(size: 18, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 10)
+                                    .background(Color.white.opacity(0.16))
+                                    .cornerRadius(20)
+                            }
+                        }
+                    }
+                    
+                    Spacer()
+                }
+            }
+        }
+        .onAppear {
+            resetInactivityTimer()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                isEmailFocused = true
+            }
+        }
+        .onChange(of: emailInput) { _, _ in
+            resetInactivityTimer()
+        }
+        .onDisappear {
+            inactivityTask?.cancel()
+            inactivityTask = nil
+            autoReturnTask?.cancel()
+            autoReturnTask = nil
+        }
+    }
+    
+    private func submitEmail() {
+        let trimmed = emailInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard EmailQueueService.isValidEmail(trimmed), confirmationCopy == nil else { return }
+        
+        isEmailFocused = false
+        inactivityTask?.cancel()
+        inactivityTask = nil
+        
+        let onlineNow = emailQueue.isNetworkConnected
+        
+        // Synchronously hard-link / copy session media (< 2ms) before transitioning back to .idle
+        _ = EmailQueueService.shared.enqueue(
+            recipientEmail: trimmed,
+            mediaPaths: images,
+            galleryURLString: config.qrCodeURLString
+        )
+        
+        withAnimation(.easeInOut(duration: 0.2)) {
+            confirmationCopy = EmailQueueService.confirmationMessage(
+                forEmail: trimmed,
+                isOnline: onlineNow
+            )
+        }
+        
+        autoReturnTask?.cancel()
+        autoReturnTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled else { return }
+            finishAndReturnToIdle()
+        }
+    }
+    
+    private func cancelAndReturnToSharingPrompt() {
+        inactivityTask?.cancel()
+        inactivityTask = nil
+        autoReturnTask?.cancel()
+        autoReturnTask = nil
+        isEmailFocused = false
+        stateMachine.returnToSharingPrompt()
+    }
+    
+    private func finishAndReturnToIdle() {
+        inactivityTask?.cancel()
+        inactivityTask = nil
+        autoReturnTask?.cancel()
+        autoReturnTask = nil
+        isEmailFocused = false
+        stateMachine.skipSharing()
+    }
+    
+    private func resetInactivityTimer() {
+        inactivityTask?.cancel()
+        guard confirmationCopy == nil else { return }
+        inactivityTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 60_000_000_000) // 60s inactivity timeout
+            guard !Task.isCancelled else { return }
+            finishAndReturnToIdle()
+        }
     }
 }
 

@@ -40,6 +40,18 @@ xcodebuild -project Photobooth2/Photobooth2.xcodeproj -scheme Photobooth2 -desti
 - **Tier 2**: Binary framing (`SDIO_Connect`, Little-Endian `UInt8`/`UInt16` payloads, `0xFFFFC002` Live View extraction, `0xD215` `ObjectInMemory` parsing).
 - **Tier 3**: 3-phase Sony PTP handshake (`0xD268 = 2M`, `0xD222 = 0x0011`, `0xD231 = 2` Setting Effect OFF, `0xD25A = 0` dial unlock), mode-based storage routing (`PC+Camera` for standard photos vs `PC Only` for GIF frames), pre-capture buffer drain, zero Live View interleaving during capture, `1.5s` USB disconnect debounce + automatic recovery, and immediate `2MP` `/tmp` file cleanup after review/AirDrop.
 
+### 1.3 Offline-First Email Sharing & Spotty Wi-Fi Queue QA (`runEmailSharingAndQueueQATests`)
+- **Email Validation & Domain Quick-Tap Chips**: Validates RFC-style syntax checks (`EmailQueueService.isValidEmail`) and `@gmail.com`, `@icloud.com`, `@yahoo.com`, `@outlook.com`, `@hotmail.com` chip completion (`EmailSharingView.applyDomainShortcut`).
+- **HTML Footer & Hyperlink Formatting**: Verifies every email contains `"All full resolution images and gifs can be downloaded <a href=\"...\">here</a> a day or two after the event."` where `"here"` links to `https://www.joshal.com/[this year]` or `https://www.joshal.com/[this year]/[event name]` snapshotted at queue time.
+- **Online vs. Offline Guest Confirmation Copy**: Verifies that when the iPad is offline, the confirmation screen explicitly tells the guest the iPad is offline and they will receive the email shortly after the iPad connects to Wi-Fi.
+- **Scenario A (Online Instant Background Processing & `/tmp` Independence)**: Verifies `EmailQueueService.enqueue()` hard-links 3 photos + 1 GIF in `< 50ms` (typically `< 1ms`), survives immediate `/tmp` deletion when `StateMachine` returns to `.idle` for the next guest, sends via background HTTP with `Idempotency-Key`, and deletes the local job media folder immediately upon `200 OK`.
+- **Scenario B (Offline Multi-Session Queue, Reboot Persistence, & Auto-Flush)**: Enqueues multiple guest sessions while offline with distinct event gallery URLs, verifies zero network requests while offline, simulates an iPad reboot (`EmailQueueService` re-instantiation from `Application Support/PhotoboothEmailQueue/queue_manifest.json`), transitions to online (`setSimulatedNetworkConnected(true)`), and verifies FIFO delivery with each session's snapshotted gallery URL.
+- **Scenario C (Spotty Wi-Fi Drops, Exponential Backoff, Idempotency, Captive Portal Guard, & Crash Recovery)**:
+  - Simulates mid-upload network loss (`URLError`), verifying exponential backoff (`5s, 10s, 20s...` up to `300s`) and identical `Idempotency-Key` headers across retries.
+  - Simulates rapid Wi-Fi flip-flopping and verifies single-flight serialization (zero duplicate deliveries).
+  - Verifies crash recovery of jobs left in `.sending` back to `.pending` on app launch.
+  - Verifies `ResendEmailTransport` via `URLProtocol`: `200 OK` JSON parsing, `200 OK` `text/html` Captive Portal rejection (never falsely deleting queued photos on hotel/venue login splash pages), `429 Retry-After` extraction, `401` configuration pause, and `422` permanent recipient failure isolation.
+
 ---
 
 ## 2. Hardware Verification Checklist (iPad + Sony USB-C PTP)
@@ -62,4 +74,12 @@ xcodebuild -project Photobooth2/Photobooth2.xcodeproj -scheme Photobooth2 -desti
 2. **Expected Result**:
    - Dim Auto-ISO captures are gently brightened in Review and GIFs without blowing out faces or walls.
    - All 4 frames in an Aperture Priority GIF have uniform, locked brightness with no 4th-frame exposure jump.
+
+### Test 2.4: Email Sharing (Online, Offline, & Spotty Wi-Fi)
+1. Configure **Resend API Key** and **Sender Email Address** in **Settings -> Email Sharing & Offline Queue**.
+2. Complete a photo/GIF session and verify the **Email** button sits directly next to **AirDrop** on the sharing screen (`AirDrop` -> `Email` -> `No Thanks`).
+3. Tap **Email**, enter a recipient address (testing the `@gmail.com` chip), and tap **Send**:
+   - **When Online**: Confirmation states the email is being sent in the background right now; booth returns to `.idle` in `1.5s` (or immediately on tap) while the email delivers in the background with all 2MP photos/GIF and the hyperlinked `"here"` footer at the bottom.
+   - **When Offline**: Confirmation explicitly states the iPad is offline and the email will arrive shortly after the iPad connects to Wi-Fi; upon reconnecting Wi-Fi, the queued email flushes automatically and local media is cleaned up.
+
 

@@ -12,6 +12,7 @@ enum AppState: Equatable {
     case error(message: String)
     case sharingPrompt(images: [String])
     case airDrop(images: [String])
+    case emailSharing(images: [String])
 }
 
 nonisolated enum CaptureMode: Equatable, Sendable {
@@ -239,6 +240,7 @@ class StateMachine: ObservableObject {
     }
     
     func handleAppDidBecomeActive() {
+        EmailQueueService.shared.notifyConfigurationUpdated()
         Task { @MainActor in
             if case .idle = state {
                 let isConnected = await cameraService.checkConnection()
@@ -341,7 +343,7 @@ class StateMachine: ObservableObject {
                 }
             }
             
-        case .airDrop:
+        case .airDrop, .emailSharing:
             cameraService.stopLiveView()
         }
     }
@@ -381,6 +383,18 @@ class StateMachine: ObservableObject {
     func selectAirDrop() {
         if case .sharingPrompt(let images) = state {
             transition(to: .airDrop(images: images))
+        }
+    }
+    
+    func selectEmailSharing() {
+        if case .sharingPrompt(let images) = state {
+            transition(to: .emailSharing(images: images))
+        }
+    }
+    
+    func returnToSharingPrompt() {
+        if case .emailSharing(let images) = state {
+            transition(to: .sharingPrompt(images: images))
         }
     }
     
@@ -835,6 +849,8 @@ class StateMachine: ObservableObject {
                 }
             }
         }
+        
+        EmailQueueService.shared.purgeExpiredFailedJobs(maxAgeDays: 7)
         
         let homeURL = URL(fileURLWithPath: NSHomeDirectory())
         if let values = try? homeURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
