@@ -1856,6 +1856,18 @@ Task.detached {
         Foundation.exit(1)
     }
 
+    let gifHTML = EmailQueueService.buildEmailHTML(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["photobooth_animation.gif"])
+    let gifText = EmailQueueService.buildEmailPlainText(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["photobooth_animation.gif"])
+    let photoHTML = EmailQueueService.buildEmailHTML(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["photo_1.jpg"])
+    let photoText = EmailQueueService.buildEmailPlainText(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["photo_1.jpg"])
+    guard gifHTML.contains("Share → Save Image"),
+          gifText.contains("Share -> Save Image"),
+          !photoHTML.contains("Save Image"),
+          !photoText.contains("Save Image") else {
+        fputs("FAIL: GIF-only mobile saving note was not properly scoped to GIF emails\\n", stderr)
+        Foundation.exit(1)
+    }
+
     sem.signal()
 }
 sem.wait()

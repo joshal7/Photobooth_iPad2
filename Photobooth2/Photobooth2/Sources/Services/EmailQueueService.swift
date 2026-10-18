@@ -909,6 +909,8 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
     }
 
     /// Builds the HTML email body containing the required hyperlinked gallery footer at the bottom.
+    /// For GIF sessions (and never for photo sessions), includes a helpful mobile tip explaining how to save
+    /// the animated GIF on iPhone email apps (Share -> Save Image instead of Download in Gmail/Outlook).
     nonisolated static func buildEmailHTML(galleryURLString: String, mediaOrFilenames: [String] = []) -> String {
         let normalizedURL = normalizeGalleryURL(galleryURLString)
         let escapedURL = normalizedURL
@@ -926,14 +928,27 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         let lower = mediaOrFilenames.map { $0.lowercased() }
         let hasGIF = lower.contains { $0.hasSuffix(".gif") }
         let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
-        let footerNoun = (hasGIF && !hasPhotos) ? "gifs" : "photos"
+        let isGIFOnly = hasGIF && !hasPhotos
+        let footerNoun = isGIFOnly ? "gifs" : "photos"
+        
+        let gifMobileNoteHTML: String
+        if isGIFOnly {
+            gifMobileNoteHTML = """
+            
+              <p style="font-size: 14px; color: #444444; background-color: #f7f7f8; border-left: 3px solid #888888; padding: 10px 12px; margin: 16px 0;">
+                <strong>📱 Saving on a phone:</strong> If you are using the <strong>Gmail</strong> or <strong>Outlook</strong> app on iPhone, tap the GIF and then tap <strong>Share → Save Image</strong> (instead of clicking Download, which only saves a still first frame). In <strong>Apple Mail</strong>, press and hold the GIF and tap <strong>Save Image</strong>.
+              </p>
+            """
+        } else {
+            gifMobileNoteHTML = ""
+        }
         
         return """
         <!DOCTYPE html>
         <html>
         <head><meta charset="UTF-8"></head>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #222222; line-height: 1.5; padding: 16px;">
-          <p>Thanks for visiting the photobooth! \(escapedDesc)</p>
+          <p>Thanks for visiting the photobooth! \(escapedDesc)</p>\(gifMobileNoteHTML)
           <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 24px 0;" />
           <p style="font-size: 14px; color: #444444;">All full resolution \(footerNoun) can be downloaded <a href="\(escapedURL)">here</a> a day or two after the event.</p>
         </body>
@@ -947,13 +962,24 @@ final class EmailQueueService: ObservableObject, @unchecked Sendable {
         let lower = mediaOrFilenames.map { $0.lowercased() }
         let hasGIF = lower.contains { $0.hasSuffix(".gif") }
         let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
-        let footerNoun = (hasGIF && !hasPhotos) ? "gifs" : "photos"
+        let isGIFOnly = hasGIF && !hasPhotos
+        let footerNoun = isGIFOnly ? "gifs" : "photos"
         
-        return """
-        Thanks for visiting the photobooth! \(desc)
+        if isGIFOnly {
+            return """
+            Thanks for visiting the photobooth! \(desc)
 
-        All full resolution \(footerNoun) can be downloaded here (\(normalizedURL)) a day or two after the event.
-        """
+            Saving on a phone: If you are using the Gmail or Outlook app on iPhone, tap the GIF and then tap Share -> Save Image (instead of clicking Download, which only saves a still first frame). In Apple Mail, press and hold the GIF and tap Save Image.
+
+            All full resolution \(footerNoun) can be downloaded here (\(normalizedURL)) a day or two after the event.
+            """
+        } else {
+            return """
+            Thanks for visiting the photobooth! \(desc)
+
+            All full resolution \(footerNoun) can be downloaded here (\(normalizedURL)) a day or two after the event.
+            """
+        }
     }
     
     /// Generates clear, unambiguous confirmation copy distinguishing online vs. offline iPad status (and unconfigured credentials).

@@ -1868,16 +1868,22 @@ enum AutomatedVerificationSuite {
             "GIF-only session uses 'Your gif from your session are attached to this email.'"
         )
         let htmlGifOnly = EmailQueueService.buildEmailHTML(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["anim.gif"])
+        let textGifOnly = EmailQueueService.buildEmailPlainText(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["anim.gif"])
         assertTrue(
             htmlGifOnly.contains("Your gif from your session are attached to this email.") &&
-            htmlGifOnly.contains("All full resolution gifs can be downloaded"),
-            "HTML email contains tailored GIF-only description and footer"
+            htmlGifOnly.contains("All full resolution gifs can be downloaded") &&
+            htmlGifOnly.contains("Share → Save Image") &&
+            textGifOnly.contains("Share -> Save Image"),
+            "GIF-only email contains tailored GIF description, footer, and mobile saving instructions (Share -> Save Image)"
         )
         let htmlPhotosOnly = EmailQueueService.buildEmailHTML(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["p1.jpg"])
+        let textPhotosOnly = EmailQueueService.buildEmailPlainText(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["p1.jpg"])
         assertTrue(
             htmlPhotosOnly.contains("Your photos from your session are attached to this email.") &&
-            htmlPhotosOnly.contains("All full resolution photos can be downloaded"),
-            "HTML email contains tailored Photos-only description and footer"
+            htmlPhotosOnly.contains("All full resolution photos can be downloaded") &&
+            !htmlPhotosOnly.contains("Save Image") &&
+            !textPhotosOnly.contains("Save Image"),
+            "Photos-only email contains tailored Photos description and footer without GIF saving instructions"
         )
         
         // 3. Online vs. Offline Guest Confirmation Copy
