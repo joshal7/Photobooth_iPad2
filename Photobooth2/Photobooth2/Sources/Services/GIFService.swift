@@ -118,7 +118,7 @@ final class GIFService: Sendable {
                 ? rawCG
                 : SonyUSBCameraClient.autoExposeCapturedCGImage(rawCG, ciContext: ciContext)
             let (luma, _) = SonyUSBCameraClient.measureSceneLuminance(baseCG)
-            loadedFrames.append(FrameEntry(cgImage: baseCG, luma: max(luma, 0.02)))
+            loadedFrames.append(FrameEntry(cgImage: baseCG, luma: max(luma, 0.06)))
         }
         
         guard !loadedFrames.isEmpty else {

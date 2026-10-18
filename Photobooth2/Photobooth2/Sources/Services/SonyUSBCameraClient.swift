@@ -122,6 +122,8 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     private let backdropLock = NSLock()
     private nonisolated(unsafe) var currentBackdrop: BackdropItem = .none
     private nonisolated(unsafe) var activeCaptureMode: CaptureMode = .standard
+    private nonisolated(unsafe) var latestLiveViewJPEGData: Data? = nil
+    private nonisolated(unsafe) var latestLiveViewTimestampNs: UInt64 = 0
     
     nonisolated func updateSelectedBackdrop(_ backdrop: BackdropItem) {
         backdropLock.lock()
@@ -139,6 +141,26 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         backdropLock.lock()
         defer { backdropLock.unlock() }
         return (currentBackdrop, activeCaptureMode)
+    }
+    
+    nonisolated private func cacheLiveViewJPEG(_ data: Data) {
+        backdropLock.lock()
+        latestLiveViewJPEGData = data
+        latestLiveViewTimestampNs = DispatchTime.now().uptimeNanoseconds
+        backdropLock.unlock()
+    }
+    
+    nonisolated private func recentLiveViewJPEG(maxAgeNs: UInt64) -> Data? {
+        backdropLock.lock()
+        defer { backdropLock.unlock() }
+        guard let data = latestLiveViewJPEGData, latestLiveViewTimestampNs > 0 else {
+            return nil
+        }
+        let nowNs = DispatchTime.now().uptimeNanoseconds
+        guard nowNs >= latestLiveViewTimestampNs, (nowNs - latestLiveViewTimestampNs) <= maxAgeNs else {
+            return nil
+        }
+        return data
     }
     
     /// Continuously monitors USB discovery every 2.5s while disconnected so that if the camera was already
@@ -627,6 +649,22 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             // 1. Pre-drain any leftover object(s) in 0xFFFFC001 so we never read a stale frame or stall the shutter
             await drainStaleRAMObjectIfNeeded(using: transport)
             
+            // 1b. Ensure we have a fresh (< 450ms old) hardware-auto-gained 0xFFFFC002 Live View frame cached
+            //     BEFORE asserting S1 so that if a capture is taken in extreme low light without a flash
+            //     (where the 0xFFFFC001 still capture is crushed to 0..2/255 monochrome), we can recover
+            //     the camera's BIONZ XR hardware-exposed Live View frame while keeping zero 0xFFFFC002
+            //     commands interleaved between S1 Down and GetObject(0xFFFFC001).
+            if recentLiveViewJPEG(maxAgeNs: 450_000_000) == nil {
+                if let (lvPayload, lvRC) = try? await commandQueue.execute(
+                    on: transport,
+                    opcode: .getObject,
+                    params: [SonyPTPHostHandle.liveViewFrameRAM.rawValue]
+                ), lvRC == SonyPTPResponseCode.ok.rawValue,
+                   let lvJPEG = SonyPTPPacket.extractLiveViewJPEG(from: lvPayload) {
+                    cacheLiveViewJPEG(lvJPEG)
+                }
+            }
+            
             // 2. Trigger shutter with S1 settle + S2 hold until capture starts (0xD215 > 0)
             var observedObjState = try await triggerShutterAndConfirmStart(
                 using: transport,
@@ -651,12 +689,14 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                         didEndCaptureScope = true
                         await commandQueue.endCaptureScope()
                         let (backdrop, mode) = currentBackdropAndMode()
+                        let fallbackLVData = self.recentLiveViewJPEG(maxAgeNs: 3_000_000_000)
                         let normalizedData = await Task.detached(priority: .userInitiated) {
                             Self.normalizeAndAutoExposeCapturedJPEG(
                                 downloaded.jpegData,
                                 objectInfoData: downloaded.objectInfoData,
                                 backdrop: backdrop,
-                                captureMode: mode
+                                captureMode: mode,
+                                fallbackLiveViewJPEG: fallbackLVData
                             )
                         }.value
                         let tempURL = FileManager.default.temporaryDirectory
@@ -698,52 +738,79 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         }
     }
     
+    /// Decodes a JPEG buffer into an upright `CGImage` with EXIF orientation baked in.
+    nonisolated private static func decodeUprightCGImage(from jpegData: Data) -> CGImage? {
+        if let src = CGImageSourceCreateWithData(jpegData as CFData, nil) {
+            let opts: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCache: false
+            ]
+            if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
+                return cg
+            }
+        }
+        return UIImage(data: jpegData)?.cgImage
+    }
+    
+    /// Resamples a `CGImage` to the specified dimensions using high-quality interpolation without edge ringing.
+    nonisolated private static func resampleCGImage(_ cgImage: CGImage, toWidth targetWidth: Int, height targetHeight: Int) -> CGImage {
+        guard targetWidth > 0, targetHeight > 0,
+              (cgImage.width != targetWidth || cgImage.height != targetHeight) else {
+            return cgImage
+        }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil,
+            width: targetWidth,
+            height: targetHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: targetWidth * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return cgImage
+        }
+        ctx.interpolationQuality = .high
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+        return ctx.makeImage() ?? cgImage
+    }
+    
     /// Re-encodes the downloaded 2MP Sony transfer payload as a clean, standard iOS JFIF JPEG:
     /// 1. Records the Triple-Lock metadata (`ptpFilename`, EXIF `DateTimeOriginal`, `8x8` RGB signature) in `BackdropManifestStore`
-    ///    in `.standard` Photo Mode when a backdrop is active (since `.standard` uses `pcAndCamera` `0x0003` to save full-res JPEGs
+    ///    in `.standard` Photo Mode when a backdrop is active (since `.standard` uses `pcAndCamera` `0x0011` to save full-res JPEGs
     ///    to the camera SD card, whereas `.gif` uses `pcOnly` `0x0001` RAM-only transfer).
-    /// 2. Horizontally mirrors the external camera subject so captured photos and GIF frames match the mirrored Live View preview
+    /// 2. If the `0xFFFFC001` still capture is crushed below the 8-bit quantization floor (`rawSubjectY < 0.016 && rawP90Y < 0.048`,
+    ///    e.g. shooting at manual strobe settings `1/125s, f/10, ISO 200` in a dark room without flash, where the camera's 8-bit JPEG
+    ///    crushes pixels to `0..2/255` and zeroes out `Cb/Cr` chroma), seamlessly recovers the contemporaneous `0xFFFFC002` Live View
+    ///    frame (which the Sony BIONZ XR ISP hardware-auto-gains in 14-bit raw sensor space when `0xD231 = 2` Setting Effect OFF is active).
+    /// 3. Horizontally mirrors the external camera subject so captured photos and GIF frames match the mirrored Live View preview
     ///    while keeping any composited foreground frame text un-reversed.
-    /// 3. Auto-exposes dark or dim captures on the mirrored subject image FIRST.
-    /// 4. In `.standard` Photo Mode with an active backdrop, composites the Background + Foreground with `.captureAccurate` segmentation.
-    /// 5. In `.gif` Mode, saves the mirrored, auto-exposed frame so `GIFService.createGIF` can equalize burst luminance
+    /// 4. Auto-exposes dark or dim captures on the mirrored subject image FIRST using our ISP luminance-driven de-blocking pipeline.
+    /// 5. In `.standard` Photo Mode with an active backdrop, composites the Background + Foreground with `.captureAccurate` segmentation.
+    /// 6. In `.gif` Mode, saves the mirrored, auto-exposed frame so `GIFService.createGIF` can equalize burst luminance
     ///    first before applying `.captureAccurate` backdrop compositing (preventing any border/backdrop brightness flicker).
     nonisolated static func normalizeAndAutoExposeCapturedJPEG(
         _ rawData: Data,
         objectInfoData: Data? = nil,
         backdrop: BackdropItem = .none,
         captureMode: CaptureMode = .standard,
-        additionalSearchDirectories: [URL] = []
+        additionalSearchDirectories: [URL] = [],
+        fallbackLiveViewJPEG: Data? = nil
     ) -> Data {
         return autoreleasepool {
             let extracted = SonyPTPPacket.extractCapturedJPEG(from: rawData) ?? rawData
             
-            // Decode with kCGImageSourceCreateThumbnailWithTransform: true so EXIF orientation is baked upright
-            // before computing the 8x8 RGB signature, mirroring, auto-exposing, and compositing foreground frames.
-            let uprightRawCG: CGImage? = {
-                if let src = CGImageSourceCreateWithData(extracted as CFData, nil) {
-                    let opts: [CFString: Any] = [
-                        kCGImageSourceCreateThumbnailFromImageAlways: true,
-                        kCGImageSourceCreateThumbnailWithTransform: true,
-                        kCGImageSourceShouldCache: false
-                    ]
-                    if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
-                        return cg
-                    }
-                }
-                return UIImage(data: extracted)?.cgImage
-            }()
-            
-            guard let decodedRawCG = uprightRawCG else {
+            guard let decodedRawCG = decodeUprightCGImage(from: extracted) else {
                 return extracted
             }
             
-            let unmirroredRawCG = BackdropCompositorService.cropToLandscapeThreeByTwo(decodedRawCG)
+            var unmirroredRawCG = BackdropCompositorService.cropToLandscapeThreeByTwo(decodedRawCG)
             let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
             
             // Record Triple-Lock manifest entry using `unmirroredRawCG` (upright, un-mirrored, pre-exposure boost)
             // so its 8x8 RGB signature matches the un-boosted SD card DSC0xxxx.JPG file even in dim lighting conditions.
-            // Only record in `.standard` Photo Mode where the Sony camera writes to the SD card (`0x0003`).
+            // Only record in `.standard` Photo Mode where the Sony camera writes to the SD card (`0x0011`).
             if captureMode == .standard && !backdrop.isNone {
                 BackdropManifestStore.shared.recordCapture(
                     uncompositedCGImage: unmirroredRawCG,
@@ -751,6 +818,23 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                     ptpObjectInfoData: objectInfoData,
                     backdrop: backdrop
                 )
+            }
+            
+            // Check if the 0xFFFFC001 capture is crushed into the 0..2/255 8-bit quantization floor (monochrome blocks)
+            // while a hardware-auto-gained 0xFFFFC002 Live View frame with full color and tonal detail is available.
+            let (rawSubjectY, rawP90Y) = measureSceneLuminance(unmirroredRawCG)
+            if rawSubjectY < 0.016, rawP90Y < 0.048,
+               let lvJPEG = fallbackLiveViewJPEG,
+               let lvDecodedCG = decodeUprightCGImage(from: lvJPEG) {
+                let lvThreeByTwoCG = BackdropCompositorService.cropToLandscapeThreeByTwo(lvDecodedCG)
+                let (lvSubjectY, lvP90Y) = measureSceneLuminance(lvThreeByTwoCG)
+                if lvSubjectY >= max(0.035, rawSubjectY * 2.0) || lvP90Y >= max(0.08, rawP90Y * 2.0) {
+                    unmirroredRawCG = resampleCGImage(
+                        lvThreeByTwoCG,
+                        toWidth: unmirroredRawCG.width,
+                        height: unmirroredRawCG.height
+                    )
+                }
             }
             
             // Horizontally mirror the external camera subject so captured photos and GIF frames match the
@@ -866,6 +950,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                         guard let jpegData = SonyPTPPacket.extractLiveViewJPEG(from: payload) else {
                             return nil
                         }
+                        self.cacheLiveViewJPEG(jpegData)
                         return Self.processLiveViewJPEG(
                             jpegData,
                             backdrop: activeBackdrop,
@@ -903,7 +988,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     
     /// Ensures the iPad Live View preview remains bright and clearly visible for framing
     /// without amplifying 8-bit quantization noise into black-and-white blocks while 0xD231 switches.
-    nonisolated private static func autoExposeLiveViewIfNeeded(_ image: UIImage, ciContext: CIContext) -> (UIImage, Double) {
+    nonisolated static func autoExposeLiveViewIfNeeded(_ image: UIImage, ciContext: CIContext) -> (UIImage, Double) {
         guard let cgImage = image.cgImage else { return (image, 0.5) }
         let (boostedCG, subjectSrgbLuma) = adjustCGImageExposureIfNeeded(
             cgImage,
@@ -981,7 +1066,64 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         return (weightedSrgbSum / totalWeight, p90SrgbY)
     }
     
-    nonisolated private static func adjustCGImageExposureIfNeeded(
+    /// Fast separable 2-pass box blur on a Float planar buffer using a cache-friendly row-wise vertical accumulator.
+    /// Runs in O(N) time independent of radius with zero ringing.
+    nonisolated private static func boxBlurFloat(_ src: [Float], width: Int, height: Int, radius: Int) -> [Float] {
+        guard radius > 0, width > 1, height > 1 else { return src }
+        let r = min(radius, min(width - 1, height - 1))
+        guard r > 0 else { return src }
+        var temp = [Float](repeating: 0, count: width * height)
+        var dst = src
+        var colSums = [Float](repeating: 0, count: width)
+        let invWindow = 1.0 / Float(2 * r + 1)
+        let initWeight = Float(r + 1)
+        
+        for _ in 0..<2 {
+            // Horizontal pass: dst -> temp
+            for y in 0..<height {
+                let rowOffset = y * width
+                var sum: Float = initWeight * dst[rowOffset]
+                for dx in 1...r {
+                    sum += dst[rowOffset + min(width - 1, dx)]
+                }
+                for x in 0..<width {
+                    temp[rowOffset + x] = sum * invWindow
+                    let outIdx = max(0, x - r)
+                    let inIdx = min(width - 1, x + r + 1)
+                    sum += dst[rowOffset + inIdx] - dst[rowOffset + outIdx]
+                }
+            }
+            // Vertical pass (row-wise for contiguous L1 cache & SIMD access): temp -> dst
+            for x in 0..<width {
+                colSums[x] = initWeight * temp[x]
+            }
+            for dy in 1...r {
+                let rowOffset = min(height - 1, dy) * width
+                for x in 0..<width {
+                    colSums[x] += temp[rowOffset + x]
+                }
+            }
+            for y in 0..<height {
+                let dstRow = y * width
+                let outRow = max(0, y - r) * width
+                let inRow = min(height - 1, y + r + 1) * width
+                for x in 0..<width {
+                    let s = colSums[x]
+                    dst[dstRow + x] = s * invWindow
+                    colSums[x] = s + temp[inRow + x] - temp[outRow + x]
+                }
+            }
+        }
+        return dst
+    }
+    
+    /// ISP-grade luminance-driven auto-exposure with bounded toe slope, 3-octave sub-LSB de-quantization,
+    /// Widrow input-domain dither grain, and 4:2:0 JPEG macroblock chroma smoothing:
+    /// - Eliminates the 46x linear-light toe discretization cliff (`0 -> 0, 1 -> 46, 2 -> 64`) caused by stacking
+    ///   `CIHighlightShadowAdjust` + `CIExposureAdjust` + `CIGammaAdjust`.
+    /// - Eliminates per-channel shadow zero-pinning (`0 * gain = 0`) and 16x16 4:2:0 `Cb/Cr` chroma macroblock
+    ///   stepping that previously turned low-light warm walls and dark shirts into neon yellow/green/purple blocks.
+    nonisolated static func adjustCGImageExposureIfNeeded(
         _ cgImage: CGImage,
         ciContext: CIContext,
         minRecoverableSrgbLuma: Double,
@@ -996,14 +1138,13 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         }
         
         // Compute smooth sRGB exposure boost with zero discontinuity at triggerThresholdSrgb
-        let safeLuma = max(subjectSrgbY, 0.03)
+        let safeLuma = max(subjectSrgbY, 0.020)
         var ev = min(max(log2(targetSrgbLuma / safeLuma), 0.0), maxEVBoost)
         
-        // Protect highlights on already-viewable / moderately dim images (e.g. Auto-ISO 12800):
-        // When the scene already has midtones/highlights (subjectSrgbY >= 0.16 and p90SrgbY > 0.45),
-        // limit EV so the 90th-percentile highlight never blows out past 0.85 sRGB.
-        if subjectSrgbY >= 0.16, p90SrgbY > 0.45 {
-            let highlightSafeEV = max(0.15, log2(0.85 / p90SrgbY) * 1.6)
+        // Protect highlights across all scene brightness levels whenever the 90th-percentile highlight is already bright
+        // (including dark-shirt portraits in well-lit rooms where subjectSrgbY < 0.16 but faces/highlights are > 0.42).
+        if p90SrgbY > 0.42 {
+            let highlightSafeEV = max(0.12, log2(0.82 / p90SrgbY) * 1.5)
             ev = min(ev, highlightSafeEV)
         }
         
@@ -1011,51 +1152,164 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             return (cgImage, subjectSrgbY)
         }
         
-        let ciInput = CIImage(cgImage: cgImage)
-        var currentCI = ciInput
-        
-        // 1. Smoothly lift shadows & roll off highlights (no minimum step jump at low EV)
-        if let shadowFilter = CIFilter(name: "CIHighlightShadowAdjust") {
-            let shadowLift = min(0.55, ev * 0.15)
-            shadowFilter.setValue(currentCI, forKey: kCIInputImageKey)
-            shadowFilter.setValue(shadowLift, forKey: "inputShadowAmount")
-            shadowFilter.setValue(0.85, forKey: "inputHighlightAmount")
-            if let out = shadowFilter.outputImage {
-                currentCI = out
-            }
+        let width = cgImage.width
+        let height = cgImage.height
+        let count = width * height
+        guard count > 0 else {
+            return (cgImage, subjectSrgbY)
         }
         
-        // 2. Apply single-pass exposure gain
-        if let exposureFilter = CIFilter(name: "CIExposureAdjust") {
-            exposureFilter.setValue(currentCI, forKey: kCIInputImageKey)
-            exposureFilter.setValue(ev, forKey: kCIInputEVKey)
-            if let out = exposureFilter.outputImage {
-                currentCI = out
-            }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        var pixels = [UInt8](repeating: 0, count: count * 4)
+        guard let ctx = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return (cgImage, subjectSrgbY)
+        }
+        ctx.interpolationQuality = .none
+        ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        
+        // Compute rational curve gain G that maps safeLuma -> targetOutY, with strictly bounded toe slope G <= 14.5
+        // so a 1-LSB step in 8-bit shadows steps by at most ~10 levels instead of 46 levels.
+        let desiredRatio = pow(2.0, ev * 0.82)
+        let targetOutY = min(targetSrgbLuma, safeLuma * desiredRatio)
+        let rawG = (targetOutY * (1.0 - safeLuma)) / max(0.001, safeLuma * (1.0 - targetOutY))
+        let G = Float(min(max(rawG, 1.04), 14.5))
+        
+        // Separate sRGB Luminance Y and 2 independent Chroma channels (dR = R - Y, dB = B - Y;
+        // dG = G - Y is linearly dependent via 0.2126*dR + 0.7152*dG + 0.0722*dB == 0)
+        var yPlane = [Float](repeating: 0, count: count)
+        var drPlane = [Float](repeating: 0, count: count)
+        var dbPlane = [Float](repeating: 0, count: count)
+        
+        let inv255: Float = 1.0 / 255.0
+        let invGreenWeight: Float = 1.0 / 0.7152
+        for i in 0..<count {
+            let idx = i * 4
+            let r = Float(pixels[idx]) * inv255
+            let g = Float(pixels[idx + 1]) * inv255
+            let b = Float(pixels[idx + 2]) * inv255
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            yPlane[i] = y
+            drPlane[i] = r - y
+            dbPlane[i] = b - y
         }
         
-        // 3. For dark scenes (ev > 1.0), apply a gentle midtone gamma lift (>= 0.75) and
-        //    subtle color-saturation compensation so low-light captures retain natural color.
-        if ev > 1.0 {
-            if let gammaFilter = CIFilter(name: "CIGammaAdjust") {
-                let gammaPower = max(0.75, 1.0 - (ev - 1.0) * 0.08)
-                gammaFilter.setValue(currentCI, forKey: kCIInputImageKey)
-                gammaFilter.setValue(gammaPower, forKey: "inputPower")
-                if let out = gammaFilter.outputImage {
-                    currentCI = out
+        // Apply multi-scale 4:2:0 JPEG macroblock de-quantization & chroma smoothing when lifting shadows (ev > 0.55)
+        // on camera-resolution frames (min dimension >= 160px)
+        let isCameraResolution = min(width, height) >= 160
+        let needsShadowDeblock = (ev > 0.55) && isCameraResolution
+        
+        let yBlurFine: [Float]
+        let yBlurMid: [Float]
+        let yBlurCoarse: [Float]
+        let drSmooth: [Float]
+        let dbSmooth: [Float]
+        
+        if needsShadowDeblock {
+            let scale = max(0.5, Double(min(width, height)) / 960.0)
+            let rFine = max(2, Int((4.0 * scale).rounded()))
+            let rMid = max(6, Int((13.0 * scale).rounded()))
+            let rCoarse = max(12, Int((30.0 * scale).rounded()))
+            
+            // Cascade Fine -> Mid -> Coarse so higher octaves become higher-order B-spline Gaussians
+            yBlurFine = boxBlurFloat(yPlane, width: width, height: height, radius: rFine)
+            yBlurMid = boxBlurFloat(yBlurFine, width: width, height: height, radius: rMid)
+            yBlurCoarse = boxBlurFloat(yBlurMid, width: width, height: height, radius: rCoarse)
+            
+            let drMid = boxBlurFloat(drPlane, width: width, height: height, radius: rMid)
+            let dbMid = boxBlurFloat(dbPlane, width: width, height: height, radius: rMid)
+            
+            let drCoarse = boxBlurFloat(drMid, width: width, height: height, radius: rCoarse)
+            let dbCoarse = boxBlurFloat(dbMid, width: width, height: height, radius: rCoarse)
+            
+            var drMix = [Float](repeating: 0, count: count)
+            var dbMix = [Float](repeating: 0, count: count)
+            for i in 0..<count {
+                let y0 = yPlane[i]
+                let shadowWeight = max(Float(0.0), min(Float(1.0), (0.16 - y0) / 0.12))
+                let smoothDR = 0.40 * drMid[i] + 0.60 * drCoarse[i]
+                let smoothDB = 0.40 * dbMid[i] + 0.60 * dbCoarse[i]
+                drMix[i] = drPlane[i] * (1.0 - shadowWeight) + smoothDR * shadowWeight
+                dbMix[i] = dbPlane[i] * (1.0 - shadowWeight) + smoothDB * shadowWeight
+            }
+            drSmooth = drMix
+            dbSmooth = dbMix
+        } else {
+            yBlurFine = yPlane
+            yBlurMid = yPlane
+            yBlurCoarse = yPlane
+            drSmooth = drPlane
+            dbSmooth = dbPlane
+        }
+        
+        let maxSubLSB: Float = 1.40 * inv255
+        let invMaxSubLSB: Float = 1.0 / maxSubLSB
+        let enableInputGrain = needsShadowDeblock && (G > 3.0)
+        
+        for y in 0..<height {
+            let rowOffset = y * width
+            for x in 0..<width {
+                let i = rowOffset + x
+                let y0 = yPlane[i]
+                
+                var yIn = y0
+                if needsShadowDeblock {
+                    let yPyr = 0.25 * yBlurFine[i] + 0.40 * yBlurMid[i] + 0.35 * yBlurCoarse[i]
+                    let diff = yPyr - y0
+                    // Soft C-infinity sub-LSB de-quantization: bridges ±1.4 LSB 8x8/16x16 JPEG steps without blurring real edges
+                    let shadowDeqScale = max(Float(0.0), min(Float(1.0), (0.20 - y0) / 0.15))
+                    yIn = y0 + (maxSubLSB * shadowDeqScale) * tanh(diff * invMaxSubLSB)
+                    
+                    if enableInputGrain && y0 > 0.001 {
+                        var h1 = UInt32(truncatingIfNeeded: (x &* 73856093) ^ (y &* 19349663) ^ 0x9E3779B9)
+                        h1 ^= h1 >> 16; h1 &*= 0x85ebca6b; h1 ^= h1 >> 13; h1 &*= 0xc2b2ae35; h1 ^= h1 >> 16
+                        var h2 = UInt32(truncatingIfNeeded: (x &* 83492791) ^ (y &* 2971215073) ^ 0x517CC1B7)
+                        h2 ^= h2 >> 16; h2 &*= 0x85ebca6b; h2 ^= h2 >> 13; h2 &*= 0xc2b2ae35; h2 ^= h2 >> 16
+                        let u1 = Float(h1 & 0xFFFF) / 65535.0
+                        let u2 = Float(h2 & 0xFFFF) / 65535.0
+                        let tpdf = (u1 + u2 - 1.0)
+                        let grainAmp = (0.62 * inv255) * max(Float(0.15), min(Float(1.0), (0.14 - y0) / 0.11))
+                        yIn = max(0.0, min(1.0, yIn + tpdf * grainAmp))
+                    }
                 }
-            }
-            if let colorFilter = CIFilter(name: "CIColorControls") {
-                let satBoost = min(1.12, 1.0 + (ev - 1.0) * 0.04)
-                colorFilter.setValue(currentCI, forKey: kCIInputImageKey)
-                colorFilter.setValue(satBoost, forKey: kCIInputSaturationKey)
-                if let out = colorFilter.outputImage {
-                    currentCI = out
-                }
+                
+                // Bounded-slope rational luminance curve: Y_out = (G * Y_in) / (1 + (G - 1) * Y_in)
+                let yOut = (G * yIn) / (1.0 + (G - 1.0) * yIn)
+                let lumaGain = yOut / max(y0, 0.002)
+                
+                // Scale chroma proportionally to luminance gain, tapering gently in the 1-10 LSB quantization floor
+                let shadowChromaConfidence = min(Float(1.0), max(Float(0.24), y0 / (12.0 * inv255)))
+                let chromaGain = min(lumaGain * (0.55 + 0.35 * shadowChromaConfidence), G * 0.74)
+                
+                let dr = drSmooth[i]
+                let db = dbSmooth[i]
+                let dg = -(0.2126 * dr + 0.0722 * db) * invGreenWeight
+                
+                var rOut = yOut + dr * chromaGain
+                var gOut = yOut + dg * chromaGain
+                var bOut = yOut + db * chromaGain
+                
+                // Soft shadow & highlight gamut guard so no channel hard-pins to 0.0 in lifted shadows
+                let minChan = yOut * 0.10
+                rOut = max(minChan, min(1.0, rOut))
+                gOut = max(minChan, min(1.0, gOut))
+                bOut = max(minChan, min(1.0, bOut))
+                
+                let idx = i * 4
+                pixels[idx]     = UInt8(min(255, max(0, Int((rOut * 255.0).rounded()))))
+                pixels[idx + 1] = UInt8(min(255, max(0, Int((gOut * 255.0).rounded()))))
+                pixels[idx + 2] = UInt8(min(255, max(0, Int((bOut * 255.0).rounded()))))
             }
         }
         
-        guard let outputCG = ciContext.createCGImage(currentCI, from: ciInput.extent) else {
+        guard let outputCG = ctx.makeImage() else {
             return (cgImage, subjectSrgbY)
         }
         

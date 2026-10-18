@@ -771,12 +771,8 @@ enum AutomatedVerificationSuite {
         let (lowPostLuma, lowPostP90) = SonyUSBCameraClient.measureSceneLuminance(lowBoostedCG)
         
         assertTrue(
-            lowPreLuma < 0.04 && lowPostLuma >= 0.25 && lowPostLuma <= 0.52,
-            String(format: "Low-Light Mode 1 brightness recovery: %.3f -> %.3f sRGB (target 0.25..0.52)", lowPreLuma, lowPostLuma)
-        )
-        assertTrue(
-            lowPostP90 < 0.85,
-            String(format: "Low-Light Mode 1 90th-percentile highlight stays un-clipped: p90=%.3f (< 0.85)", lowPostP90)
+            lowPreLuma < 0.04 && lowPostLuma >= 0.11 && lowPostLuma <= 0.45 && lowPostP90 >= 0.30 && lowPostP90 < 0.85,
+            String(format: "Low-Light Mode 1 brightness recovery with bounded toe slope: mean %.3f -> %.3f, subject p90=%.3f (0.30..0.85)", lowPreLuma, lowPostLuma, lowPostP90)
         )
         
         // Verify RGB color ordering & chroma preservation (NOT black-and-white!)
@@ -791,15 +787,15 @@ enum AutomatedVerificationSuite {
             "Low-Light Mode 1 preserves cool shirt color ratios (B=\(shirtPost.b) > G=\(shirtPost.g) > R=\(shirtPost.r), non-clipped)"
         )
         
-        // Verify smooth shadow gradation (no 1-bit block quantization where 1/255 jumps to 255)
+        // Verify smooth shadow gradation (no 46x toe cliff where 1/255 jumps to 46+)
         let step1 = readPixelRGB(lowBoostedCG, x: 2, y: 4).r
         let step2 = readPixelRGB(lowBoostedCG, x: 4, y: 4).r
         let step4 = readPixelRGB(lowBoostedCG, x: 6, y: 4).r
         let step8 = readPixelRGB(lowBoostedCG, x: 8, y: 4).r
         let step16 = readPixelRGB(lowBoostedCG, x: 10, y: 4).r
         assertTrue(
-            step1 < step4 && step4 < step8 && step8 < step16 && step1 < 80 && step16 < 210,
-            "Low-Light Mode 1 shadow steps (1,2,4,8,16/255) scale smoothly without 1-bit block clipping: [\(step1), \(step2), \(step4), \(step8), \(step16)]"
+            step1 <= 16 && step1 < step2 && step2 < step4 && step4 < step8 && step8 < step16 && step16 < 180,
+            "Low-Light Mode 1 shadow steps (1,2,4,8,16/255) scale smoothly with bounded toe slope (step1 <= 16): [\(step1), \(step2), \(step4), \(step8), \(step16)]"
         )
         
         // 2. Decent Light / Dim Auto-ISO 12800 ("A little dim on camera, but viewable")
@@ -910,6 +906,85 @@ enum AutomatedVerificationSuite {
             assertTrue(false, "Failed to verify low-light GIF non-duplication")
         }
         try? FileManager.default.removeItem(at: sonyLowURL)
+        
+        // 6. 16x16 4:2:0 JPEG Macroblock Discretization & Shadow Zero-Pinning Elimination
+        //    Synthesize a camera-resolution (320x240) mildly low-light warm wall & maroon shirt scene where
+        //    adjacent 16x16 blocks toggle weak channels between 0, 1, and 2 LSBs (matching the user's Image 1),
+        //    and verify that our ISP pipeline eliminates zero-pinned neon yellow/green blocks and smooths 16x16 steps.
+        let deblockW = 320, deblockH = 240
+        var deblockPixels = [UInt8](repeating: 255, count: deblockW * deblockH * 4)
+        for y in 0..<deblockH {
+            for x in 0..<deblockW {
+                let bx = (x / 16) % 3
+                let idx = (y * deblockW + x) * 4
+                if y < 140 {
+                    // Warm low-light wall where B toggles 0, 1, 2 across 16x16 macroblocks
+                    deblockPixels[idx]     = 8
+                    deblockPixels[idx + 1] = 4
+                    deblockPixels[idx + 2] = UInt8(bx) // 0, 1, 2
+                } else {
+                    // Dark maroon shirt where G toggles 1, 2 across 16x16 macroblocks
+                    deblockPixels[idx]     = 5
+                    deblockPixels[idx + 1] = UInt8(1 + (bx % 2))
+                    deblockPixels[idx + 2] = 2
+                }
+            }
+        }
+        let deblockCS = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        if let deblockCtx = CGContext(
+            data: &deblockPixels,
+            width: deblockW,
+            height: deblockH,
+            bitsPerComponent: 8,
+            bytesPerRow: deblockW * 4,
+            space: deblockCS,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let rawBlockyCG = deblockCtx.makeImage() {
+            let deblockedCG = SonyUSBCameraClient.autoExposeCapturedCGImage(rawBlockyCG, ciContext: ciContext)
+            let b0 = readPixelRGB(deblockedCG, x: 8, y: 60)   // Center of block 0 (raw B=0)
+            let b1 = readPixelRGB(deblockedCG, x: 24, y: 60)  // Center of block 1 (raw B=1)
+            let b2 = readPixelRGB(deblockedCG, x: 40, y: 60)  // Center of block 2 (raw B=2)
+            let maxBlueBlockJump = max(abs(b0.b - b1.b), abs(b1.b - b2.b))
+            assertTrue(
+                b0.b >= 12 && maxBlueBlockJump <= 6,
+                "Low-light 16x16 macroblock de-blocking prevents B=0 neon-yellow zero-pinning (B=\(b0.b),\(b1.b),\(b2.b), maxJump=\(maxBlueBlockJump) <= 6 vs old 59)"
+            )
+        }
+        
+        // 7. Very-Low-Light (0..2/255 Monochrome Still Capture) Hardware Live View Frame Recovery
+        //    When the camera's 0xFFFFC001 still capture is crushed into 0..2/255 monochrome (e.g. strobe settings without flash),
+        //    normalizeAndAutoExposeCapturedJPEG recovers the hardware-exposed 0xFFFFC002 Live View frame.
+        let crushedStillCG = makeSyntheticLightingScene(
+            bgRGB: (1, 1, 1),
+            subjectSkinRGB: (2, 2, 2),
+            shirtRGB: (1, 1, 1)
+        )
+        let hardwareLiveViewCG = makeSyntheticLightingScene(
+            bgRGB: (28, 25, 22),
+            subjectSkinRGB: (110, 78, 56),
+            shirtRGB: (42, 82, 130)
+        )
+        if let crushedData = UIImage(cgImage: crushedStillCG).jpegData(compressionQuality: 0.90),
+           let liveViewData = UIImage(cgImage: hardwareLiveViewCG).jpegData(compressionQuality: 0.90) {
+            let recoveredData = SonyUSBCameraClient.normalizeAndAutoExposeCapturedJPEG(
+                crushedData,
+                backdrop: .none,
+                captureMode: .standard,
+                fallbackLiveViewJPEG: liveViewData
+            )
+            if let recoveredCG = UIImage(data: recoveredData)?.cgImage {
+                // Note: normalizeAndAutoExposeCapturedJPEG horizontally mirrors the 72x48 image, so x=20 mirrors to x=51
+                let recSkin = readPixelRGB(recoveredCG, x: 51, y: 20)
+                let recShirt = readPixelRGB(recoveredCG, x: 51, y: 34)
+                assertTrue(
+                    recSkin.r > recSkin.g && recSkin.g > recSkin.b && (recSkin.r - recSkin.b) >= 18 &&
+                    recShirt.b > recShirt.g && recShirt.g > recShirt.r && (recShirt.b - recShirt.r) >= 18,
+                    "Very-low-light hardware Live View recovery restores full skin (\(recSkin.r),\(recSkin.g),\(recSkin.b)) & shirt (\(recShirt.r),\(recShirt.g),\(recShirt.b)) color from 0xFFFFC002"
+                )
+            } else {
+                assertTrue(false, "Failed to decode recovered very-low-light JPEG")
+            }
+        }
         
         try runBackdropAndForegroundQATests(ciContext: ciContext)
     }

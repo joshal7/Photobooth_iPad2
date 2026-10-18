@@ -229,19 +229,34 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
         let rawCI = CIImage(cvPixelBuffer: cvBuffer)
         
         // Pre-orient and horizontally mirror raw front-camera frame BEFORE compositing any foreground text/frame,
-        // then render (and optionally segment/composite) in a SINGLE createCGImage GPU pass.
+        // then auto-expose dim frames with the same ISP curve as still captures so Live View matches Review.
         let orientedMirroredCI = BackdropCompositorService.orientAndMirrorFrontCameraCIImage(
             rawCI,
             interfaceOrientation: deviceOrientation
         )
         
-        guard let finalCG = BackdropCompositorService.composite(
-            subjectCI: orientedMirroredCI,
-            backdrop: selectedBackdrop,
-            quality: .liveFast,
-            ciContext: self.ciContext
-        ) else {
+        guard let subjectCG = self.ciContext.createCGImage(orientedMirroredCI, from: orientedMirroredCI.extent) else {
             return
+        }
+        let (exposedSubjectCG, _) = SonyUSBCameraClient.adjustCGImageExposureIfNeeded(
+            subjectCG,
+            ciContext: self.ciContext,
+            minRecoverableSrgbLuma: 0.025,
+            targetSrgbLuma: 0.42,
+            triggerThresholdSrgb: 0.40,
+            maxEVBoost: 3.5
+        )
+        
+        let finalCG: CGImage
+        if !selectedBackdrop.isNone {
+            finalCG = BackdropCompositorService.composite(
+                cgImage: exposedSubjectCG,
+                backdrop: selectedBackdrop,
+                quality: .liveFast,
+                ciContext: self.ciContext
+            )
+        } else {
+            finalCG = exposedSubjectCG
         }
         
         let uiImage = UIImage(cgImage: finalCG, scale: 1.0, orientation: .up)
@@ -287,10 +302,10 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
             let uprightSubjectCG = ciCtx.createCGImage(orientedMirroredCI, from: orientedMirroredCI.extent) ?? rawCG
             
             // Step 2: Run single-pass subject auto-exposure BEFORE backdrop compositing
-            let exposedSubjectUI = SonyUSBCameraClient.autoExposeCapturedUIImage(
-                UIImage(cgImage: uprightSubjectCG, scale: 1.0, orientation: .up)
+            let exposedSubjectCG = SonyUSBCameraClient.autoExposeCapturedCGImage(
+                uprightSubjectCG,
+                ciContext: ciCtx
             )
-            let exposedSubjectCG = exposedSubjectUI.cgImage ?? uprightSubjectCG
             
             // Step 3: For standard photo captures, apply high-accuracy backdrop/foreground compositing now.
             // For GIF captures, leave the frame un-composited so GIFService.createGIF can equalize luminance

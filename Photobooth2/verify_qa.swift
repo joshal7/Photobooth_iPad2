@@ -109,49 +109,159 @@ func measureSceneLuminance(_ cgImage: CGImage) -> (subjectSrgbY: Double, p90Srgb
     return (weightedSrgbSum / totalWeight, p90SrgbY)
 }
 
+func boxBlurFloat(_ src: [Float], width: Int, height: Int, radius: Int) -> [Float] {
+    guard radius > 0, width > 1, height > 1 else { return src }
+    let r = min(radius, min(width - 1, height - 1))
+    guard r > 0 else { return src }
+    var temp = [Float](repeating: 0, count: width * height)
+    var dst = src
+    var colSums = [Float](repeating: 0, count: width)
+    let invWindow = 1.0 / Float(2 * r + 1)
+    let initWeight = Float(r + 1)
+    
+    for _ in 0..<2 {
+        for y in 0..<height {
+            let rowOffset = y * width
+            var sum: Float = initWeight * dst[rowOffset]
+            for dx in 1...r { sum += dst[rowOffset + min(width - 1, dx)] }
+            for x in 0..<width {
+                temp[rowOffset + x] = sum * invWindow
+                let outIdx = max(0, x - r)
+                let inIdx = min(width - 1, x + r + 1)
+                sum += dst[rowOffset + inIdx] - dst[rowOffset + outIdx]
+            }
+        }
+        for x in 0..<width { colSums[x] = initWeight * temp[x] }
+        for dy in 1...r {
+            let rowOffset = min(height - 1, dy) * width
+            for x in 0..<width { colSums[x] += temp[rowOffset + x] }
+        }
+        for y in 0..<height {
+            let dstRow = y * width
+            let outRow = max(0, y - r) * width
+            let inRow = min(height - 1, y + r + 1) * width
+            for x in 0..<width {
+                let s = colSums[x]
+                dst[dstRow + x] = s * invWindow
+                colSums[x] = s + temp[inRow + x] - temp[outRow + x]
+            }
+        }
+    }
+    return dst
+}
+
 func autoExposeCapturedCGImage(_ cgImage: CGImage) -> CGImage {
     let (subjectSrgbY, p90SrgbY) = measureSceneLuminance(cgImage)
     guard subjectSrgbY < 0.42 else { return cgImage }
     
-    let safeLuma = max(subjectSrgbY, 0.03)
+    let safeLuma = max(subjectSrgbY, 0.020)
     var ev = min(max(log2(0.42 / safeLuma), 0.0), 3.8)
     
-    if subjectSrgbY >= 0.16, p90SrgbY > 0.45 {
-        let highlightSafeEV = max(0.15, log2(0.85 / p90SrgbY) * 1.6)
+    if p90SrgbY > 0.42 {
+        let highlightSafeEV = max(0.12, log2(0.82 / p90SrgbY) * 1.5)
         ev = min(ev, highlightSafeEV)
     }
     guard ev > 0.04 else { return cgImage }
     
-    let ciInput = CIImage(cgImage: cgImage)
-    var currentCI = ciInput
+    let width = cgImage.width
+    let height = cgImage.height
+    let count = width * height
+    let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+    var pixels = [UInt8](repeating: 0, count: count * 4)
+    guard let ctx = CGContext(data: &pixels, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+        return cgImage
+    }
+    ctx.interpolationQuality = .none
+    ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
     
-    if let shadowFilter = CIFilter(name: "CIHighlightShadowAdjust") {
-        let shadowLift = min(0.55, ev * 0.15)
-        shadowFilter.setValue(currentCI, forKey: kCIInputImageKey)
-        shadowFilter.setValue(shadowLift, forKey: "inputShadowAmount")
-        shadowFilter.setValue(0.85, forKey: "inputHighlightAmount")
-        if let out = shadowFilter.outputImage { currentCI = out }
+    let desiredRatio = pow(2.0, ev * 0.82)
+    let targetOutY = min(0.42, safeLuma * desiredRatio)
+    let rawG = (targetOutY * (1.0 - safeLuma)) / max(0.001, safeLuma * (1.0 - targetOutY))
+    let G = Float(min(max(rawG, 1.04), 14.5))
+    
+    var yPlane = [Float](repeating: 0, count: count)
+    var drPlane = [Float](repeating: 0, count: count)
+    var dbPlane = [Float](repeating: 0, count: count)
+    let inv255: Float = 1.0 / 255.0
+    let invGreenWeight: Float = 1.0 / 0.7152
+    for i in 0..<count {
+        let idx = i * 4
+        let r = Float(pixels[idx]) * inv255
+        let g = Float(pixels[idx + 1]) * inv255
+        let b = Float(pixels[idx + 2]) * inv255
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        yPlane[i] = y; drPlane[i] = r - y; dbPlane[i] = b - y
     }
-    if let exposureFilter = CIFilter(name: "CIExposureAdjust") {
-        exposureFilter.setValue(currentCI, forKey: kCIInputImageKey)
-        exposureFilter.setValue(ev, forKey: kCIInputEVKey)
-        if let out = exposureFilter.outputImage { currentCI = out }
-    }
-    if ev > 1.0 {
-        if let gammaFilter = CIFilter(name: "CIGammaAdjust") {
-            let gammaPower = max(0.75, 1.0 - (ev - 1.0) * 0.08)
-            gammaFilter.setValue(currentCI, forKey: kCIInputImageKey)
-            gammaFilter.setValue(gammaPower, forKey: "inputPower")
-            if let out = gammaFilter.outputImage { currentCI = out }
+    
+    let needsShadowDeblock = (ev > 0.55) && min(width, height) >= 160
+    let yBlurFine: [Float]; let yBlurMid: [Float]; let yBlurCoarse: [Float]
+    let drSmooth: [Float]; let dbSmooth: [Float]
+    if needsShadowDeblock {
+        let scale = max(0.5, Double(min(width, height)) / 960.0)
+        let rFine = max(2, Int((4.0 * scale).rounded()))
+        let rMid = max(6, Int((13.0 * scale).rounded()))
+        let rCoarse = max(12, Int((30.0 * scale).rounded()))
+        yBlurFine = boxBlurFloat(yPlane, width: width, height: height, radius: rFine)
+        yBlurMid = boxBlurFloat(yBlurFine, width: width, height: height, radius: rMid)
+        yBlurCoarse = boxBlurFloat(yBlurMid, width: width, height: height, radius: rCoarse)
+        let drMid = boxBlurFloat(drPlane, width: width, height: height, radius: rMid)
+        let dbMid = boxBlurFloat(dbPlane, width: width, height: height, radius: rMid)
+        let drCoarse = boxBlurFloat(drMid, width: width, height: height, radius: rCoarse)
+        let dbCoarse = boxBlurFloat(dbMid, width: width, height: height, radius: rCoarse)
+        var drMix = [Float](repeating: 0, count: count)
+        var dbMix = [Float](repeating: 0, count: count)
+        for i in 0..<count {
+            let y0 = yPlane[i]
+            let sw = max(Float(0.0), min(Float(1.0), (0.16 - y0) / 0.12))
+            drMix[i] = drPlane[i] * (1.0 - sw) + (0.40 * drMid[i] + 0.60 * drCoarse[i]) * sw
+            dbMix[i] = dbPlane[i] * (1.0 - sw) + (0.40 * dbMid[i] + 0.60 * dbCoarse[i]) * sw
         }
-        if let colorFilter = CIFilter(name: "CIColorControls") {
-            let satBoost = min(1.12, 1.0 + (ev - 1.0) * 0.04)
-            colorFilter.setValue(currentCI, forKey: kCIInputImageKey)
-            colorFilter.setValue(satBoost, forKey: kCIInputSaturationKey)
-            if let out = colorFilter.outputImage { currentCI = out }
+        drSmooth = drMix; dbSmooth = dbMix
+    } else {
+        yBlurFine = yPlane; yBlurMid = yPlane; yBlurCoarse = yPlane
+        drSmooth = drPlane; dbSmooth = dbPlane
+    }
+    
+    let maxSubLSB: Float = 1.40 * inv255
+    let invMaxSubLSB: Float = 1.0 / maxSubLSB
+    let enableInputGrain = needsShadowDeblock && (G > 3.0)
+    for y in 0..<height {
+        let rowOffset = y * width
+        for x in 0..<width {
+            let i = rowOffset + x
+            let y0 = yPlane[i]
+            var yIn = y0
+            if needsShadowDeblock {
+                let yPyr = 0.25 * yBlurFine[i] + 0.40 * yBlurMid[i] + 0.35 * yBlurCoarse[i]
+                let shadowDeqScale = max(Float(0.0), min(Float(1.0), (0.20 - y0) / 0.15))
+                yIn = y0 + (maxSubLSB * shadowDeqScale) * tanh((yPyr - y0) * invMaxSubLSB)
+                if enableInputGrain && y0 > 0.001 {
+                    var h1 = UInt32(truncatingIfNeeded: (x &* 73856093) ^ (y &* 19349663) ^ 0x9E3779B9)
+                    h1 ^= h1 >> 16; h1 &*= 0x85ebca6b; h1 ^= h1 >> 13; h1 &*= 0xc2b2ae35; h1 ^= h1 >> 16
+                    var h2 = UInt32(truncatingIfNeeded: (x &* 83492791) ^ (y &* 2971215073) ^ 0x517CC1B7)
+                    h2 ^= h2 >> 16; h2 &*= 0x85ebca6b; h2 ^= h2 >> 13; h2 &*= 0xc2b2ae35; h2 ^= h2 >> 16
+                    let tpdf = (Float(h1 & 0xFFFF) + Float(h2 & 0xFFFF)) / 65535.0 - 1.0
+                    let grainAmp = (0.62 * inv255) * max(Float(0.15), min(Float(1.0), (0.14 - y0) / 0.11))
+                    yIn = max(0.0, min(1.0, yIn + tpdf * grainAmp))
+                }
+            }
+            let yOut = (G * yIn) / (1.0 + (G - 1.0) * yIn)
+            let lumaGain = yOut / max(y0, 0.002)
+            let shadowChromaConfidence = min(Float(1.0), max(Float(0.24), y0 / (12.0 * inv255)))
+            let chromaGain = min(lumaGain * (0.55 + 0.35 * shadowChromaConfidence), G * 0.74)
+            let dr = drSmooth[i], db = dbSmooth[i]
+            let dg = -(0.2126 * dr + 0.0722 * db) * invGreenWeight
+            let minChan = yOut * 0.10
+            let rOut = max(minChan, min(1.0, yOut + dr * chromaGain))
+            let gOut = max(minChan, min(1.0, yOut + dg * chromaGain))
+            let bOut = max(minChan, min(1.0, yOut + db * chromaGain))
+            let idx = i * 4
+            pixels[idx]     = UInt8(min(255, max(0, Int((rOut * 255.0).rounded()))))
+            pixels[idx + 1] = UInt8(min(255, max(0, Int((gOut * 255.0).rounded()))))
+            pixels[idx + 2] = UInt8(min(255, max(0, Int((bOut * 255.0).rounded()))))
         }
     }
-    return ciContext.createCGImage(currentCI, from: ciInput.extent) ?? cgImage
+    return ctx.makeImage() ?? cgImage
 }
 
 func createEqualizedGIF(from urls: [URL], frameDuration: Double) -> URL? {
@@ -171,7 +281,7 @@ func createEqualizedGIF(from urls: [URL], frameDuration: Double) -> URL? {
         let isAlreadyNormalizedSonyFrame = url.lastPathComponent.hasPrefix("sony_")
         let baseCG = isAlreadyNormalizedSonyFrame ? rawCG : autoExposeCapturedCGImage(rawCG)
         let (luma, _) = measureSceneLuminance(baseCG)
-        loadedFrames.append(FrameEntry(cgImage: baseCG, luma: max(luma, 0.02)))
+        loadedFrames.append(FrameEntry(cgImage: baseCG, luma: max(luma, 0.06)))
     }
     guard !loadedFrames.isEmpty else { return nil }
     let sorted = loadedFrames.map(\.luma).sorted()
@@ -203,7 +313,7 @@ func makeSyntheticLightingScene(
     includeShadowRamp: Bool = false,
     includeSmallBrightLamp: Bool = false
 ) -> CGImage {
-    let width = 48, height = 48
+    let width = 72, height = 48
     var pixels = [UInt8](repeating: 255, count: width * height * 4)
     for y in 0..<height {
         for x in 0..<width {
@@ -267,12 +377,8 @@ let lowBoostedCG = autoExposeCapturedCGImage(lowLightCG)
 let (lowPostLuma, lowPostP90) = measureSceneLuminance(lowBoostedCG)
 
 assertTrue(
-    lowPreLuma < 0.04 && lowPostLuma >= 0.25 && lowPostLuma <= 0.52,
-    String(format: "Low-Light Mode 1 brightness recovery: %.3f -> %.3f sRGB (target 0.25..0.52)", lowPreLuma, lowPostLuma)
-)
-assertTrue(
-    lowPostP90 < 0.85,
-    String(format: "Low-Light Mode 1 90th-percentile highlight stays un-clipped: p90=%.3f (< 0.85)", lowPostP90)
+    lowPreLuma < 0.04 && lowPostLuma >= 0.11 && lowPostLuma <= 0.45 && lowPostP90 >= 0.30 && lowPostP90 < 0.85,
+    String(format: "Low-Light Mode 1 brightness recovery with bounded toe slope: mean %.3f -> %.3f, subject p90=%.3f (0.30..0.85)", lowPreLuma, lowPostLuma, lowPostP90)
 )
 
 let skinPost = readPixelRGB(lowBoostedCG, x: 20, y: 20)
@@ -292,8 +398,8 @@ let step4 = readPixelRGB(lowBoostedCG, x: 6, y: 4).r
 let step8 = readPixelRGB(lowBoostedCG, x: 8, y: 4).r
 let step16 = readPixelRGB(lowBoostedCG, x: 10, y: 4).r
 assertTrue(
-    step1 < step4 && step4 < step8 && step8 < step16 && step1 < 80 && step16 < 210,
-    "Low-Light Mode 1 shadow steps (1,2,4,8,16/255) scale smoothly without 1-bit block clipping: [\(step1), \(step2), \(step4), \(step8), \(step16)]"
+    step1 <= 16 && step1 < step2 && step2 < step4 && step4 < step8 && step8 < step16 && step16 < 180,
+    "Low-Light Mode 1 shadow steps (1,2,4,8,16/255) scale smoothly with bounded toe slope (step1 <= 16): [\(step1), \(step2), \(step4), \(step8), \(step16)]"
 )
 
 // 2. Decent Light / Dim Auto-ISO 12800 ("A little dim on camera, but viewable")
@@ -387,6 +493,44 @@ if let lowGIFURL = createEqualizedGIF(from: [sonyLowURL, sonyLowURL], frameDurat
     assertTrue(false, "Failed to verify low-light GIF non-duplication")
 }
 try? FileManager.default.removeItem(at: sonyLowURL)
+
+// 5b. 16x16 4:2:0 JPEG Macroblock Discretization & Shadow Zero-Pinning Elimination
+let deblockW = 320, deblockH = 240
+var deblockPixels = [UInt8](repeating: 255, count: deblockW * deblockH * 4)
+for y in 0..<deblockH {
+    for x in 0..<deblockW {
+        let bx = (x / 16) % 3
+        let idx = (y * deblockW + x) * 4
+        if y < 140 {
+            deblockPixels[idx]     = 8
+            deblockPixels[idx + 1] = 4
+            deblockPixels[idx + 2] = UInt8(bx) // 0, 1, 2
+        } else {
+            deblockPixels[idx]     = 5
+            deblockPixels[idx + 1] = UInt8(1 + (bx % 2))
+            deblockPixels[idx + 2] = 2
+        }
+    }
+}
+if let deblockCtx = CGContext(
+    data: &deblockPixels,
+    width: deblockW,
+    height: deblockH,
+    bitsPerComponent: 8,
+    bytesPerRow: deblockW * 4,
+    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+), let rawBlockyCG = deblockCtx.makeImage() {
+    let deblockedCG = autoExposeCapturedCGImage(rawBlockyCG)
+    let b0 = readPixelRGB(deblockedCG, x: 8, y: 60)
+    let b1 = readPixelRGB(deblockedCG, x: 24, y: 60)
+    let b2 = readPixelRGB(deblockedCG, x: 40, y: 60)
+    let maxBlueBlockJump = max(abs(b0.b - b1.b), abs(b1.b - b2.b))
+    assertTrue(
+        b0.b >= 12 && maxBlueBlockJump <= 6,
+        "Low-light 16x16 macroblock de-blocking prevents B=0 neon-yellow zero-pinning (B=\(b0.b),\(b1.b),\(b2.b), maxJump=\(maxBlueBlockJump) <= 6 vs old 59)"
+    )
+}
 
 // 6. Top-Center Pill Wait Bar (10% trailing -> 30% leading left-to-right fill) & Photo/GIF Progress Dot Verification
 func computePillWaitBarFillWidth(pillWidth: Double, progress: Double) -> Double {
