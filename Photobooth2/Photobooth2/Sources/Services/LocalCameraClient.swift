@@ -229,34 +229,19 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
         let rawCI = CIImage(cvPixelBuffer: cvBuffer)
         
         // Pre-orient and horizontally mirror raw front-camera frame BEFORE compositing any foreground text/frame,
-        // then auto-expose dim frames with the same ISP curve as still captures so Live View matches Review.
+        // then render (and optionally segment/composite) in a SINGLE createCGImage GPU pass at 30 FPS.
         let orientedMirroredCI = BackdropCompositorService.orientAndMirrorFrontCameraCIImage(
             rawCI,
             interfaceOrientation: deviceOrientation
         )
         
-        guard let subjectCG = self.ciContext.createCGImage(orientedMirroredCI, from: orientedMirroredCI.extent) else {
+        guard let finalCG = BackdropCompositorService.composite(
+            subjectCI: orientedMirroredCI,
+            backdrop: selectedBackdrop,
+            quality: .liveFast,
+            ciContext: self.ciContext
+        ) else {
             return
-        }
-        let (exposedSubjectCG, _) = SonyUSBCameraClient.adjustCGImageExposureIfNeeded(
-            subjectCG,
-            ciContext: self.ciContext,
-            minRecoverableSrgbLuma: 0.025,
-            targetSrgbLuma: 0.42,
-            triggerThresholdSrgb: 0.40,
-            maxEVBoost: 3.5
-        )
-        
-        let finalCG: CGImage
-        if !selectedBackdrop.isNone {
-            finalCG = BackdropCompositorService.composite(
-                cgImage: exposedSubjectCG,
-                backdrop: selectedBackdrop,
-                quality: .liveFast,
-                ciContext: self.ciContext
-            )
-        } else {
-            finalCG = exposedSubjectCG
         }
         
         let uiImage = UIImage(cgImage: finalCG, scale: 1.0, orientation: .up)
@@ -293,15 +278,29 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
                 return
             }
             
-            // Step 1: Orient and horizontally mirror raw front-camera frame into upright selfie coordinates
+            // Step 1: Orient and horizontally mirror raw front-camera frame into upright 3:2 selfie coordinates,
+            // and scale 12MP captures down to the photobooth standard 2MP (1620x1080) on the GPU in a single pass.
             let rawCI = CIImage(cgImage: rawCG)
-            let orientedMirroredCI = BackdropCompositorService.orientAndMirrorFrontCameraCIImage(
+            var orientedMirroredCI = BackdropCompositorService.orientAndMirrorFrontCameraCIImage(
                 rawCI,
                 interfaceOrientation: cachedOrientation
             )
+            let maxWidth: CGFloat = 1620.0
+            if orientedMirroredCI.extent.width > maxWidth {
+                let scale = maxWidth / orientedMirroredCI.extent.width
+                orientedMirroredCI = orientedMirroredCI
+                    .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                let targetRect = CGRect(
+                    x: orientedMirroredCI.extent.origin.x.rounded(),
+                    y: orientedMirroredCI.extent.origin.y.rounded(),
+                    width: maxWidth,
+                    height: (orientedMirroredCI.extent.height).rounded()
+                )
+                orientedMirroredCI = orientedMirroredCI.cropped(to: targetRect)
+            }
             let uprightSubjectCG = ciCtx.createCGImage(orientedMirroredCI, from: orientedMirroredCI.extent) ?? rawCG
             
-            // Step 2: Run single-pass subject auto-exposure BEFORE backdrop compositing
+            // Step 2: Run fast GPU subject auto-exposure BEFORE backdrop compositing
             let exposedSubjectCG = SonyUSBCameraClient.autoExposeCapturedCGImage(
                 uprightSubjectCG,
                 ciContext: ciCtx

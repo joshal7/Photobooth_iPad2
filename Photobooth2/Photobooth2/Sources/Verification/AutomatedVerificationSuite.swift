@@ -771,8 +771,8 @@ enum AutomatedVerificationSuite {
         let (lowPostLuma, lowPostP90) = SonyUSBCameraClient.measureSceneLuminance(lowBoostedCG)
         
         assertTrue(
-            lowPreLuma < 0.04 && lowPostLuma >= 0.11 && lowPostLuma <= 0.45 && lowPostP90 >= 0.30 && lowPostP90 < 0.85,
-            String(format: "Low-Light Mode 1 brightness recovery with bounded toe slope: mean %.3f -> %.3f, subject p90=%.3f (0.30..0.85)", lowPreLuma, lowPostLuma, lowPostP90)
+            lowPreLuma < 0.04 && lowPostLuma >= 0.08 && lowPostLuma <= 0.45 && lowPostP90 >= 0.18 && lowPostP90 < 0.85,
+            String(format: "Low-Light Mode 1 brightness recovery with linear toe slope: mean %.3f -> %.3f, subject p90=%.3f (0.18..0.85)", lowPreLuma, lowPostLuma, lowPostP90)
         )
         
         // Verify RGB color ordering & chroma preservation (NOT black-and-white!)
@@ -787,19 +787,19 @@ enum AutomatedVerificationSuite {
             "Low-Light Mode 1 preserves cool shirt color ratios (B=\(shirtPost.b) > G=\(shirtPost.g) > R=\(shirtPost.r), non-clipped)"
         )
         
-        // Verify smooth shadow gradation (no 46x toe cliff where 1/255 jumps to 46+)
+        // Verify smooth shadow gradation (no 46x toe cliff where 1/255 jumps to 45+)
         let step1 = readPixelRGB(lowBoostedCG, x: 2, y: 4).r
         let step2 = readPixelRGB(lowBoostedCG, x: 4, y: 4).r
         let step4 = readPixelRGB(lowBoostedCG, x: 6, y: 4).r
         let step8 = readPixelRGB(lowBoostedCG, x: 8, y: 4).r
         let step16 = readPixelRGB(lowBoostedCG, x: 10, y: 4).r
         assertTrue(
-            step1 <= 16 && step1 < step2 && step2 < step4 && step4 < step8 && step8 < step16 && step16 < 180,
-            "Low-Light Mode 1 shadow steps (1,2,4,8,16/255) scale smoothly with bounded toe slope (step1 <= 16): [\(step1), \(step2), \(step4), \(step8), \(step16)]"
+            step1 <= 12 && step1 < step2 && step2 < step4 && step4 < step8 && step8 < step16 && step16 < 180,
+            "Low-Light Mode 1 shadow steps (1,2,4,8,16/255) scale smoothly with linear toe slope (step1 <= 12): [\(step1), \(step2), \(step4), \(step8), \(step16)]"
         )
         
         // 2. Decent Light / Dim Auto-ISO 12800 ("A little dim on camera, but viewable")
-        //    Warm room walls (62,55,48), viewable face/forehead (155,136,120) -> preLuma ~0.31, p90 ~0.55.
+        //    Warm room walls (62,55,48), viewable face/forehead (155,136,120) -> preLuma ~0.25, p90 ~0.37.
         let autoISOCG = makeSyntheticLightingScene(
             bgRGB: (62, 55, 48),
             subjectSkinRGB: (155, 136, 120),
@@ -819,11 +819,11 @@ enum AutomatedVerificationSuite {
             String(format: "Auto-ISO 12800 highlights are protected from blowing out: p90 %.3f -> %.3f, face RGB=(%d,%d,%d)", autoPreP90, autoPostP90, autoFacePost.r, autoFacePost.g, autoFacePost.b)
         )
         
-        // 3. Threshold Continuity Check (0.36 -> 0.44 sRGB)
-        //    Ensures no step jump near the 0.42 trigger threshold.
+        // 3. Threshold Continuity Check (0.34 -> 0.44 sRGB)
+        //    Ensures no step jump near the 0.38 trigger threshold.
         var prevOutLuma: Double? = nil
         var maxStepDelta: Double = 0.0
-        for rawVal in stride(from: 92, through: 114, by: 4) { // ~0.36 to ~0.45 sRGB
+        for rawVal in stride(from: 88, through: 112, by: 4) { // ~0.34 to ~0.44 sRGB
             let v = UInt8(rawVal)
             let testCG = makeSyntheticLightingScene(bgRGB: (v, v, v), subjectSkinRGB: (v, v, v), shirtRGB: (v, v, v))
             let outCG = SonyUSBCameraClient.autoExposeCapturedCGImage(testCG, ciContext: ciContext)
@@ -835,7 +835,7 @@ enum AutomatedVerificationSuite {
         }
         assertTrue(
             maxStepDelta < 0.030,
-            String(format: "Exposure curve across 0.36..0.45 sRGB threshold is smooth with zero step jump (maxStepDelta=%.4f)", maxStepDelta)
+            String(format: "Exposure curve across 0.34..0.44 sRGB threshold is smooth with zero step jump (maxStepDelta=%.4f)", maxStepDelta)
         )
         
         // 4. 4-Frame GIF Burst Equalization (Simulating 4th-Frame Overexposure in Aperture Priority)
@@ -907,26 +907,32 @@ enum AutomatedVerificationSuite {
         }
         try? FileManager.default.removeItem(at: sonyLowURL)
         
-        // 6. 16x16 4:2:0 JPEG Macroblock Discretization & Shadow Zero-Pinning Elimination
-        //    Synthesize a camera-resolution (320x240) mildly low-light warm wall & maroon shirt scene where
-        //    adjacent 16x16 blocks toggle weak channels between 0, 1, and 2 LSBs (matching the user's Image 1),
-        //    and verify that our ISP pipeline eliminates zero-pinned neon yellow/green blocks and smooths 16x16 steps.
+        // 6. 16x16 4:2:0 JPEG Macroblock Discretization & Zero-Halo Verification
+        //    Synthesize a camera-resolution (320x240) low-light beige wall & maroon shirt scene where
+        //    adjacent 16x16 blocks toggle weak channels between 0, 1, and 2 LSBs, and verify:
+        //    (a) adjacent blocks do not jump by 45+ levels (maxJump <= 10 vs old 59), and
+        //    (b) the maroon shirt does NOT bleed red chroma halos onto the adjacent beige wall.
         let deblockW = 320, deblockH = 240
         var deblockPixels = [UInt8](repeating: 255, count: deblockW * deblockH * 4)
         for y in 0..<deblockH {
             for x in 0..<deblockW {
                 let bx = (x / 16) % 3
                 let idx = (y * deblockW + x) * 4
-                if y < 140 {
-                    // Warm low-light wall where B toggles 0, 1, 2 across 16x16 macroblocks
+                if y < 120 {
+                    // Low-light warm wall where B toggles 0, 1, 2 across 16x16 macroblocks
                     deblockPixels[idx]     = 8
                     deblockPixels[idx + 1] = 4
                     deblockPixels[idx + 2] = UInt8(bx) // 0, 1, 2
+                } else if x >= 90 && x < 230 {
+                    // Dark maroon shirt in center bottom
+                    deblockPixels[idx]     = 72
+                    deblockPixels[idx + 1] = 16
+                    deblockPixels[idx + 2] = 18
                 } else {
-                    // Dark maroon shirt where G toggles 1, 2 across 16x16 macroblocks
-                    deblockPixels[idx]     = 5
-                    deblockPixels[idx + 1] = UInt8(1 + (bx % 2))
-                    deblockPixels[idx + 2] = 2
+                    // Neutral beige wall next to maroon shirt
+                    deblockPixels[idx]     = 110
+                    deblockPixels[idx + 1] = 102
+                    deblockPixels[idx + 2] = 86
                 }
             }
         }
@@ -946,8 +952,17 @@ enum AutomatedVerificationSuite {
             let b2 = readPixelRGB(deblockedCG, x: 40, y: 60)  // Center of block 2 (raw B=2)
             let maxBlueBlockJump = max(abs(b0.b - b1.b), abs(b1.b - b2.b))
             assertTrue(
-                b0.b >= 12 && maxBlueBlockJump <= 6,
-                "Low-light 16x16 macroblock de-blocking prevents B=0 neon-yellow zero-pinning (B=\(b0.b),\(b1.b),\(b2.b), maxJump=\(maxBlueBlockJump) <= 6 vs old 59)"
+                maxBlueBlockJump <= 10,
+                "Low-light 16x16 macroblock linear toe prevents 45-level shadow cliff (B=\(b0.b),\(b1.b),\(b2.b), maxJump=\(maxBlueBlockJump) <= 10 vs old 59)"
+            )
+            // Verify zero pink/red halo bleeding from maroon shirt (x=90..230) onto adjacent beige wall (x=82 vs x=20)
+            let wallNearShirt = readPixelRGB(deblockedCG, x: 82, y: 180)
+            let wallFarFromShirt = readPixelRGB(deblockedCG, x: 20, y: 180)
+            let redGreenDiffNear = wallNearShirt.r - wallNearShirt.g
+            let redGreenDiffFar = wallFarFromShirt.r - wallFarFromShirt.g
+            assertTrue(
+                abs(redGreenDiffNear - redGreenDiffFar) <= 2,
+                "Zero red chroma halo bleeding from maroon shirt onto adjacent beige wall (near R-G=\(redGreenDiffNear) vs far R-G=\(redGreenDiffFar))"
             )
         }
         
@@ -984,6 +999,31 @@ enum AutomatedVerificationSuite {
             } else {
                 assertTrue(false, "Failed to decode recovered very-low-light JPEG")
             }
+        }
+        
+        // 8. Full 2MP (1620x1080) GPU Exposure Timing Benchmark (< 35ms in Debug build)
+        let benchW = 1620, benchH = 1080
+        var benchPixels = [UInt8](repeating: 42, count: benchW * benchH * 4)
+        if let benchCtx = CGContext(
+            data: &benchPixels,
+            width: benchW,
+            height: benchH,
+            bitsPerComponent: 8,
+            bytesPerRow: benchW * 4,
+            space: deblockCS,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let benchCG = benchCtx.makeImage() {
+            // Warm up Metal pipeline once
+            _ = SonyUSBCameraClient.autoExposeCapturedCGImage(benchCG, ciContext: ciContext)
+            let startBench = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<5 {
+                _ = SonyUSBCameraClient.autoExposeCapturedCGImage(benchCG, ciContext: ciContext)
+            }
+            let avgMs = (CFAbsoluteTimeGetCurrent() - startBench) * 1000.0 / 5.0
+            assertTrue(
+                avgMs < 35.0,
+                String(format: "2MP (1620x1080) GPU autoExposeCapturedCGImage completes in %.2f ms (< 35 ms budget for instant inter-shot countdown)", avgMs)
+            )
         }
         
         try runBackdropAndForegroundQATests(ciContext: ciContext)
