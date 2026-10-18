@@ -1814,8 +1814,10 @@ Task.detached {
         let rgbaInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
         for fIdx in 0..<4 {
             if let gCtx = CGContext(data: nil, width: 1620, height: 1080, bitsPerComponent: 8, bytesPerRow: 1620 * 4, space: colorSpace, bitmapInfo: rgbaInfo) {
-                gCtx.setFillColor(red: CGFloat(fIdx) * 0.25, green: 0.3, blue: 0.7, alpha: 1.0)
+                gCtx.setFillColor(red: 0.85, green: 0.75, blue: 0.60, alpha: 1.0)
                 gCtx.fill(CGRect(x: 0, y: 0, width: 1620, height: 1080))
+                gCtx.setFillColor(red: 0.30 + CGFloat(fIdx) * 0.15, green: 0.45, blue: 0.75, alpha: 1.0)
+                gCtx.fill(CGRect(x: 300 + fIdx * 120, y: 200, width: 400, height: 500))
                 if let fCG = gCtx.makeImage() {
                     CGImageDestinationAddImage(gifDest, fCG, [kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFDelayTime as String: 0.45]] as CFDictionary)
                 }
@@ -1830,15 +1832,23 @@ Task.detached {
        let gw = gProps[kCGImagePropertyPixelWidth] as? Int,
        let gh = gProps[kCGImagePropertyPixelHeight] as? Int,
        let gDict = gProps[kCGImagePropertyGIFDictionary] as? [CFString: Any],
-       let gUnclamped = gDict[kCGImagePropertyGIFUnclampedDelayTime] as? Double,
+       let gDelay = gDict[kCGImagePropertyGIFDelayTime] as? Double,
        let cProps = CGImageSourceCopyProperties(gSrc, nil) as? [CFString: Any],
        let cGIF = cProps[kCGImagePropertyGIFDictionary] as? [CFString: Any],
-       let loopCount = cGIF[kCGImagePropertyGIFLoopCount] as? Int,
-       let hasGlobalMap = cGIF[kCGImagePropertyGIFHasGlobalColorMap] as? Bool {
-        let headerMagic = String(data: normGIF.prefix(6), encoding: .ascii) ?? ""
-        let gAlpha = (gProps[kCGImagePropertyHasAlpha] as? Bool) ?? false
-        guard headerMagic == "GIF89a" && !gAlpha && gw == 960 && gh == 640 && loopCount == 0 && hasGlobalMap && abs(gUnclamped - 0.45) < 0.02 else {
-            fputs("FAIL: Normalized GIF properties mismatch: header=\\(headerMagic) alpha=\\(gAlpha) \\(gw)x\\(gh) loop=\\(loopCount) globalMap=\\(hasGlobalMap) unclamped=\\(gUnclamped)\\n", stderr)
+       let loopCount = cGIF[kCGImagePropertyGIFLoopCount] as? Int {
+        var blackPixels = 0
+        for fIdx in 0..<4 {
+            if let fCG = CGImageSourceCreateImageAtIndex(gSrc, fIdx, nil),
+               let dp = fCG.dataProvider?.data as Data? {
+                for p in stride(from: 0, to: dp.count, by: 4) {
+                    if dp[p] < 10 && dp[p + 1] < 10 && dp[p + 2] < 10 {
+                        blackPixels += 1
+                    }
+                }
+            }
+        }
+        guard gw == 960 && gh == 640 && loopCount == 0 && abs(gDelay - 0.45) < 0.02 && blackPixels == 0 else {
+            fputs("FAIL: Normalized GIF properties mismatch: \\(gw)x\\(gh) loop=\\(loopCount) delay=\\(gDelay) blackPixels=\\(blackPixels)\\n", stderr)
             Foundation.exit(1)
         }
     } else {

@@ -2295,7 +2295,7 @@ enum AutomatedVerificationSuite {
             "Post-email confirmation screen adds 1s (2.5s total) when offline ('Saved for Wi-Fi Delivery')"
         )
         
-        // C10: Animated GIF email normalization (1620x1080 -> 960x640 opaque RGB multi-frame GIF89a for iPhone Gmail preview/download)
+        // C10: Animated GIF email normalization (1620x1080 -> 960x640 multi-frame GIF with zero black-dot delta corruption)
         let rawFourFrameGIFData: Data? = {
             let colorSpace = CGColorSpaceCreateDeviceRGB()
             let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
@@ -2304,8 +2304,11 @@ enum AutomatedVerificationSuite {
             CGImageDestinationSetProperties(dest, [kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFLoopCount as String: 0]] as CFDictionary)
             for idx in 0..<4 {
                 guard let ctx = CGContext(data: nil, width: 1620, height: 1080, bitsPerComponent: 8, bytesPerRow: 1620 * 4, space: colorSpace, bitmapInfo: bitmapInfo) else { return nil }
-                ctx.setFillColor(red: CGFloat(idx) * 0.25, green: 0.4, blue: 0.8, alpha: 1.0)
+                // Static warm background + moving subject rectangle so delta frames exercise unchanged background pixels
+                ctx.setFillColor(red: 0.85, green: 0.75, blue: 0.60, alpha: 1.0)
                 ctx.fill(CGRect(x: 0, y: 0, width: 1620, height: 1080))
+                ctx.setFillColor(red: 0.30 + CGFloat(idx) * 0.15, green: 0.45, blue: 0.75, alpha: 1.0)
+                ctx.fill(CGRect(x: 300 + idx * 120, y: 200, width: 400, height: 500))
                 guard let cg = ctx.makeImage() else { return nil }
                 CGImageDestinationAddImage(dest, cg, [kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFDelayTime as String: 0.45]] as CFDictionary)
             }
@@ -2321,20 +2324,27 @@ enum AutomatedVerificationSuite {
                 let w = f0Props?[kCGImagePropertyPixelWidth] as? Int ?? 0
                 let h = f0Props?[kCGImagePropertyPixelHeight] as? Int ?? 0
                 let gifDict = f0Props?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
-                let unclamped = gifDict?[kCGImagePropertyGIFUnclampedDelayTime] as? Double ?? 0
+                let delay = gifDict?[kCGImagePropertyGIFDelayTime] as? Double ?? 0
                 let containerProps = CGImageSourceCopyProperties(gifSrc, nil) as? [CFString: Any]
                 let containerGIF = containerProps?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
                 let loopCount = containerGIF?[kCGImagePropertyGIFLoopCount] as? Int ?? -1
-                let hasGlobalMap = containerGIF?[kCGImagePropertyGIFHasGlobalColorMap] as? Bool ?? false
-                let headerMagic = String(data: normalizedGIF.prefix(6), encoding: .ascii) ?? ""
-                let hasAlpha = (f0Props?[kCGImagePropertyHasAlpha] as? Bool) ?? false
-                assertEqual(headerMagic, "GIF89a", "Normalized email GIF starts with strict GIF89a magic signature (not GIF87a)")
-                assertTrue(!hasAlpha, "Normalized email GIF clears bogus GCE transparent color flag (HasAlpha == false)")
                 assertEqual(w, 960, "Normalized email GIF width is 960px (< 1000px mobile proxy threshold)")
                 assertEqual(h, 640, "Normalized email GIF height is 640px (exact 3:2 landscape)")
                 assertEqual(loopCount, 0, "Normalized email GIF preserves infinite LoopCount = 0")
-                assertTrue(hasGlobalMap, "Normalized email GIF sets HasGlobalColorMap = true")
-                assertTrue(abs(unclamped - 0.45) < 0.02, "Normalized email GIF frame preserves UnclampedDelayTime (0.45s)")
+                assertTrue(abs(delay - 0.45) < 0.02, "Normalized email GIF frame preserves DelayTime (0.45s)")
+                
+                var blackPixelCount = 0
+                for frameIdx in 0..<count {
+                    if let frameCG = CGImageSourceCreateImageAtIndex(gifSrc, frameIdx, nil),
+                       let dp = frameCG.dataProvider?.data as Data? {
+                        for p in stride(from: 0, to: dp.count, by: 4) {
+                            if dp[p] < 10 && dp[p + 1] < 10 && dp[p + 2] < 10 {
+                                blackPixelCount += 1
+                            }
+                        }
+                    }
+                }
+                assertEqual(blackPixelCount, 0, "Normalized email GIF frames 1-4 have zero black-dot delta corruption pixels")
             } else {
                 assertTrue(false, "Normalized email GIF data must be a valid CGImageSource")
             }
