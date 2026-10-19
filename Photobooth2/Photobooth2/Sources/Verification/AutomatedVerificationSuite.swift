@@ -1608,6 +1608,171 @@ enum AutomatedVerificationSuite {
             assertTrue(false, "Mac Batch Full-Res Processor failed on asymmetric external camera photo")
         }
         
+        // 6C. Real-World Event Manifest Robustness Suite:
+        //     - Exact 15-Entry User Scenario (`DSC09816`..`DSC09829` deleted pre-format test shots with corrupted `matchedFullResFilename`,
+        //       `DSC09830`..`DSC09832` Snowy Peaks, `DSC09833`..`DSC09835` No-Background, `DSC09836`..`DSC09838` Golden Gate Bridge)
+        //     - Interleaved GIFs & Old GIFs (<24h) in Folder
+        //     - Multiple `manifest.json` Files (`photobooth_backdrop_manifest.json` + `photobooth_backdrop_manifest 2.json`) from App Restart
+        //     - SD Card Format in `Reset` Mode (`DSC00001.JPG` Filename Reuse for Roving Photo & No-Background Photo)
+        let realWorldFolder = qaRoot.appendingPathComponent("RealWorld_DSC09830_09838", isDirectory: true)
+        try fm.createDirectory(at: realWorldFolder, withIntermediateDirectories: true)
+        
+        let snowyBgCG = makeSolidOrBorderCGImage(width: 180, height: 120, fillRGBA: (20, 180, 245, 255))    // Cyan-Blue (Snowy Peaks)
+        let ggbBgCG = makeSolidOrBorderCGImage(width: 180, height: 120, fillRGBA: (240, 80, 20, 255))      // Orange-Red (Golden Gate Bridge)
+        let speyBgCG = makeSolidOrBorderCGImage(width: 180, height: 120, fillRGBA: (180, 120, 20, 255))    // Amber (Spey Whisky - DELETED)
+        let timeFgCG = makeSolidOrBorderCGImage(width: 180, height: 120, fillRGBA: (0, 0, 0, 0), borderThickness: 12, borderRGBA: (230, 10, 10, 255))
+        let eiffelBgCG = makeSolidOrBorderCGImage(width: 180, height: 120, fillRGBA: (130, 30, 200, 255))  // Purple (Eiffel - DELETED)
+        
+        let snowyBytes = encodeJPEGWithEXIF(snowyBgCG, dateTimeOriginal: "2026:10:18 12:00:00")
+        let ggbBytes = encodeJPEGWithEXIF(ggbBgCG, dateTimeOriginal: "2026:10:18 12:00:00")
+        let speyBytes = encodeJPEGWithEXIF(speyBgCG, dateTimeOriginal: "2026:10:18 12:00:00")
+        let timeBytes = encodePNG(timeFgCG)
+        let eiffelBytes = encodeJPEGWithEXIF(eiffelBgCG, dateTimeOriginal: "2026:10:18 12:00:00")
+        
+        // Tripod room scene with near-identical 8x8 RGB signature across the entire evening (dist < 0.03 between all shots!)
+        let tripodRoomSubjCG = makeSolidOrBorderCGImage(width: 180, height: 120, fillRGBA: (145, 130, 110, 255))
+        let tripodRoomSig = BackdropCompositorService.computeRGBSignature8x8(from: tripodRoomSubjCG)
+        
+        // Write the 9 post-format SD card JPEGs (`DSC09830.JPG` .. `DSC09838.JPG`) into `realWorldFolder`:
+        let sdCardShots: [(name: String, exifDT: String)] = [
+            ("DSC09830.JPG", "2026:10:18 20:38:52"),
+            ("DSC09831.JPG", "2026:10:18 20:38:56"),
+            ("DSC09832.JPG", "2026:10:18 20:39:01"),
+            ("DSC09833.JPG", "2026:10:18 20:40:00"), // No background (Original)
+            ("DSC09834.JPG", "2026:10:18 20:40:04"), // No background (Original)
+            ("DSC09835.JPG", "2026:10:18 20:40:08"), // No background (Original)
+            ("DSC09836.JPG", "2026:10:18 20:40:48"),
+            ("DSC09837.JPG", "2026:10:18 20:40:52"),
+            ("DSC09838.JPG", "2026:10:18 20:40:56")
+        ]
+        for shot in sdCardShots {
+            let url = realWorldFolder.appendingPathComponent(shot.name)
+            try encodeJPEGWithEXIF(tripodRoomSubjCG, dateTimeOriginal: shot.exifDT).write(to: url)
+        }
+        // Also place old GIFs from <24h ago and a current-session GIF into the same folder
+        try Data("GIF89a_old_session".utf8).write(to: realWorldFolder.appendingPathComponent("4231F25C-AD33-4F26-AC53-0D73D25BDAC0.gif"))
+        try Data("GIF89a_current_session".utf8).write(to: realWorldFolder.appendingPathComponent("A448AC27-B568-4A0F-9D6E-2854BD8A16AC.gif"))
+        
+        let isoFormatter = ISO8601DateFormatter()
+        func makeTestEntry(
+            utc: String,
+            ptp: String,
+            exifDT: String,
+            subSec: String,
+            backdropID: String,
+            bgFile: String?,
+            fgFile: String? = nil,
+            applied: Bool = false,
+            corruptedMatched: String? = nil
+        ) -> PhotoBackdropManifestEntry {
+            PhotoBackdropManifestEntry(
+                id: UUID(),
+                captureTimestampUTC: isoFormatter.date(from: utc) ?? Date(),
+                ptpFilename: ptp,
+                exifDateTimeOriginal: exifDT,
+                exifSubSecOriginal: subSec,
+                rgbSignature8x8: tripodRoomSig,
+                backdropID: backdropID,
+                backdropDisplayName: backdropID,
+                backgroundFilename: bgFile,
+                foregroundFilename: fgFile,
+                foregroundFitMode: .stretchToEdges,
+                appliedToFullRes: applied,
+                matchedFullResFilename: corruptedMatched
+            )
+        }
+        
+        // Split the 15 entries across TWO manifest files in the same folder (`photobooth_backdrop_manifest.json` and
+        // `photobooth_backdrop_manifest 2.json`) to simultaneously verify Condition 3 & 4 (app restart / multiple manifests)
+        // AND self-healing of previously corrupted `matchedFullResFilename` values!
+        let manifestPart1Entries: [PhotoBackdropManifestEntry] = [
+            // 9 deleted pre-format test shots (20:31..20:36) with corrupted `matchedFullResFilename` from prior buggy run:
+            makeTestEntry(utc: "2026-10-19T03:31:28Z", ptp: "DSC09816.JPG", exifDT: "2026:10:18 20:31:25", subSec: "991", backdropID: "301_scottish_spey_whisky", bgFile: "301_scottish_spey_whisky_bg.jpg", applied: true, corruptedMatched: "DSC09838.JPG"),
+            makeTestEntry(utc: "2026-10-19T03:31:33Z", ptp: "DSC09818.JPG", exifDT: "2026:10:18 20:31:31", subSec: "391", backdropID: "301_scottish_spey_whisky", bgFile: "301_scottish_spey_whisky_bg.jpg", applied: true, corruptedMatched: "DSC09836.JPG"),
+            makeTestEntry(utc: "2026-10-19T03:31:38Z", ptp: "DSC09820.JPG", exifDT: "2026:10:18 20:31:36", subSec: "623", backdropID: "301_scottish_spey_whisky", bgFile: "301_scottish_spey_whisky_bg.jpg", applied: true, corruptedMatched: "DSC09830.JPG"),
+            makeTestEntry(utc: "2026-10-19T03:33:25Z", ptp: "DSC09824.JPG", exifDT: "2026:10:18 20:33:22", subSec: "467", backdropID: "501_time_person_of_the_year", bgFile: nil, fgFile: "501_time_person_of_the_year_fg.png", applied: true, corruptedMatched: "DSC09834.JPG"),
+            makeTestEntry(utc: "2026-10-19T03:33:28Z", ptp: "DSC09825.JPG", exifDT: "2026:10:18 20:33:26", subSec: "326", backdropID: "501_time_person_of_the_year", bgFile: nil, fgFile: "501_time_person_of_the_year_fg.png", applied: true, corruptedMatched: "DSC09833.JPG"),
+            makeTestEntry(utc: "2026-10-19T03:33:33Z", ptp: "DSC09826.JPG", exifDT: "2026:10:18 20:33:30", subSec: "723", backdropID: "501_time_person_of_the_year", bgFile: nil, fgFile: "501_time_person_of_the_year_fg.png"),
+            makeTestEntry(utc: "2026-10-19T03:36:33Z", ptp: "DSC09827.JPG", exifDT: "2026:10:18 20:36:30", subSec: "481", backdropID: "303_eiffel_tower_night", bgFile: "303_eiffel_tower_night_bg.jpg"),
+            makeTestEntry(utc: "2026-10-19T03:36:37Z", ptp: "DSC09828.JPG", exifDT: "2026:10:18 20:36:34", subSec: "391", backdropID: "303_eiffel_tower_night", bgFile: "303_eiffel_tower_night_bg.jpg"),
+            makeTestEntry(utc: "2026-10-19T03:36:41Z", ptp: "DSC09829.JPG", exifDT: "2026:10:18 20:36:38", subSec: "623", backdropID: "303_eiffel_tower_night", bgFile: "303_eiffel_tower_night_bg.jpg"),
+            // First 3 post-format shots (Snowy Peaks):
+            makeTestEntry(utc: "2026-10-19T03:38:55Z", ptp: "DSC09830.JPG", exifDT: "2026:10:18 20:38:52", subSec: "361", backdropID: "101_snowy_peaks", bgFile: "101_snowy_peaks_bg.jpg", applied: true, corruptedMatched: "DSC09832.JPG"),
+            makeTestEntry(utc: "2026-10-19T03:38:59Z", ptp: "DSC09831.JPG", exifDT: "2026:10:18 20:38:56", subSec: "600", backdropID: "101_snowy_peaks", bgFile: "101_snowy_peaks_bg.jpg", applied: true, corruptedMatched: "DSC09831.JPG"),
+            makeTestEntry(utc: "2026-10-19T03:39:03Z", ptp: "DSC09832.JPG", exifDT: "2026:10:18 20:39:01", subSec: "136", backdropID: "101_snowy_peaks", bgFile: "101_snowy_peaks_bg.jpg", applied: true, corruptedMatched: "DSC09835.JPG")
+        ]
+        // Second manifest file created after simulated app restart (`photobooth_backdrop_manifest 2.json`):
+        let manifestPart2Entries: [PhotoBackdropManifestEntry] = [
+            // Duplicate of DSC09832.JPG + 3 Golden Gate Bridge shots:
+            manifestPart1Entries.last!,
+            makeTestEntry(utc: "2026-10-19T03:40:51Z", ptp: "DSC09836.JPG", exifDT: "2026:10:18 20:40:48", subSec: "476", backdropID: "305_golden_gate_bridge", bgFile: "305_golden_gate_bridge_bg.jpg", applied: true, corruptedMatched: "DSC09837.JPG"),
+            makeTestEntry(utc: "2026-10-19T03:40:54Z", ptp: "DSC09837.JPG", exifDT: "2026:10:18 20:40:52", subSec: "242", backdropID: "305_golden_gate_bridge", bgFile: "305_golden_gate_bridge_bg.jpg"),
+            makeTestEntry(utc: "2026-10-19T03:40:59Z", ptp: "DSC09838.JPG", exifDT: "2026:10:18 20:40:56", subSec: "790", backdropID: "305_golden_gate_bridge", bgFile: "305_golden_gate_bridge_bg.jpg")
+        ]
+        let customAssetMap: [String: Data] = [
+            "101_snowy_peaks_bg.jpg": snowyBytes,
+            "305_golden_gate_bridge_bg.jpg": ggbBytes,
+            "301_scottish_spey_whisky_bg.jpg": speyBytes,
+            "501_time_person_of_the_year_fg.png": timeBytes,
+            "303_eiffel_tower_night_bg.jpg": eiffelBytes
+        ]
+        
+        try encoder.encode(BackdropManifestDocument(entries: manifestPart1Entries, customAssetsByFilename: customAssetMap))
+            .write(to: realWorldFolder.appendingPathComponent("photobooth_backdrop_manifest.json"))
+        try encoder.encode(BackdropManifestDocument(entries: manifestPart2Entries, customAssetsByFilename: customAssetMap))
+            .write(to: realWorldFolder.appendingPathComponent("photobooth_backdrop_manifest 2.json"))
+        
+        let rwReport = try BackdropManifestStore.applyBackdropsToFolder(
+            folderURL: realWorldFolder,
+            customMaskProvider: { _ in maskCI }
+        )
+        assertEqual(rwReport.newlyAppliedCount, 6, "Real-world 15-entry scenario applies backdrops to exactly 6 photos (3 Snowy Peaks + 3 Golden Gate Bridge)")
+        
+        for name in ["DSC09830.JPG", "DSC09831.JPG", "DSC09832.JPG"] {
+            let (_, _, tag) = BackdropCompositorService.extractEXIFTimestamps(from: realWorldFolder.appendingPathComponent(name))
+            assertEqual(tag, "101_snowy_peaks", "\(name) received Snowy Peaks backdrop (101_snowy_peaks)")
+        }
+        for name in ["DSC09833.JPG", "DSC09834.JPG", "DSC09835.JPG"] {
+            let (_, _, tag) = BackdropCompositorService.extractEXIFTimestamps(from: realWorldFolder.appendingPathComponent(name))
+            assertEqual(tag, nil, "\(name) (No Background / Original) remained 100% untouched (nil PB2_BACKDROP tag)")
+        }
+        for name in ["DSC09836.JPG", "DSC09837.JPG", "DSC09838.JPG"] {
+            let (_, _, tag) = BackdropCompositorService.extractEXIFTimestamps(from: realWorldFolder.appendingPathComponent(name))
+            assertEqual(tag, "305_golden_gate_bridge", "\(name) received Golden Gate Bridge backdrop (305_golden_gate_bridge)")
+        }
+        
+        // 6D. SD Card Format in `Reset` Mode (`DSC00001.JPG` Filename Reuse) + Roving Disconnected Camera Photos + `.none` Capture Protection
+        let resetCardFolder = qaRoot.appendingPathComponent("ResetCardFolder", isDirectory: true)
+        try fm.createDirectory(at: resetCardFolder, withIntermediateDirectories: true)
+        // Suppose earlier before formatting the SD card, DSC00001.JPG and DSC00002.JPG were taken at 19:00 with Spey Whisky:
+        let staleResetEntry1 = makeTestEntry(utc: "2026-10-19T02:00:05Z", ptp: "DSC00001.JPG", exifDT: "2026:10:18 19:00:02", subSec: "100", backdropID: "301_scottish_spey_whisky", bgFile: "301_scottish_spey_whisky_bg.jpg")
+        let staleResetEntry2 = makeTestEntry(utc: "2026-10-19T02:00:10Z", ptp: "DSC00002.JPG", exifDT: "2026:10:18 19:00:07", subSec: "200", backdropID: "301_scottish_spey_whisky", bgFile: "301_scottish_spey_whisky_bg.jpg")
+        // Then SD card was formatted (resetting counter to DSC00001.JPG) at 21:00:
+        // - New DSC00001.JPG at 21:00:10 is taken in photobooth with NO background (`none`)
+        // - New DSC00002.JPG at 21:00:20 is taken with camera DISCONNECTED (roving photo, so no new manifest entry!)
+        // - New DSC00003.JPG at 21:00:30 is taken in photobooth with Golden Gate Bridge
+        let newNoneEntry1 = makeTestEntry(utc: "2026-10-19T04:00:12Z", ptp: "DSC00001.JPG", exifDT: "2026:10:18 21:00:10", subSec: "500", backdropID: "none", bgFile: nil, fgFile: nil)
+        let newGGBEntry3 = makeTestEntry(utc: "2026-10-19T04:00:32Z", ptp: "DSC00003.JPG", exifDT: "2026:10:18 21:00:30", subSec: "800", backdropID: "305_golden_gate_bridge", bgFile: "305_golden_gate_bridge_bg.jpg")
+        
+        try encodeJPEGWithEXIF(tripodRoomSubjCG, dateTimeOriginal: "2026:10:18 21:00:10").write(to: resetCardFolder.appendingPathComponent("DSC00001.JPG"))
+        try encodeJPEGWithEXIF(tripodRoomSubjCG, dateTimeOriginal: "2026:10:18 21:00:20").write(to: resetCardFolder.appendingPathComponent("DSC00002.JPG"))
+        try encodeJPEGWithEXIF(tripodRoomSubjCG, dateTimeOriginal: "2026:10:18 21:00:30").write(to: resetCardFolder.appendingPathComponent("DSC00003.JPG"))
+        
+        let resetManifestDoc = BackdropManifestDocument(
+            entries: [staleResetEntry1, staleResetEntry2, newNoneEntry1, newGGBEntry3],
+            customAssetsByFilename: customAssetMap
+        )
+        try encoder.encode(resetManifestDoc).write(to: resetCardFolder.appendingPathComponent(BackdropManifestDocument.defaultFilename))
+        
+        let resetReport = try BackdropManifestStore.applyBackdropsToFolder(
+            folderURL: resetCardFolder,
+            customMaskProvider: { _ in maskCI }
+        )
+        assertEqual(resetReport.newlyAppliedCount, 1, "SD Card Reset Mode: only DSC00003.JPG receives a backdrop; reused DSC00001 (No Background) and DSC00002 (disconnected roving photo) are protected by EXIF timestamp veto")
+        assertEqual(BackdropCompositorService.extractEXIFTimestamps(from: resetCardFolder.appendingPathComponent("DSC00001.JPG")).backdropAppliedID, nil, "Reused DSC00001.JPG (No Background) is untouched despite stale pre-format DSC00001.JPG entry")
+        assertEqual(BackdropCompositorService.extractEXIFTimestamps(from: resetCardFolder.appendingPathComponent("DSC00002.JPG")).backdropAppliedID, nil, "Reused DSC00002.JPG (disconnected roving photo) is untouched despite stale pre-format DSC00002.JPG entry")
+        assertEqual(BackdropCompositorService.extractEXIFTimestamps(from: resetCardFolder.appendingPathComponent("DSC00003.JPG")).backdropAppliedID, "305_golden_gate_bridge", "DSC00003.JPG receives Golden Gate Bridge backdrop")
+        
         // 7. Touch-Shield Hit-Testing Verification (`BackdropPickerOverlayView.isPointInsideShield`)
         let iPadScreen = CGSize(width: 1194, height: 834)
         let bottomCenterTap = CGPoint(x: 597, y: 800)

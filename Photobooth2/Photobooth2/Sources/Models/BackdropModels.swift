@@ -94,6 +94,82 @@ nonisolated struct PhotoBackdropManifestEntry: Identifiable, Codable, Equatable,
     
     var appliedToFullRes: Bool = false
     var matchedFullResFilename: String? = nil
+    
+    /// Returns `true` when this manifest entry records an intentional "Original" (no background / no foreground) photo capture.
+    var isNoneBackdrop: Bool {
+        backdropID == BackdropItem.noneID || (backgroundFilename == nil && foregroundFilename == nil)
+    }
+    
+    init(
+        id: UUID = UUID(),
+        captureTimestampUTC: Date = Date(),
+        ptpFilename: String? = nil,
+        exifDateTimeOriginal: String? = nil,
+        exifSubSecOriginal: String? = nil,
+        rgbSignature8x8: [UInt8] = [],
+        backdropID: String,
+        backdropDisplayName: String,
+        backgroundFilename: String? = nil,
+        foregroundFilename: String? = nil,
+        foregroundFitMode: ForegroundFitMode = .stretchToEdges,
+        customBackgroundData: Data? = nil,
+        customForegroundData: Data? = nil,
+        appliedToFullRes: Bool = false,
+        matchedFullResFilename: String? = nil
+    ) {
+        self.id = id
+        self.captureTimestampUTC = captureTimestampUTC
+        self.ptpFilename = ptpFilename
+        self.exifDateTimeOriginal = exifDateTimeOriginal
+        self.exifSubSecOriginal = exifSubSecOriginal
+        self.rgbSignature8x8 = rgbSignature8x8
+        self.backdropID = backdropID
+        self.backdropDisplayName = backdropDisplayName
+        self.backgroundFilename = backgroundFilename
+        self.foregroundFilename = foregroundFilename
+        self.foregroundFitMode = foregroundFitMode
+        self.customBackgroundData = customBackgroundData
+        self.customForegroundData = customForegroundData
+        self.appliedToFullRes = appliedToFullRes
+        self.matchedFullResFilename = matchedFullResFilename
+    }
+    
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case captureTimestampUTC
+        case ptpFilename
+        case exifDateTimeOriginal
+        case exifSubSecOriginal
+        case rgbSignature8x8
+        case backdropID
+        case backdropDisplayName
+        case backgroundFilename
+        case foregroundFilename
+        case foregroundFitMode
+        case customBackgroundData
+        case customForegroundData
+        case appliedToFullRes
+        case matchedFullResFilename
+    }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = (try? container.decode(UUID.self, forKey: .id)) ?? UUID()
+        self.captureTimestampUTC = (try? container.decode(Date.self, forKey: .captureTimestampUTC)) ?? Date()
+        self.ptpFilename = try? container.decodeIfPresent(String.self, forKey: .ptpFilename)
+        self.exifDateTimeOriginal = try? container.decodeIfPresent(String.self, forKey: .exifDateTimeOriginal)
+        self.exifSubSecOriginal = try? container.decodeIfPresent(String.self, forKey: .exifSubSecOriginal)
+        self.rgbSignature8x8 = (try? container.decode([UInt8].self, forKey: .rgbSignature8x8)) ?? []
+        self.backdropID = try container.decode(String.self, forKey: .backdropID)
+        self.backdropDisplayName = (try? container.decode(String.self, forKey: .backdropDisplayName)) ?? self.backdropID
+        self.backgroundFilename = try? container.decodeIfPresent(String.self, forKey: .backgroundFilename)
+        self.foregroundFilename = try? container.decodeIfPresent(String.self, forKey: .foregroundFilename)
+        self.foregroundFitMode = (try? container.decode(ForegroundFitMode.self, forKey: .foregroundFitMode)) ?? .stretchToEdges
+        self.customBackgroundData = try? container.decodeIfPresent(Data.self, forKey: .customBackgroundData)
+        self.customForegroundData = try? container.decodeIfPresent(Data.self, forKey: .customForegroundData)
+        self.appliedToFullRes = (try? container.decode(Bool.self, forKey: .appliedToFullRes)) ?? false
+        self.matchedFullResFilename = try? container.decodeIfPresent(String.self, forKey: .matchedFullResFilename)
+    }
 }
 
 nonisolated struct BackdropManifestDocument: Codable, Equatable, Sendable {
@@ -106,6 +182,46 @@ nonisolated struct BackdropManifestDocument: Codable, Equatable, Sendable {
     /// Deduplicated Base64-encoded image bytes keyed by filename for custom iPad-added backdrops,
     /// avoiding duplicating megabytes of image data across every entry in the JSON file.
     var customAssetsByFilename: [String: Data]? = nil
+    
+    init(
+        schemaVersion: Int = Self.currentSchemaVersion,
+        exportedAtUTC: Date = Date(),
+        entries: [PhotoBackdropManifestEntry],
+        customAssetsByFilename: [String: Data]? = nil
+    ) {
+        self.schemaVersion = schemaVersion
+        self.exportedAtUTC = exportedAtUTC
+        self.entries = entries
+        self.customAssetsByFilename = customAssetsByFilename
+    }
+    
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion
+        case exportedAtUTC
+        case entries
+        case customAssetsByFilename
+    }
+    
+    private struct LossyDecodableEntry: Decodable {
+        let entry: PhotoBackdropManifestEntry?
+        init(from decoder: Decoder) throws {
+            self.entry = try? PhotoBackdropManifestEntry(from: decoder)
+        }
+    }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.schemaVersion = (try? container.decode(Int.self, forKey: .schemaVersion)) ?? Self.currentSchemaVersion
+        self.exportedAtUTC = (try? container.decode(Date.self, forKey: .exportedAtUTC)) ?? Date()
+        if let strictEntries = try? container.decode([PhotoBackdropManifestEntry].self, forKey: .entries) {
+            self.entries = strictEntries
+        } else if let lossyEntries = try? container.decode([LossyDecodableEntry].self, forKey: .entries) {
+            self.entries = lossyEntries.compactMap(\.entry)
+        } else {
+            self.entries = []
+        }
+        self.customAssetsByFilename = try? container.decodeIfPresent([String: Data].self, forKey: .customAssetsByFilename)
+    }
 }
 
 nonisolated struct BatchApplyReport: Equatable, Sendable {

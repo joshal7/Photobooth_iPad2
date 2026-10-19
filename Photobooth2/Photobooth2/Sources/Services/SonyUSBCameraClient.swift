@@ -900,7 +900,9 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             // Record Triple-Lock manifest entry using `unmirroredRawCG` (upright, un-mirrored, pre-exposure boost)
             // so its 8x8 RGB signature matches the un-boosted SD card DSC0xxxx.JPG file even in dim lighting conditions.
             // Only record in `.standard` Photo Mode where the Sony camera writes to the SD card (`0x0011`).
-            if captureMode == .standard && !backdrop.isNone {
+            // Also record `.none` ("Original") captures when camera metadata is present so No-Background photos
+            // explicitly claim their SD card filename/timestamp and supersede any deleted/formatted prior shots.
+            if captureMode == .standard {
                 BackdropManifestStore.shared.recordCapture(
                     uncompositedCGImage: unmirroredRawCG,
                     rawJPEGData: extracted,

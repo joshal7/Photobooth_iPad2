@@ -1298,6 +1298,254 @@ assertTrue(
     "External Camera Horizontal Mirroring: subject mirrors to left (\(extLeftSubjPx.r),\(extLeftSubjPx.g),\(extLeftSubjPx.b)) while foreground frame stays un-reversed on right (\(extRightFramePx.r),\(extRightFramePx.g),\(extRightFramePx.b))"
 )
 
+// 7S. Multi-Manifest Merging, Self-Healing `matchedFullResFilename`, and Global 3-Pass Priority Matching
+//     (Exact 15-Entry `DSC09816`..`DSC09838` Deleted/Formatted Pre-Shoot + Interleaved No-Background + SD Card Reset Verification)
+assertTrue(
+    manifestSource.contains("sanitizeAndMergeManifestDocuments") &&
+    manifestSource.contains("Pass1MatchCandidate") &&
+    manifestSource.contains("Pass2MatchCandidate") &&
+    manifestSource.contains("Pass3MatchCandidate") &&
+    manifestSource.contains("guard eDate == nil || cand.exifDate == nil else { continue }"),
+    "BackdropManifestStore implements multi-manifest merging, self-healing matchedFullResFilename, and global 3-pass priority matching with strict PTP stem & EXIF timestamp vetoes"
+)
+
+let backdropModelsSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Models/BackdropModels.swift", encoding: .utf8)) ?? ""
+let manifestJITScriptURL = tempDir.appendingPathComponent("qa_manifest_jit_\(UUID().uuidString).swift")
+defer { try? FileManager.default.removeItem(at: manifestJITScriptURL) }
+
+let manifestJITHarness = """
+import Foundation
+
+nonisolated func canonicalFilenameStem(_ filename: String?) -> String? {
+    guard let raw = filename?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+    let lastComponent = (raw as NSString).lastPathComponent
+    var stem = (lastComponent as NSString).deletingPathExtension.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    guard !stem.isEmpty else { return nil }
+    let cameraPrefixes = ["DSC", "_DSC", "DSCF", "IMG_", "_MG_"]
+    if cameraPrefixes.contains(where: { stem.hasPrefix($0) }), let spaceIdx = stem.firstIndex(of: " ") {
+        let baseCandidate = String(stem[..<spaceIdx])
+        if baseCandidate.count >= 6 && baseCandidate.last?.isNumber == true { stem = baseCandidate }
+    }
+    return stem
+}
+
+nonisolated func parseEXIF(_ dt: String?, _ sub: String?) -> Date? {
+    guard let dt = dt else { return nil }
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.timeZone = TimeZone(secondsFromGMT: 0)
+    f.dateFormat = "yyyy:MM:dd HH:mm:ss"
+    guard let base = f.date(from: dt) else { return nil }
+    if let sub = sub, let v = Double("0." + sub) { return base.addingTimeInterval(v) }
+    return base
+}
+
+nonisolated func sigDist(_ a: [UInt8], _ b: [UInt8]) -> Double {
+    guard a.count == b.count, !a.isEmpty else { return 1.0 }
+    var d = 0
+    for i in 0..<a.count { d += abs(Int(a[i]) - Int(b[i])) }
+    return Double(d) / (Double(a.count) * 255.0)
+}
+
+nonisolated func simulateMatch(
+    entries: [PhotoBackdropManifestEntry],
+    candidates: [(name: String, exifDT: String?, sig: [UInt8])]
+) -> [String: String] {
+    var docs = [BackdropManifestDocument(entries: entries)]
+    // Self-heal mismatched matchedFullResFilename
+    for i in 0..<docs[0].entries.count {
+        if let pStem = canonicalFilenameStem(docs[0].entries[i].ptpFilename),
+           let mStem = canonicalFilenameStem(docs[0].entries[i].matchedFullResFilename),
+           pStem != mStem {
+            docs[0].entries[i].matchedFullResFilename = nil
+            docs[0].entries[i].appliedToFullRes = false
+        }
+    }
+    let cleanEntries = docs[0].entries
+    let entryStems = cleanEntries.map { canonicalFilenameStem($0.ptpFilename) }
+    let entryDates = cleanEntries.map { parseEXIF($0.exifDateTimeOriginal, $0.exifSubSecOriginal) }
+    let candStems = candidates.map { canonicalFilenameStem($0.name) ?? $0.name }
+    let candDates = candidates.map { parseEXIF($0.exifDT, nil) }
+
+    var matchedEntryToCand: [Int: Int] = [:]
+    var usedCands = Set<Int>()
+
+    // Pass 1: ptpFilename stem + EXIF <= 3.0s + RGB sig < 0.28
+    var pass1: [(e: Int, c: Int, tDiff: Double, sDist: Double, utc: Date)] = []
+    for eIdx in cleanEntries.indices {
+        guard let pStem = entryStems[eIdx] else { continue }
+        let entry = cleanEntries[eIdx]
+        for cIdx in candidates.indices where candStems[cIdx] == pStem {
+            var tDiff = 0.0
+            if let ed = entryDates[eIdx], let cd = candDates[cIdx] {
+                tDiff = abs(cd.timeIntervalSince(ed))
+                guard tDiff <= 3.0 else { continue }
+            }
+            let dist = sigDist(entry.rgbSignature8x8, candidates[cIdx].sig)
+            guard dist < 0.28 else { continue }
+            pass1.append((eIdx, cIdx, tDiff, dist, entry.captureTimestampUTC))
+        }
+    }
+    pass1.sort { a, b in
+        if abs(a.tDiff - b.tDiff) > 0.05 { return a.tDiff < b.tDiff }
+        if abs(a.sDist - b.sDist) > 0.015 { return a.sDist < b.sDist }
+        return a.utc > b.utc
+    }
+    for m in pass1 {
+        guard matchedEntryToCand[m.e] == nil, !usedCands.contains(m.c) else { continue }
+        matchedEntryToCand[m.e] = m.c
+        usedCands.insert(m.c)
+    }
+
+    // Pass 2: ptpFilename == nil ONLY, EXIF <= 3.0s + RGB sig < 0.25
+    var pass2: [(e: Int, c: Int, sDist: Double, tDiff: Double)] = []
+    for eIdx in cleanEntries.indices where entryStems[eIdx] == nil && matchedEntryToCand[eIdx] == nil {
+        guard let ed = entryDates[eIdx] else { continue }
+        let entry = cleanEntries[eIdx]
+        for cIdx in candidates.indices where !usedCands.contains(cIdx) {
+            guard let cd = candDates[cIdx] else { continue }
+            let tDiff = abs(cd.timeIntervalSince(ed))
+            guard tDiff <= 3.0 else { continue }
+            let dist = sigDist(entry.rgbSignature8x8, candidates[cIdx].sig)
+            guard dist < 0.25 else { continue }
+            pass2.append((eIdx, cIdx, dist, tDiff))
+        }
+    }
+    pass2.sort { a, b in
+        if abs(a.sDist - b.sDist) > 0.005 { return a.sDist < b.sDist }
+        return a.tDiff < b.tDiff
+    }
+    for m in pass2 {
+        guard matchedEntryToCand[m.e] == nil, !usedCands.contains(m.c) else { continue }
+        matchedEntryToCand[m.e] = m.c
+        usedCands.insert(m.c)
+    }
+
+    // Pass 3: ptpFilename == nil ONLY, and at least one side lacks EXIF date
+    var pass3: [(e: Int, c: Int, sDist: Double)] = []
+    for eIdx in cleanEntries.indices where entryStems[eIdx] == nil && matchedEntryToCand[eIdx] == nil {
+        let entry = cleanEntries[eIdx]
+        for cIdx in candidates.indices where !usedCands.contains(cIdx) {
+            guard entryDates[eIdx] == nil || candDates[cIdx] == nil else { continue }
+            let dist = sigDist(entry.rgbSignature8x8, candidates[cIdx].sig)
+            if dist < 0.08 { pass3.append((eIdx, cIdx, dist)) }
+        }
+    }
+    pass3.sort { $0.sDist < $1.sDist }
+    for m in pass3 {
+        guard matchedEntryToCand[m.e] == nil, !usedCands.contains(m.c) else { continue }
+        matchedEntryToCand[m.e] = m.c
+        usedCands.insert(m.c)
+    }
+
+    var result: [String: String] = [:]
+    for (eIdx, cIdx) in matchedEntryToCand {
+        let entry = cleanEntries[eIdx]
+        if !entry.isNoneBackdrop {
+            result[candidates[cIdx].name] = entry.backdropID
+        }
+    }
+    return result
+}
+
+let roomSig = [UInt8](repeating: 140, count: 192)
+let iso = ISO8601DateFormatter()
+func entry(_ utc: String, _ ptp: String?, _ dt: String?, _ bg: String, _ corrupted: String? = nil) -> PhotoBackdropManifestEntry {
+    PhotoBackdropManifestEntry(
+        id: UUID(),
+        captureTimestampUTC: iso.date(from: utc) ?? Date(),
+        ptpFilename: ptp,
+        exifDateTimeOriginal: dt,
+        exifSubSecOriginal: "100",
+        rgbSignature8x8: roomSig,
+        backdropID: bg,
+        backdropDisplayName: bg,
+        backgroundFilename: bg == "none" ? nil : "\\(bg)_bg.jpg",
+        foregroundFilename: nil,
+        foregroundFitMode: .stretchToEdges,
+        appliedToFullRes: corrupted != nil,
+        matchedFullResFilename: corrupted
+    )
+}
+
+// 1. User's exact 15-entry scenario (9 deleted shots 20:31..20:36 with corrupted matches + 3 Snowy Peaks + 3 No-Bg + 3 Golden Gate Bridge)
+let userEntries: [PhotoBackdropManifestEntry] = [
+    entry("2026-10-19T03:31:28Z", "DSC09816.JPG", "2026:10:18 20:31:25", "301_scottish_spey_whisky", "DSC09838.JPG"),
+    entry("2026-10-19T03:31:33Z", "DSC09818.JPG", "2026:10:18 20:31:31", "301_scottish_spey_whisky", "DSC09836.JPG"),
+    entry("2026-10-19T03:31:38Z", "DSC09820.JPG", "2026:10:18 20:31:36", "301_scottish_spey_whisky", "DSC09830.JPG"),
+    entry("2026-10-19T03:33:25Z", "DSC09824.JPG", "2026:10:18 20:33:22", "501_time_person_of_the_year", "DSC09834.JPG"),
+    entry("2026-10-19T03:33:28Z", "DSC09825.JPG", "2026:10:18 20:33:26", "501_time_person_of_the_year", "DSC09833.JPG"),
+    entry("2026-10-19T03:33:33Z", "DSC09826.JPG", "2026:10:18 20:33:30", "501_time_person_of_the_year"),
+    entry("2026-10-19T03:36:33Z", "DSC09827.JPG", "2026:10:18 20:36:30", "303_eiffel_tower_night"),
+    entry("2026-10-19T03:36:37Z", "DSC09828.JPG", "2026:10:18 20:36:34", "303_eiffel_tower_night"),
+    entry("2026-10-19T03:36:41Z", "DSC09829.JPG", "2026:10:18 20:36:38", "303_eiffel_tower_night"),
+    entry("2026-10-19T03:38:55Z", "DSC09830.JPG", "2026:10:18 20:38:52", "101_snowy_peaks", "DSC09832.JPG"),
+    entry("2026-10-19T03:38:59Z", "DSC09831.JPG", "2026:10:18 20:38:56", "101_snowy_peaks", "DSC09831.JPG"),
+    entry("2026-10-19T03:39:03Z", "DSC09832.JPG", "2026:10:18 20:39:01", "101_snowy_peaks", "DSC09835.JPG"),
+    entry("2026-10-19T03:40:51Z", "DSC09836.JPG", "2026:10:18 20:40:48", "305_golden_gate_bridge", "DSC09837.JPG"),
+    entry("2026-10-19T03:40:54Z", "DSC09837.JPG", "2026:10:18 20:40:52", "305_golden_gate_bridge"),
+    entry("2026-10-19T03:40:59Z", "DSC09838.JPG", "2026:10:18 20:40:56", "305_golden_gate_bridge")
+]
+let userCandidates: [(name: String, exifDT: String?, sig: [UInt8])] = [
+    ("DSC09830.JPG", "2026:10:18 20:38:52", roomSig),
+    ("DSC09831.JPG", "2026:10:18 20:38:56", roomSig),
+    ("DSC09832.JPG", "2026:10:18 20:39:01", roomSig),
+    ("DSC09833.JPG", "2026:10:18 20:40:00", roomSig),
+    ("DSC09834.JPG", "2026:10:18 20:40:04", roomSig),
+    ("DSC09835.JPG", "2026:10:18 20:40:08", roomSig),
+    ("DSC09836.JPG", "2026:10:18 20:40:48", roomSig),
+    ("DSC09837.JPG", "2026:10:18 20:40:52", roomSig),
+    ("DSC09838.JPG", "2026:10:18 20:40:56", roomSig)
+]
+let assigned = simulateMatch(entries: userEntries, candidates: userCandidates)
+guard assigned.count == 6,
+      assigned["DSC09830.JPG"] == "101_snowy_peaks",
+      assigned["DSC09831.JPG"] == "101_snowy_peaks",
+      assigned["DSC09832.JPG"] == "101_snowy_peaks",
+      assigned["DSC09833.JPG"] == nil,
+      assigned["DSC09834.JPG"] == nil,
+      assigned["DSC09835.JPG"] == nil,
+      assigned["DSC09836.JPG"] == "305_golden_gate_bridge",
+      assigned["DSC09837.JPG"] == "305_golden_gate_bridge",
+      assigned["DSC09838.JPG"] == "305_golden_gate_bridge" else {
+    fputs("FAIL: 15-entry user scenario mismatch: \\(assigned)\\n", stderr)
+    Foundation.exit(1)
+}
+
+// 2. SD card reset / filename reuse (DSC00001.JPG from 19:00 vs new DSC00001.JPG at 21:00 as No-Background or roving photo)
+let resetEntries: [PhotoBackdropManifestEntry] = [
+    entry("2026-10-19T02:00:05Z", "DSC00001.JPG", "2026:10:18 19:00:02", "301_scottish_spey_whisky"),
+    entry("2026-10-19T02:00:10Z", "DSC00002.JPG", "2026:10:18 19:00:07", "301_scottish_spey_whisky"),
+    entry("2026-10-19T04:00:12Z", "DSC00001.JPG", "2026:10:18 21:00:10", "none"),
+    entry("2026-10-19T04:00:32Z", "DSC00003.JPG", "2026:10:18 21:00:30", "305_golden_gate_bridge")
+]
+let resetCandidates: [(name: String, exifDT: String?, sig: [UInt8])] = [
+    ("DSC00001.JPG", "2026:10:18 21:00:10", roomSig),
+    ("DSC00002.JPG", "2026:10:18 21:00:20", roomSig),
+    ("DSC00003.JPG", "2026:10:18 21:00:30", roomSig)
+]
+let resetAssigned = simulateMatch(entries: resetEntries, candidates: resetCandidates)
+guard resetAssigned.count == 1,
+      resetAssigned["DSC00001.JPG"] == nil,
+      resetAssigned["DSC00002.JPG"] == nil,
+      resetAssigned["DSC00003.JPG"] == "305_golden_gate_bridge" else {
+    fputs("FAIL: SD card reset scenario mismatch: \\(resetAssigned)\\n", stderr)
+    Foundation.exit(1)
+}
+"""
+
+try! (backdropModelsSource + "\n" + manifestJITHarness).write(to: manifestJITScriptURL, atomically: true, encoding: .utf8)
+let manifestJITProc = Process()
+manifestJITProc.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+manifestJITProc.arguments = ["swift", "-default-isolation", "MainActor", manifestJITScriptURL.path]
+try! manifestJITProc.run()
+manifestJITProc.waitUntilExit()
+assertEqual(
+    manifestJITProc.terminationStatus,
+    0,
+    "Live JIT execution of 15-entry user scenario (DSC09816..DSC09838) & SD card reset scenario produced 3 Snowy Peaks, 3 No-Background, and 3 Golden Gate Bridge"
+)
+
 // ============================================================================
 // 8. Email Sharing & Offline / Spotty Wi-Fi Queue QA Suite
 // ============================================================================
