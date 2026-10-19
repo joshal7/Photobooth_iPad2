@@ -49,9 +49,12 @@ class StateMachine: ObservableObject {
     @Published var isBackdropPickerExpanded: Bool = false
     
     private var cameraService: CameraService
+    private let hasInjectedCameraService: Bool
     private let config: ConfigManager
     private var cancellables = Set<AnyCancellable>()
     private var serviceCancellables = Set<AnyCancellable>()
+    private var activeStateTask: Task<Void, Never>?
+    private var stateGeneration: UInt64 = 0
     private var disconnectDebounceTask: Task<Void, Never>?
     private var sharingPromptTimeoutTask: Task<Void, Never>?
     private var errorAutoRetryTask: Task<Void, Never>?
@@ -59,6 +62,7 @@ class StateMachine: ObservableObject {
     init(cameraService: CameraService? = nil, config: ConfigManager? = nil) {
         let resolvedConfig = config ?? ConfigManager.shared
         self.config = resolvedConfig
+        self.hasInjectedCameraService = (cameraService != nil)
         
         if let injectedService = cameraService {
             self.cameraService = injectedService
@@ -75,13 +79,30 @@ class StateMachine: ObservableObject {
         setupBindings()
     }
     
+    deinit {
+        activeStateTask?.cancel()
+        disconnectDebounceTask?.cancel()
+        sharingPromptTimeoutTask?.cancel()
+        errorAutoRetryTask?.cancel()
+    }
+    
+    private func isCurrentExecution(_ generation: UInt64) -> Bool {
+        return !Task.isCancelled && self.stateGeneration == generation
+    }
+    
+    private var isInCaptureState: Bool {
+        if case .capture = state { return true }
+        return false
+    }
+    
     private func setupBindings() {
         config.$useLocalCamera
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] useLocal in
                 Task { @MainActor [weak self] in
-                    self?.switchCameraService(useLocal: useLocal)
+                    guard let self = self, !self.hasInjectedCameraService else { return }
+                    self.switchCameraService(useLocal: useLocal)
                 }
             }
             .store(in: &cancellables)
@@ -158,6 +179,8 @@ class StateMachine: ObservableObject {
     
     private func bindCameraStreams() {
         serviceCancellables.removeAll()
+        self.isCameraConnected = cameraService.isConnected
+        self.cameraStatusMessage = cameraService.statusMessage
         
         cameraService.previewStream
             .receive(on: DispatchQueue.main)
@@ -191,7 +214,7 @@ class StateMachine: ObservableObject {
             // Zero-touch auto-recovery if camera was reconnected or powered on while on error/init screen
             if case .error = state {
                 transition(to: .idle)
-            } else if case .initialization = state {
+            } else if case .initialization = state, stateGeneration > 0, activeStateTask == nil {
                 transition(to: .idle)
             }
         } else {
@@ -214,11 +237,19 @@ class StateMachine: ObservableObject {
     }
     
     private func switchCameraService(useLocal: Bool) {
+        activeStateTask?.cancel()
+        activeStateTask = nil
         disconnectDebounceTask?.cancel()
         disconnectDebounceTask = nil
+        sharingPromptTimeoutTask?.cancel()
+        sharingPromptTimeoutTask = nil
         errorAutoRetryTask?.cancel()
         errorAutoRetryTask = nil
-        cameraService.stopLiveView()
+        if let sonyClient = cameraService as? SonyUSBCameraClient {
+            sonyClient.shutdown()
+        } else {
+            cameraService.stopLiveView()
+        }
         
         if useLocal {
             self.cameraService = LocalCameraClient()
@@ -261,6 +292,22 @@ class StateMachine: ObservableObject {
     func transition(to newState: AppState) {
         print("Transitioning to: \(newState)")
         let previousState = self.state
+        
+        // Preserve the in-flight GIF capture task when it transitions from .capture into .processing;
+        // for all other transitions, cancel the previous state's task and advance stateGeneration.
+        let isInternalCaptureToProcessing: Bool = {
+            if case .capture = previousState, case .processing = newState {
+                return true
+            }
+            return false
+        }()
+        if !isInternalCaptureToProcessing {
+            stateGeneration &+= 1
+            activeStateTask?.cancel()
+            activeStateTask = nil
+        }
+        let generation = stateGeneration
+        
         sharingPromptTimeoutTask?.cancel()
         sharingPromptTimeoutTask = nil
         errorAutoRetryTask?.cancel()
@@ -269,7 +316,15 @@ class StateMachine: ObservableObject {
         
         switch newState {
         case .initialization:
-            Task { await initializeCamera() }
+            activeStateTask = Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                defer {
+                    if self.stateGeneration == generation {
+                        self.activeStateTask = nil
+                    }
+                }
+                await self.initializeCamera(generation: generation)
+            }
             
         case .idle:
             // Collapse the bottom picker between sessions; reset backdrop selection to default unless persistent selection is enabled
@@ -289,15 +344,19 @@ class StateMachine: ObservableObject {
                 cleanupSessionStillImages(afterDelay: 0)
             }
             purgeOrphanedTempFilesAndCheckStorage()
-            Task { await startLiveView() }
+            activeStateTask = Task { @MainActor [weak self] in
+                guard let self = self, self.isCurrentExecution(generation) else { return }
+                await self.startLiveView()
+            }
             
         case .capture:
             self.isBackdropPickerExpanded = false
-            Task {
+            activeStateTask = Task { @MainActor [weak self] in
+                guard let self = self else { return }
                 if self.captureMode == .gif {
-                    await startGIFCaptureSequence()
+                    await self.startGIFCaptureSequence(generation: generation)
                 } else {
-                    await startCaptureSequence()
+                    await self.startCaptureSequence(generation: generation)
                 }
             }
             
@@ -309,10 +368,20 @@ class StateMachine: ObservableObject {
             if images.isEmpty {
                 transition(to: .idle)
             } else {
-                Task { await startReviewSequence() }
+                activeStateTask = Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    await self.startReviewSequence(generation: generation)
+                }
             }
             
         case .error:
+            self.isFlashing = false
+            self.isVignetteFlashing = false
+            self.showGuidance = false
+            self.countdown = 0
+            self.currentPhotoNumber = 0
+            self.currentGIFFrameIndex = 0
+            self.poseIndicator = nil
             cameraService.stopLiveView()
             cleanupSessionStillImages(afterDelay: 0)
             errorAutoRetryTask = Task { @MainActor [weak self] in
@@ -321,10 +390,12 @@ class StateMachine: ObservableObject {
                     guard let self = self, !Task.isCancelled else { break }
                     guard case .error = self.state else { break }
                     if await self.cameraService.checkConnection() {
+                        guard !Task.isCancelled, case .error = self.state else { break }
                         self.transition(to: .idle)
                         break
                     }
                     try? await self.cameraService.connect()
+                    guard !Task.isCancelled, case .error = self.state else { break }
                     if self.cameraService.isConnected {
                         self.isCameraConnected = true
                         self.cameraStatusMessage = self.cameraService.statusMessage
@@ -351,14 +422,15 @@ class StateMachine: ObservableObject {
     
     // MARK: - Actions
     
-    private func initializeCamera() async {
+    private func initializeCamera(generation: UInt64) async {
         do {
             try await cameraService.connect()
+            guard isCurrentExecution(generation), case .initialization = state else { return }
             self.isCameraConnected = cameraService.isConnected
             self.cameraStatusMessage = cameraService.statusMessage
-            await startLiveView()
             transition(to: .idle)
         } catch {
+            guard isCurrentExecution(generation), case .initialization = state else { return }
             self.isCameraConnected = cameraService.isConnected
             self.cameraStatusMessage = cameraService.statusMessage
             let detailedMessage = cameraService.statusMessage ?? error.localizedDescription
@@ -400,6 +472,7 @@ class StateMachine: ObservableObject {
     }
     
     func skipSharing() {
+        if case .idle = state { return }
         transition(to: .idle)
     }
     
@@ -432,7 +505,7 @@ class StateMachine: ObservableObject {
     
     // MARK: - Standard Photo Capture Sequence
     
-    private func startCaptureSequence() async {
+    private func startCaptureSequence(generation: UInt64) async {
         capturedImages.removeAll()
         self.currentPhotoNumber = 0
         
@@ -440,7 +513,13 @@ class StateMachine: ObservableObject {
             try await cameraService.prepareForCapture(mode: .standard)
         } catch {
             self.currentPhotoNumber = 0
+            guard isCurrentExecution(generation), isInCaptureState else { return }
             transition(to: .error(message: "Capture Setup Failed: \(error.localizedDescription)"))
+            return
+        }
+        
+        guard isCurrentExecution(generation), isInCaptureState else {
+            await cameraService.finishCaptureSequence(mode: .standard)
             return
         }
         
@@ -451,7 +530,7 @@ class StateMachine: ObservableObject {
             // 1. Ensure previous photo's transfer finished before starting next countdown
             if let task = previousCaptureTask {
                 _ = await task.result
-                if case .error = state {
+                if !isCurrentExecution(generation) || !isInCaptureState {
                     self.currentPhotoNumber = 0
                     await cameraService.finishCaptureSequence(mode: .standard)
                     return
@@ -464,9 +543,20 @@ class StateMachine: ObservableObject {
                 if config.showGuidanceText {
                     self.showGuidance = true
                     for _ in 0..<3 {
+                        if !isCurrentExecution(generation) || !isInCaptureState {
+                            self.showGuidance = false
+                            self.currentPhotoNumber = 0
+                            await cameraService.finishCaptureSequence(mode: .standard)
+                            return
+                        }
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
                     }
                     self.showGuidance = false
+                    guard isCurrentExecution(generation), isInCaptureState else {
+                        self.currentPhotoNumber = 0
+                        await cameraService.finishCaptureSequence(mode: .standard)
+                        return
+                    }
                     self.currentPhotoNumber = i + 1
                     countTime = max(3, config.initialCountdownSec - 3)
                 } else {
@@ -480,7 +570,8 @@ class StateMachine: ObservableObject {
             
             if countTime > 0 {
                 for t in (1...countTime).reversed() {
-                    if case .error = state {
+                    if !isCurrentExecution(generation) || !isInCaptureState {
+                        self.countdown = 0
                         self.currentPhotoNumber = 0
                         await cameraService.finishCaptureSequence(mode: .standard)
                         return
@@ -490,6 +581,12 @@ class StateMachine: ObservableObject {
                 }
             }
             self.countdown = 0
+            
+            guard isCurrentExecution(generation), isInCaptureState else {
+                self.currentPhotoNumber = 0
+                await cameraService.finishCaptureSequence(mode: .standard)
+                return
+            }
             
             // 3. Trigger White Screen Flash (0.5s hold + 0.5s fade = 1.0s)
             withAnimation(.linear(duration: 0)) { self.isFlashing = true }
@@ -502,6 +599,10 @@ class StateMachine: ObservableObject {
             previousCaptureTask = Task { @MainActor in
                 do {
                     let fileURLString = try await self.captureSinglePhoto()
+                    guard self.isCurrentExecution(generation), self.isInCaptureState else {
+                        self.cleanupTempFiles([fileURLString])
+                        return
+                    }
                     self.capturedImages.append(fileURLString)
                     // When using the external Sony camera, full-res still images are stored on the camera's SD card,
                     // and the 2MP iPad copies are kept only in /tmp for preview & AirDrop and then deleted (not saved to iPad Photos).
@@ -509,6 +610,7 @@ class StateMachine: ObservableObject {
                         self.saveToPhotoLibrary(urls: [fileURLString])
                     }
                 } catch {
+                    guard self.isCurrentExecution(generation), self.isInCaptureState else { return }
                     self.isFlashing = false
                     self.currentPhotoNumber = 0
                     self.transition(to: .error(message: "Capture Failed: \(error.localizedDescription)"))
@@ -517,7 +619,7 @@ class StateMachine: ObservableObject {
             
             // Wait for the 1.0s flash fade to complete before advancing to the next photo countdown
             try? await Task.sleep(nanoseconds: 1_000_000_000)
-            guard case .capture = state else { break }
+            guard isCurrentExecution(generation), isInCaptureState else { break }
             
             withAnimation(.spring(response: 0.25, dampingFraction: 0.78)) {
                 self.currentPhotoNumber = i + 2
@@ -531,7 +633,7 @@ class StateMachine: ObservableObject {
         await cameraService.finishCaptureSequence(mode: .standard)
         self.currentPhotoNumber = 0
         
-        guard case .capture = state else { return }
+        guard isCurrentExecution(generation), isInCaptureState else { return }
         transition(to: .review(images: capturedImages, index: 0))
     }
     
@@ -549,7 +651,7 @@ class StateMachine: ObservableObject {
     
     // MARK: - Animated GIF Capture Sequence
     
-    private func startGIFCaptureSequence() async {
+    private func startGIFCaptureSequence(generation: UInt64) async {
         print("Starting GIF Capture Sequence")
         capturedImages.removeAll()
         self.poseIndicator = nil
@@ -563,7 +665,13 @@ class StateMachine: ObservableObject {
             try await cameraService.prepareForCapture(mode: .gif)
         } catch {
             self.currentGIFFrameIndex = 0
+            guard isCurrentExecution(generation), isInCaptureState else { return }
             transition(to: .error(message: "GIF Setup Failed: \(error.localizedDescription)"))
+            return
+        }
+        
+        guard isCurrentExecution(generation), isInCaptureState else {
+            await cameraService.finishCaptureSequence(mode: .gif)
             return
         }
         
@@ -572,9 +680,20 @@ class StateMachine: ObservableObject {
         if config.showGuidanceText {
             self.showGuidance = true
             for _ in 0..<3 {
+                if !isCurrentExecution(generation) || !isInCaptureState {
+                    self.showGuidance = false
+                    self.currentGIFFrameIndex = 0
+                    await cameraService.finishCaptureSequence(mode: .gif)
+                    return
+                }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
             self.showGuidance = false
+            guard isCurrentExecution(generation), isInCaptureState else {
+                self.currentGIFFrameIndex = 0
+                await cameraService.finishCaptureSequence(mode: .gif)
+                return
+            }
             countTime = min(3, max(1, config.initialCountdownSec))
         }
         
@@ -583,7 +702,8 @@ class StateMachine: ObservableObject {
         
         if countTime > 0 {
             for t in (1...countTime).reversed() {
-                if case .error = state {
+                if !isCurrentExecution(generation) || !isInCaptureState {
+                    self.countdown = 0
                     self.currentGIFFrameIndex = 0
                     await cameraService.finishCaptureSequence(mode: .gif)
                     return
@@ -594,13 +714,20 @@ class StateMachine: ObservableObject {
         }
         self.countdown = 0
         
+        guard isCurrentExecution(generation), isInCaptureState else {
+            self.currentGIFFrameIndex = 0
+            await cameraService.finishCaptureSequence(mode: .gif)
+            return
+        }
+        
         // 2. Multi-Pose GIF Capture Loop (Enforcing "Min Time Between GIFs", default 2.0s, min 0.5s)
         let frameCount = config.gifFrameCount
         let minInterval = max(0.5, config.gifCaptureInterval)
         let poseNames = ["Second", "Third", "Fourth", "Fifth", "Sixth", "Seventh", "Eighth", "Ninth", "Tenth"]
         
         for i in 0..<frameCount {
-            if case .error = state {
+            if !isCurrentExecution(generation) || !isInCaptureState {
+                self.poseIndicator = nil
                 self.currentGIFFrameIndex = 0
                 withAnimation(.none) { self.gifPerimeterProgress = 0.0 }
                 await cameraService.finishCaptureSequence(mode: .gif)
@@ -619,6 +746,14 @@ class StateMachine: ObservableObject {
             
             do {
                 let fileURLString = try await captureSinglePhoto()
+                guard isCurrentExecution(generation), isInCaptureState else {
+                    cleanupTempFiles([fileURLString])
+                    self.poseIndicator = nil
+                    self.currentGIFFrameIndex = 0
+                    withAnimation(.none) { self.gifPerimeterProgress = 0.0 }
+                    await cameraService.finishCaptureSequence(mode: .gif)
+                    return
+                }
                 capturedImages.append(fileURLString)
             } catch {
                 self.isFlashing = false
@@ -627,6 +762,7 @@ class StateMachine: ObservableObject {
                 self.currentGIFFrameIndex = 0
                 withAnimation(.none) { self.gifPerimeterProgress = 0.0 }
                 await cameraService.finishCaptureSequence(mode: .gif)
+                guard isCurrentExecution(generation), isInCaptureState else { return }
                 transition(to: .error(message: "Capture Failed: \(error.localizedDescription)"))
                 return
             }
@@ -653,6 +789,14 @@ class StateMachine: ObservableObject {
                     try? await Task.sleep(nanoseconds: UInt64(prePoseWait * 1_000_000_000))
                 }
                 
+                guard isCurrentExecution(generation), isInCaptureState else {
+                    self.poseIndicator = nil
+                    self.currentGIFFrameIndex = 0
+                    withAnimation(.none) { self.gifPerimeterProgress = 0.0 }
+                    await cameraService.finishCaptureSequence(mode: .gif)
+                    return
+                }
+                
                 if i < poseNames.count {
                     self.poseIndicator = "\(poseNames[i]) Pose"
                 }
@@ -675,6 +819,11 @@ class StateMachine: ObservableObject {
         }
         await cameraService.finishCaptureSequence(mode: .gif)
         
+        guard isCurrentExecution(generation), isInCaptureState else {
+            cleanupTempFiles(self.capturedImages)
+            return
+        }
+        
         // 3. Zero-Copy GIF Creation (source frames are already local files in /tmp)
         let sourceFrameURLs = self.capturedImages
         let activeBackdrop = self.selectedBackdrop
@@ -695,6 +844,13 @@ class StateMachine: ObservableObject {
         // 4. Immediately delete all individual source .jpg frames from disk
         cleanupTempFiles(sourceFrameURLs)
         
+        guard isCurrentExecution(generation), case .processing = state else {
+            if let unusedGIF = gifURL {
+                cleanupTempFiles([unusedGIF.path])
+            }
+            return
+        }
+        
         guard let finalGIFURL = gifURL else {
             transition(to: .error(message: "Failed to create GIF"))
             return
@@ -713,11 +869,11 @@ class StateMachine: ObservableObject {
     
     // MARK: - Review & Photo Library Persistence
     
-    private func startReviewSequence() async {
-        guard case .review(let images, _) = state else { return }
+    private func startReviewSequence(generation: UInt64) async {
+        guard isCurrentExecution(generation), case .review(let images, _) = state else { return }
         
         for i in 0..<images.count {
-            guard case .review = state else { return }
+            guard isCurrentExecution(generation), case .review = state else { return }
             
             if images[i].lowercased().hasSuffix(".gif") {
                 self.currentReviewImage = nil
@@ -734,6 +890,7 @@ class StateMachine: ObservableObject {
             // re-apply auto-exposure a second time on top of a composited backdrop.
             do {
                 let data = try await cameraService.fetchImage(url: images[i])
+                guard isCurrentExecution(generation), case .review = state else { return }
                 if let image = UIImage(data: data) {
                     let isAlreadyNormalizedFile = images[i].contains("sony_") || images[i].contains("local_")
                     self.currentReviewImage = isAlreadyNormalizedFile
@@ -746,12 +903,13 @@ class StateMachine: ObservableObject {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                 }
             } catch {
+                guard isCurrentExecution(generation), case .review = state else { return }
                 self.state = .review(images: images, index: i)
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
         
-        guard case .review = state else { return }
+        guard isCurrentExecution(generation), case .review = state else { return }
         if config.enableImageSharing {
             // Pass `images` directly (for GIF sessions, `images` contains ONLY the .gif file)
             transition(to: .sharingPrompt(images: images))
@@ -834,19 +992,34 @@ class StateMachine: ObservableObject {
     private func purgeOrphanedTempFilesAndCheckStorage() {
         let tempDir = FileManager.default.temporaryDirectory
         let cutoffDate = Date().addingTimeInterval(-600) // 10 minutes ago
+        let activeFilePaths = Set(capturedImages.map { item -> String in
+            if let parsed = URL(string: item), parsed.isFileURL {
+                return parsed.standardizedFileURL.path
+            }
+            return URL(fileURLWithPath: item).standardizedFileURL.path
+        })
         
         if let contents = try? FileManager.default.contentsOfDirectory(
             at: tempDir,
-            includingPropertiesForKeys: [.creationDateKey],
+            includingPropertiesForKeys: [.creationDateKey, .contentModificationDateKey],
             options: [.skipsHiddenFiles]
         ) {
             for fileURL in contents {
                 let ext = fileURL.pathExtension.lowercased()
                 guard ext == "jpg" || ext == "gif" else { continue }
-                if let values = try? fileURL.resourceValues(forKeys: [.creationDateKey]),
-                   let created = values.creationDate,
-                   created < cutoffDate {
-                    try? FileManager.default.removeItem(at: fileURL)
+                guard !activeFilePaths.contains(fileURL.standardizedFileURL.path) else { continue }
+                if let values = try? fileURL.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey]) {
+                    let modDate = values.contentModificationDate
+                    let createDate = values.creationDate
+                    let oldestTimestamp: Date?
+                    if let m = modDate, let c = createDate {
+                        oldestTimestamp = min(m, c)
+                    } else {
+                        oldestTimestamp = modDate ?? createDate
+                    }
+                    if let timestamp = oldestTimestamp, timestamp < cutoffDate {
+                        try? FileManager.default.removeItem(at: fileURL)
+                    }
                 }
             }
         }

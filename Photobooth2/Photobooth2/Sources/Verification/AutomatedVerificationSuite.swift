@@ -603,13 +603,29 @@ enum AutomatedVerificationSuite {
             ofItemAtPath: oldTempFile.path
         )
         
-        sm.skipSharing() // Transitions to .idle, immediately deleting the session's 2MP still images
+        sm.skipSharing() // Transitions from .airDrop to .idle (90s sharingd retention grace window)
         try await Task.sleep(nanoseconds: 150_000_000)
         for urlStr in stdReviewImages {
             if let u = URL(string: urlStr) {
-                assertTrue(!FileManager.default.fileExists(atPath: u.path), "2MP still image was immediately deleted from iPad after review/AirDrop finished")
+                assertTrue(FileManager.default.fileExists(atPath: u.path), "2MP still image is preserved during 90s sharingd background transfer window after .airDrop -> .idle")
             }
         }
+        sm.cleanupTempFiles(stdReviewImages)
+        for urlStr in stdReviewImages {
+            if let u = URL(string: urlStr) {
+                assertTrue(!FileManager.default.fileExists(atPath: u.path), "cleanupTempFiles removes 2MP still image from /tmp")
+            }
+        }
+        
+        // Also verify immediate deletion when skipping directly from .sharingPrompt -> .idle
+        let directSkipTempFile = tempDir.appendingPathComponent("direct_skip_\(UUID().uuidString).jpg")
+        try Data([0xFF, 0xD8, 0xFF, 0xD9]).write(to: directSkipTempFile)
+        sm.capturedImages = [directSkipTempFile.absoluteString]
+        sm.transition(to: .sharingPrompt(images: [directSkipTempFile.absoluteString]))
+        sm.skipSharing()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        assertTrue(!FileManager.default.fileExists(atPath: directSkipTempFile.path), "2MP still image is immediately deleted when skipping directly from .sharingPrompt -> .idle")
+        
         assertTrue(!FileManager.default.fileExists(atPath: oldTempFile.path), "Orphaned /tmp file older than 10 minutes (15m) was purged on return to .idle")
         assertTrue(FileManager.default.fileExists(atPath: freshTempFile.path), "Recent /tmp file (< 10 minutes old) was preserved for background Photo Library / AirDrop")
         try? FileManager.default.removeItem(at: freshTempFile)
@@ -664,6 +680,32 @@ enum AutomatedVerificationSuite {
             // 11d. Toggling persistentBackdropSelection off immediately reverts to the default background
             config.persistentBackdropSelection = false
             assertEqual(sm.selectedBackdrop.id, BackdropItem.noneID, "Toggling persistentBackdropSelection off immediately reverts to default background")
+        }
+        
+        // 12. Superseded State Task Cancellation & Custom Backdrop Symbol-Only Name Fallback
+        transport.resetLog()
+        config.initialCountdownSec = 2
+        sm.triggerCapture(mode: .standard)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        // Cancel mid-countdown by transitioning back to .idle
+        sm.transition(to: .idle)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+        assertEqual(sm.state, .idle, "Cancelled capture sequence task does not mutate StateMachine state after transition to .idle")
+        let postCancelShutters = transport.commandLog.filter {
+            $0.opcode == SonyPTPOpcode.sdioControlDevice.rawValue &&
+            $0.parameters.first == UInt32(SonyPTPPropertyCode.shutterRelease.rawValue)
+        }
+        assertEqual(postCancelShutters.count, 0, "Cancelled capture sequence task fires zero shutter commands")
+        
+        if let customItem = BackdropManager.shared.addCustomBackdrop(
+            displayName: "!!!",
+            backgroundData: transport.sampleJPEGData,
+            foregroundPNGData: nil
+        ) {
+            assertTrue(!customItem.id.isEmpty && customItem.id != BackdropItem.noneID && !customItem.isNone, "Custom backdrop with symbol-only name receives valid non-none ID (\(customItem.id))")
+            BackdropManager.shared.deleteCustomBackdrop(id: customItem.id)
+        } else {
+            assertTrue(false, "Expected addCustomBackdrop to succeed with valid backgroundData")
         }
         
         config.resetToDefaults()
@@ -2355,6 +2397,17 @@ enum AutomatedVerificationSuite {
                 assertTrue(false, "Normalized email GIF data must be a valid CGImageSource")
             }
         }
+        
+        // 13. ConfigManager Default Consistency & GIFService Empty Input Guard
+        let config = ConfigManager.shared
+        let savedGIFPreviewDuration = config.gifPreviewDuration
+        config.resetToDefaults()
+        assertEqual(config.gifPreviewDuration, 6.0, "ConfigManager.resetToDefaults() sets gifPreviewDuration to 6.0 matching init()")
+        config.gifPreviewDuration = savedGIFPreviewDuration
+        
+        let emptyGIFResult = GIFService.createGIF(from: [], frameDuration: 0.25)
+        assertTrue(emptyGIFResult == nil, "GIFService.createGIF(from: []) returns nil cleanly without creating orphaned files")
+        assertEqual(BackdropManager.normalizedID(from: "!!!"), "", "BackdropManager.normalizedID returns empty string for punctuation-only input")
     }
 }
 

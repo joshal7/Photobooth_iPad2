@@ -541,12 +541,18 @@ private nonisolated final class SMTPTLSSession: @unchecked Sendable {
     }
     
     private func withTimeout<T: Sendable>(seconds: TimeInterval, operation: @escaping @Sendable () async throws -> T) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
+        let conn = self.connection
+        return try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {
-                try await operation()
+                try await withTaskCancellationHandler {
+                    try await operation()
+                } onCancel: {
+                    conn.cancel()
+                }
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                conn.cancel()
                 throw URLError(.timedOut)
             }
             guard let first = try await group.next() else {

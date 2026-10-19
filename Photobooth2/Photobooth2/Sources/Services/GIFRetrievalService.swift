@@ -25,15 +25,9 @@ final class GIFRetrievalService: Sendable {
             // 2. Setup Fetch Options
             let fetchOptions = PHFetchOptions()
             let endDate = Date()
-            let startDate = Calendar.current.date(byAdding: .hour, value: -hours, to: endDate)!
+            let startDate = Calendar.current.date(byAdding: .hour, value: -hours, to: endDate)
+                ?? endDate.addingTimeInterval(-Double(hours) * 3600.0)
             
-            // Predicate: created >= startDate AND mediaSubtype == photoAnimated
-            // Note: Some GIFs might not be marked as .photoAnimated by all sources, but our app likely saves them as such
-            // or we can check the file extension/UTI if needed. Using .photoAnimated is safer for "Live Photos" vs GIFs differentiation,
-            // but standard GIFs are usually .photoAnimated or just images.
-            // Let's filter by creation date first, then check resources.
-            // Actually, `mediaSubtype` .photoAnimated usually refers to true GIFs or Live Photos? 
-            // .photoLive is for Live Photos. .photoAnimated is for GIFs.
             fetchOptions.predicate = NSPredicate(format: "creationDate >= %@", startDate as NSDate)
             fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
             
@@ -49,21 +43,37 @@ final class GIFRetrievalService: Sendable {
             // 3. Extract Data & Save to Temp
             var resultURLs: [URL] = []
             let group = DispatchGroup()
-            // Protect result array
             let lock = NSLock()
             
-            // Limit concurrent requests if needed, but for now specific valid assets should be few.
-            // assets is a PHFetchResult, we can iterate.
-            
             assets.enumerateObjects { asset, _, _ in
-                group.enter()
-                
-                let resourceOptions = PHAssetResourceRequestOptions()
-                resourceOptions.isNetworkAccessAllowed = true
-                
-                // We want the original data (the GIF file)
                 let resources = PHAssetResource.assetResources(for: asset)
-                if let gifResource = resources.first(where: { $0.uniformTypeIdentifier == "com.compuserve.gif" } ) {
+                let gifResource = resources.first { resource in
+                    resource.uniformTypeIdentifier == "com.compuserve.gif"
+                        || UTType(resource.uniformTypeIdentifier)?.conforms(to: .gif) == true
+                        || resource.originalFilename.lowercased().hasSuffix(".gif")
+                }
+                
+                // If the asset has known non-GIF resources and is not marked as an animated image,
+                // skip loading its full image data into memory.
+                if gifResource == nil && !resources.isEmpty && asset.playbackStyle != .imageAnimated {
+                    return
+                }
+                
+                group.enter()
+                var hasLeftGroup = false
+                let leaveGroupOnce = {
+                    lock.lock()
+                    let shouldLeave = !hasLeftGroup
+                    hasLeftGroup = true
+                    lock.unlock()
+                    if shouldLeave {
+                        group.leave()
+                    }
+                }
+                
+                if let gifResource = gifResource {
+                    let resourceOptions = PHAssetResourceRequestOptions()
+                    resourceOptions.isNetworkAccessAllowed = true
                     
                     let filename = gifResource.originalFilename
                     let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "_" + filename)
@@ -76,32 +86,31 @@ final class GIFRetrievalService: Sendable {
                             resultURLs.append(tempURL)
                             lock.unlock()
                         }
-                        group.leave()
+                        leaveGroupOnce()
                     }
                 } else {
-                    // Fallback: Request Image Data if resource not found directly
+                    // Fallback: Request Image Data only when resources were unavailable or asset is animated
                     let imageManager = PHImageManager.default()
                     let options = PHImageRequestOptions()
                     options.isNetworkAccessAllowed = true
                     options.version = .original
                     
-                    imageManager.requestImageDataAndOrientation(for: asset, options: options) { data, dataUTI, _, info in
-                        defer { group.leave() }
+                    imageManager.requestImageDataAndOrientation(for: asset, options: options) { data, dataUTI, _, _ in
+                        defer { leaveGroupOnce() }
                         
                         guard let data = data, let uti = dataUTI else { return }
                         
-                        // Check if it's a GIF
                         if UTType(uti)?.conforms(to: .gif) == true {
-                             let filename = "exported_\(UUID().uuidString).gif"
-                             let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
-                             do {
-                                 try data.write(to: tempURL)
-                                 lock.lock()
-                                 resultURLs.append(tempURL)
-                                 lock.unlock()
-                             } catch {
-                                 print("Failed to write data: \(error)")
-                             }
+                            let filename = "exported_\(UUID().uuidString).gif"
+                            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+                            do {
+                                try data.write(to: tempURL, options: .atomic)
+                                lock.lock()
+                                resultURLs.append(tempURL)
+                                lock.unlock()
+                            } catch {
+                                print("Failed to write data: \(error)")
+                            }
                         }
                     }
                 }

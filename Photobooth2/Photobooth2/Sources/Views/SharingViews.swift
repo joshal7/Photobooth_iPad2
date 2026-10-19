@@ -145,8 +145,6 @@ struct AirDropInstructionsView: View {
     @EnvironmentObject var stateMachine: StateMachine
     let images: [String]
     
-    @State private var showSuccessMessage = false
-    @State private var showFailureOptions = false
     @State private var isPreparing = false
     @State private var isSheetPresented = false
     
@@ -157,108 +155,67 @@ struct AirDropInstructionsView: View {
         ZStack {
             Color.black.edgesIgnoringSafeArea(.all)
             
-            if showSuccessMessage {
+            ZStack {
                 VStack(spacing: 20) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 80))
-                        .foregroundColor(.green)
-                    Text("Transfer Successful!")
-                        .font(.largeTitle)
-                        .foregroundColor(.white)
-                }
-                .transition(.scale)
-            } else if showFailureOptions {
-                // Completion Options
-                VStack(spacing: 30) {
-                    Text("Transfer Finished?")
-                        .font(.largeTitle)
-                        .bold()
-                        .foregroundColor(.white)
-                    
-                    Button("Done") {
-                        stateMachine.skipSharing()
-                    }
-                    .buttonStyle(ActionButtonStyle(color: .green))
-                    .frame(width: 200)
-                    
-                    Text("Or try another way:")
-                        .font(.subheadline)
-                        .foregroundColor(.gray)
-                        .padding(.top, 10)
-                    
-                    HStack(spacing: 20) {
-                        Button("Try Again") {
-                            showFailureOptions = false
-                            startAirDropProcess()
-                        }
-                        .buttonStyle(ActionButtonStyle(color: .blue))
-                    }
-                }
-            } else {
-                // Active Sharing State (Preparing or Sheet Presented)
-                ZStack {
-                    VStack(spacing: 20) {
-                        VStack(alignment: .leading, spacing: 20) {
-                            Text("(1) Settings > General > Airdrop > Everyone for 10 minutes")
-                                .font(.title2)
-                                .bold()
-                                .foregroundColor(.white)
-                            
-                            Text("(2) Click the Airdrop button below")
-                                .font(.title2)
-                                .bold()
-                                .foregroundColor(.white)
-                        }
-                        .fixedSize()
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 10)
+                    VStack(alignment: .leading, spacing: 20) {
+                        Text("(1) Settings > General > Airdrop > Everyone for 10 minutes")
+                            .font(.title2)
+                            .bold()
+                            .foregroundColor(.white)
                         
-                        Spacer()
-                        
-                        if isPreparing {
-                            VStack(spacing: 20) {
-                                ProgressView()
-                                    .scaleEffect(1.5)
-                                    .colorScheme(.dark)
-                                Text("Preparing images...")
-                                    .font(.headline)
-                                    .foregroundColor(.white)
-                            }
-                        } else {
-                            Text("Sharing...")
+                        Text("(2) Click the Airdrop button below")
+                            .font(.title2)
+                            .bold()
+                            .foregroundColor(.white)
+                    }
+                    .fixedSize()
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 10)
+                    
+                    Spacer()
+                    
+                    if isPreparing {
+                        VStack(spacing: 20) {
+                            ProgressView()
+                                .scaleEffect(1.5)
+                                .colorScheme(.dark)
+                            Text("Preparing images...")
                                 .font(.headline)
-                                .foregroundColor(.white.opacity(0.7))
+                                .foregroundColor(.white)
                         }
-                        
-                        Spacer()
+                    } else {
+                        Text("Sharing...")
+                            .font(.headline)
+                            .foregroundColor(.white.opacity(0.7))
                     }
                     
-                    // Overlay "Done" button
-                    VStack {
-                        HStack {
-                            Spacer()
-                            Button(action: {
-                                closeShareSheet()
-                            }) {
-                                Text("Done")
-                                    .font(.headline)
-                                    .bold()
-                                    .foregroundColor(.white)
-                                    .padding(.horizontal, 30)
-                                    .padding(.vertical, 15)
-                                    .background(Color.blue)
-                                    .cornerRadius(30)
-                            }
-                            .padding(40)
-                        }
+                    Spacer()
+                }
+                
+                // Overlay "Done" button
+                VStack {
+                    HStack {
                         Spacer()
+                        Button(action: {
+                            closeShareSheetAndFinish()
+                        }) {
+                            Text("Done")
+                                .font(.headline)
+                                .bold()
+                                .foregroundColor(.white)
+                                .padding(.horizontal, 30)
+                                .padding(.vertical, 15)
+                                .background(Color.blue)
+                                .cornerRadius(30)
+                        }
+                        .padding(40)
                     }
+                    Spacer()
                 }
             }
         }
         .onAppear {
-            // Auto-start when view appears
-            if !isSheetPresented && !showFailureOptions && !showSuccessMessage {
+            if !isSheetPresented {
                 startAirDropProcess()
             }
         }
@@ -269,17 +226,30 @@ struct AirDropInstructionsView: View {
         }
     }
     
-    private func closeShareSheet() {
-        // Find the root VC and dismiss presented VC
-        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-              let rootVC = windowScene.windows.first?.rootViewController else { return }
+    private func closeShareSheetAndFinish() {
+        cancelReset()
+        pollTimer?.invalidate()
+        pollTimer = nil
+        isSheetPresented = false
         
-        rootVC.dismiss(animated: true)
+        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+           let rootVC = windowScene.windows.first?.rootViewController,
+           rootVC.presentedViewController != nil {
+            rootVC.dismiss(animated: true) {
+                if case .airDrop = stateMachine.state {
+                    stateMachine.skipSharing()
+                }
+            }
+        } else if case .airDrop = stateMachine.state {
+            stateMachine.skipSharing()
+        }
     }
     
     private func startAirDropProcess() {
         isPreparing = true
-        cancelReset() // Cancel any existing timers
+        cancelReset()
+        pollTimer?.invalidate()
+        pollTimer = nil
         
         var items: [Any] = []
         for path in images {
@@ -301,7 +271,10 @@ struct AirDropInstructionsView: View {
     
     private func presentShareSheet(items: [Any]) {
         guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-              let rootVC = windowScene.windows.first?.rootViewController else { return }
+              let rootVC = windowScene.windows.first?.rootViewController else {
+            isSheetPresented = false
+            return
+        }
         
         let activityVC = UIActivityViewController(activityItems: items, applicationActivities: nil)
         
@@ -340,15 +313,17 @@ struct AirDropInstructionsView: View {
         activityVC.completionWithItemsHandler = { _, completed, _, _ in
             print("ActivityVC Completion Handler Called. Completed: \(completed)")
             
-            // Reset state
             isSheetPresented = false
-            self.cancelReset() // Stop the 120s timer
+            self.pollTimer?.invalidate()
+            self.pollTimer = nil
+            self.cancelReset()
             
-            // Dismissal of the share sheet can sometimes conflict with state transitions if done too fast.
-            // We wait a brief moment to ensure the sheet is fully dismissed before changing state.
+            // Wait a brief moment to ensure the sheet is fully dismissed before changing state.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                print("Executing skipSharing() from handler")
-                stateMachine.skipSharing()
+                if case .airDrop = stateMachine.state {
+                    print("Executing skipSharing() from handler")
+                    stateMachine.skipSharing()
+                }
             }
         }
         
@@ -360,6 +335,7 @@ struct AirDropInstructionsView: View {
         // SAFETY POLL: Check every 1s if the VC is still presented.
         // If the system dismisses it (e.g. after AirDrop) but fails to call the handler,
         // this will catch it and reset the app.
+        pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak rootVC] _ in
             Task { @MainActor [weak rootVC] in
                 guard let rootVC = rootVC else {
@@ -375,16 +351,15 @@ struct AirDropInstructionsView: View {
                     return
                 }
                 
-                // Check if the rootVC is still presenting OUR activityVC
-                // Note: We check if presentedViewController is nil, or if it's NOT the activityVC.
-                // However, checking for nil is the safest "it's gone" check.
                 if rootVC.presentedViewController == nil {
                     print("Safety Poll: Share Sheet is gone but handler didn't fire. Forcing reset.")
                     pollTimer?.invalidate()
                     pollTimer = nil
                     isSheetPresented = false
                     cancelReset()
-                    stateMachine.skipSharing()
+                    if case .airDrop = stateMachine.state {
+                        stateMachine.skipSharing()
+                    }
                 }
             }
         }
@@ -394,8 +369,7 @@ struct AirDropInstructionsView: View {
         cancelReset()
         let item = DispatchWorkItem {
             print("Inactivity timeout. Resetting.")
-            closeShareSheet()
-            stateMachine.skipSharing()
+            closeShareSheetAndFinish()
         }
         resetWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)

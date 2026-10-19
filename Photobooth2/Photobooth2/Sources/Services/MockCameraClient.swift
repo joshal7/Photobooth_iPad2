@@ -16,24 +16,28 @@ class MockCameraClient: CameraService {
     
     private var timer: Timer?
     
+    deinit {
+        timer?.invalidate()
+    }
+    
     func connect() async throws {
         // Simulate network delay
         try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
-        DispatchQueue.main.async { self.isConnected = true }
+        self.isConnected = true
     }
     
     func startLiveView() async throws {
         try await Task.sleep(nanoseconds: 500_000_000)
-        // Start emitting frames
-        DispatchQueue.main.async {
-            self.timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-                let renderer = UIGraphicsImageRenderer(size: CGSize(width: 720, height: 480))
-                let image = renderer.image { ctx in
-                    UIColor.random().setFill()
-                    ctx.fill(CGRect(x: 0, y: 0, width: 720, height: 480))
-                }
-                self._previewStream.send(image)
+        guard !Task.isCancelled else { return }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let renderer = UIGraphicsImageRenderer(size: CGSize(width: 720, height: 480))
+            let image = renderer.image { ctx in
+                UIColor.random().setFill()
+                ctx.fill(CGRect(x: 0, y: 0, width: 720, height: 480))
             }
+            self._previewStream.send(image)
         }
     }
     

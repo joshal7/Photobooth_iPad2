@@ -14,10 +14,10 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
         _previewStream.eraseToAnyPublisher()
     }
     
-    private let session = AVCaptureSession()
-    private let photoOutput = AVCapturePhotoOutput()
-    private let videoOutput = AVCaptureVideoDataOutput()
-    private let sessionQueue = DispatchQueue(label: "camera.session.queue")
+    nonisolated(unsafe) private let session = AVCaptureSession()
+    nonisolated(unsafe) private let photoOutput = AVCapturePhotoOutput()
+    nonisolated(unsafe) private let videoOutput = AVCaptureVideoDataOutput()
+    nonisolated private let sessionQueue = DispatchQueue(label: "camera.session.queue")
     nonisolated private let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
     
     private nonisolated final class ThreadSafeState: @unchecked Sendable {
@@ -74,7 +74,9 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
         Task { @MainActor [weak self] in
             self?.refreshCachedDeviceOrientation()
         }
-        checkPermissions()
+        if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+            setupSession()
+        }
     }
     
     nonisolated func updateSelectedBackdrop(_ backdrop: BackdropItem) {
@@ -118,61 +120,73 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
         threadSafeState.setCaptureMode(.standard)
     }
     
-    private func checkPermissions() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized:
-            setupSession()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { granted in
-                if granted { self.setupSession() }
-            }
-        default:
-            break
+    /// Must only be called on `sessionQueue`. Returns `true` if the session has a valid video input.
+    nonisolated private func configureSessionOnQueueIfNeeded() -> Bool {
+        if !self.session.inputs.isEmpty {
+            return true
         }
+        
+        self.session.beginConfiguration()
+        self.session.sessionPreset = .photo
+        
+        // Add input (Front Camera on iPad, or default FaceTime camera on Mac)
+        let preferredDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
+            ?? AVCaptureDevice.default(for: .video)
+        guard let device = preferredDevice,
+              let input = try? AVCaptureDeviceInput(device: device),
+              self.session.canAddInput(input) else {
+            self.session.commitConfiguration()
+            return false
+        }
+        
+        self.session.addInput(input)
+        
+        // Add outputs
+        if self.session.canAddOutput(self.photoOutput) {
+            self.session.addOutput(self.photoOutput)
+        }
+        
+        if self.session.canAddOutput(self.videoOutput) {
+            self.videoOutput.alwaysDiscardsLateVideoFrames = true
+            self.videoOutput.setSampleBufferDelegate(self, queue: self.sessionQueue)
+            self.session.addOutput(self.videoOutput)
+        }
+        
+        self.session.commitConfiguration()
+        return true
     }
     
     private func setupSession() {
         sessionQueue.async {
-            self.session.beginConfiguration()
-            self.session.sessionPreset = .photo
-            
-            // Add input (Front Camera on iPad, or default FaceTime camera on Mac)
-            let preferredDevice = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
-                ?? AVCaptureDevice.default(for: .video)
-            guard let device = preferredDevice,
-                  let input = try? AVCaptureDeviceInput(device: device) else {
-                self.session.commitConfiguration()
-                return
-            }
-            
-            if self.session.canAddInput(input) {
-                self.session.addInput(input)
-            }
-            
-            // Add outputs
-            if self.session.canAddOutput(self.photoOutput) {
-                self.session.addOutput(self.photoOutput)
-            }
-            
-            if self.session.canAddOutput(self.videoOutput) {
-                self.videoOutput.alwaysDiscardsLateVideoFrames = true
-                self.videoOutput.setSampleBufferDelegate(self, queue: self.sessionQueue)
-                self.session.addOutput(self.videoOutput)
-            }
-            
-            self.session.commitConfiguration()
+            let configured = self.configureSessionOnQueueIfNeeded()
             DispatchQueue.main.async {
-                self.isConnected = true
+                self.isConnected = configured
             }
         }
     }
     
     func connect() async throws {
-        // Local camera is "connected" if session is configured
-        if !session.inputs.isEmpty {
-            DispatchQueue.main.async { self.isConnected = true }
-        } else {
-            setupSession()
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        if status == .notDetermined {
+            let granted = await AVCaptureDevice.requestAccess(for: .video)
+            guard granted else {
+                self.isConnected = false
+                throw CameraError.connectionFailed
+            }
+        } else if status != .authorized {
+            self.isConnected = false
+            throw CameraError.connectionFailed
+        }
+        
+        let configured: Bool = await withCheckedContinuation { continuation in
+            sessionQueue.async {
+                let ok = self.configureSessionOnQueueIfNeeded()
+                continuation.resume(returning: ok)
+            }
+        }
+        self.isConnected = configured
+        if !configured {
+            throw CameraError.connectionFailed
         }
     }
     
@@ -185,6 +199,10 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
     }
     
     func stopLiveView() {
+        if let pending = self.photoContinuation {
+            self.photoContinuation = nil
+            pending.resume(throwing: CameraError.connectionFailed)
+        }
         sessionQueue.async {
             if self.session.isRunning {
                 self.session.stopRunning()
@@ -193,10 +211,28 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
     }
     
     func takePicture() async throws -> [String] {
+        if let staleContinuation = self.photoContinuation {
+            self.photoContinuation = nil
+            staleContinuation.resume(throwing: CameraError.connectionFailed)
+        }
         return try await withCheckedThrowingContinuation { continuation in
             self.photoContinuation = continuation
-            let settings = AVCapturePhotoSettings()
-            self.photoOutput.capturePhoto(with: settings, delegate: self)
+            self.sessionQueue.async {
+                guard self.session.isRunning,
+                      let connection = self.photoOutput.connection(with: .video),
+                      connection.isEnabled,
+                      connection.isActive else {
+                    DispatchQueue.main.async {
+                        if let pending = self.photoContinuation {
+                            self.photoContinuation = nil
+                            pending.resume(throwing: CameraError.connectionFailed)
+                        }
+                    }
+                    return
+                }
+                let settings = AVCapturePhotoSettings()
+                self.photoOutput.capturePhoto(with: settings, delegate: self)
+            }
         }
     }
     
@@ -212,7 +248,7 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
     }
     
     func checkConnection() async -> Bool {
-        return true
+        return isConnected
     }
     
     // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
@@ -262,8 +298,9 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
             guard let self = self else { return }
             if let error = error {
                 await MainActor.run {
-                    self.photoContinuation?.resume(throwing: error)
+                    let pending = self.photoContinuation
                     self.photoContinuation = nil
+                    pending?.resume(throwing: error)
                 }
                 return
             }
@@ -272,8 +309,9 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
                   let image = UIImage(data: data),
                   let rawCG = image.cgImage else {
                 await MainActor.run {
-                    self.photoContinuation?.resume(throwing: CameraError.invalidResponse)
+                    let pending = self.photoContinuation
                     self.photoContinuation = nil
+                    pending?.resume(throwing: CameraError.invalidResponse)
                 }
                 return
             }
@@ -324,8 +362,9 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
             let finalImage = UIImage(cgImage: finalCG, scale: 1.0, orientation: .up)
             guard let finalData = finalImage.jpegData(compressionQuality: 0.92) else {
                 await MainActor.run {
-                    self.photoContinuation?.resume(throwing: CameraError.invalidResponse)
+                    let pending = self.photoContinuation
                     self.photoContinuation = nil
+                    pending?.resume(throwing: CameraError.invalidResponse)
                 }
                 return
             }
@@ -336,13 +375,15 @@ class LocalCameraClient: NSObject, CameraService, AVCaptureVideoDataOutputSample
             do {
                 try finalData.write(to: url, options: .atomic)
                 await MainActor.run {
-                    self.photoContinuation?.resume(returning: [url.absoluteString])
+                    let pending = self.photoContinuation
                     self.photoContinuation = nil
+                    pending?.resume(returning: [url.absoluteString])
                 }
             } catch {
                 await MainActor.run {
-                    self.photoContinuation?.resume(throwing: error)
+                    let pending = self.photoContinuation
                     self.photoContinuation = nil
+                    pending?.resume(throwing: error)
                 }
             }
         }

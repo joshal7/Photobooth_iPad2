@@ -6,6 +6,11 @@ import CoreImage
 
 final class GIFService: Sendable {
     
+    nonisolated private static let sharedCIContext = CIContext(options: [
+        .useSoftwareRenderer: false,
+        .cacheIntermediates: false
+    ])
+    
     // No shared instance needed for stateless service
     private init() {}
     
@@ -32,6 +37,10 @@ final class GIFService: Sendable {
         additionalSearchDirectories: [URL] = [],
         customMaskProvider: ((CIImage) -> CIImage?)? = nil
     ) -> URL? {
+        guard !imagePaths.isEmpty else {
+            return nil
+        }
+        
         let fileProperties: [String: Any] = [
             kCGImagePropertyGIFDictionary as String: [
                 kCGImagePropertyGIFLoopCount as String: 0 // 0 = infinite loop
@@ -43,16 +52,6 @@ final class GIFService: Sendable {
                 kCGImagePropertyGIFDelayTime as String: frameDuration
             ]
         ]
-        
-        let tempDir = FileManager.default.temporaryDirectory
-        let gifURL = tempDir.appendingPathComponent("\(UUID().uuidString).gif")
-        
-        guard let destination = CGImageDestinationCreateWithURL(gifURL as CFURL, UTType.gif.identifier as CFString, imagePaths.count, nil) else {
-            print("Failed to create GIF destination")
-            return nil
-        }
-        
-        CGImageDestinationSetProperties(destination, fileProperties as CFDictionary)
         
         // Default 1080p height (1620x1080 at 3:2 landscape aspect ratio)
         let targetHeight: Double = 1080
@@ -88,7 +87,7 @@ final class GIFService: Sendable {
             kCGImageSourceThumbnailMaxPixelSize: computedMaxPixelSize as NSNumber
         ]
         
-        let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+        let ciContext = Self.sharedCIContext
         
         struct FrameEntry {
             let cgImage: CGImage
@@ -122,6 +121,16 @@ final class GIFService: Sendable {
         guard !loadedFrames.isEmpty else {
             return nil
         }
+        
+        let tempDir = FileManager.default.temporaryDirectory
+        let gifURL = tempDir.appendingPathComponent("\(UUID().uuidString).gif")
+        
+        guard let destination = CGImageDestinationCreateWithURL(gifURL as CFURL, UTType.gif.identifier as CFString, loadedFrames.count, nil) else {
+            print("Failed to create GIF destination")
+            return nil
+        }
+        
+        CGImageDestinationSetProperties(destination, fileProperties as CFDictionary)
         
         // 1. Compute the median scene luminance across all raw subject frames in the GIF burst
         //    so any single frame that drifted in exposure is equalized BEFORE the static backdrop/frame is applied.
@@ -173,6 +182,7 @@ final class GIFService: Sendable {
             print("GIF created at \(gifURL)")
             return gifURL
         } else {
+            try? FileManager.default.removeItem(at: gifURL)
             print("Failed to finalize GIF")
             return nil
         }

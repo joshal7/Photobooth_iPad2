@@ -767,14 +767,22 @@ final class BackdropCompositorService: Sendable {
         return (dt, subSec)
     }
     
-    /// Parses an EXIF date string (`"YYYY:MM:DD HH:MM:SS"`) into a `Date` for $\pm 2\text{s}$ timestamp window matching.
-    nonisolated static func parseEXIFDate(_ exifString: String?, subSec: String? = nil) -> Date? {
-        guard let exifString = exifString, !exifString.isEmpty else { return nil }
+    private nonisolated static let exifDateLock = NSLock()
+    private nonisolated(unsafe) static let exifDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
-        guard let baseDate = formatter.date(from: exifString) else { return nil }
+        return formatter
+    }()
+    
+    /// Parses an EXIF date string (`"YYYY:MM:DD HH:MM:SS"`) into a `Date` for $\pm 2\text{s}$ timestamp window matching.
+    nonisolated static func parseEXIFDate(_ exifString: String?, subSec: String? = nil) -> Date? {
+        guard let exifString = exifString, !exifString.isEmpty else { return nil }
+        exifDateLock.lock()
+        let baseDate = exifDateFormatter.date(from: exifString)
+        exifDateLock.unlock()
+        guard let baseDate = baseDate else { return nil }
         if let sub = subSec, let frac = Double("0.\(sub.trimmingCharacters(in: .whitespaces))") {
             return baseDate.addingTimeInterval(frac)
         }

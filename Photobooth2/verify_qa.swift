@@ -1366,7 +1366,7 @@ func qaSessionAttachmentDescription(for mediaOrFilenames: [String]) -> String {
     if hasPhotos && hasGIF {
         return "Your photos & animated GIF from your session are attached to this email."
     } else if hasGIF {
-        return "Your gif from your session are attached to this email."
+        return "Your animated GIF from your session is attached to this email."
     } else {
         return "Your photos from your session are attached to this email."
     }
@@ -1388,12 +1388,23 @@ func qaBuildEmailHTML(galleryURLString: String, mediaOrFilenames: [String] = [])
     let hasGIF = lower.contains { $0.hasSuffix(".gif") }
     let hasPhotos = lower.contains { $0.hasSuffix(".jpg") || $0.hasSuffix(".jpeg") || $0.hasSuffix(".png") }
     let footerNoun = (hasGIF && !hasPhotos) ? "gifs" : "photos"
+    let gifSaveTipHTML: String
+    if hasGIF {
+        gifSaveTipHTML = """
+        
+          <p style="font-size: 13px; color: #555555; background-color: #f6f7f9; padding: 10px 12px; border-radius: 8px; margin-top: 14px;">
+            <strong>Tip for saving your GIF on iPhone:</strong> Tap the attached GIF to open it full-screen, then tap the <strong>Share</strong> icon in the corner and choose <strong>Save Image</strong> (instead of long-pressing inside the email) so it saves as a looping animated GIF in your Photos app.
+          </p>
+        """
+    } else {
+        gifSaveTipHTML = ""
+    }
     return """
     <!DOCTYPE html>
     <html>
     <head><meta charset="UTF-8"></head>
     <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #222222; line-height: 1.5; padding: 16px;">
-      <p>Thanks for visiting the photobooth! \(escapedDesc)</p>
+      <p>Thanks for visiting the photobooth! \(escapedDesc)</p>\(gifSaveTipHTML)
       <hr style="border: none; border-top: 1px solid #e0e0e0; margin: 24px 0;" />
       <p style="font-size: 14px; color: #444444;">All full resolution \(footerNoun) can be downloaded <a href="\(escapedURL)">here</a> a day or two after the event.</p>
     </body>
@@ -1401,7 +1412,7 @@ func qaBuildEmailHTML(galleryURLString: String, mediaOrFilenames: [String] = [])
     """
 }
 
-func qaConfirmationMessage(forEmail email: String, isOnline: Bool, mediaOrFilenames: [String] = []) -> (title: String, subtitle: String, isOnline: Bool) {
+func qaConfirmationMessage(forEmail email: String, isOnline: Bool, isConfigured: Bool = true, mediaOrFilenames: [String] = []) -> (title: String, subtitle: String, isOnline: Bool, isConfigured: Bool) {
     let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
     let lower = mediaOrFilenames.map { $0.lowercased() }
     let hasGIF = lower.contains { $0.hasSuffix(".gif") }
@@ -1409,17 +1420,26 @@ func qaConfirmationMessage(forEmail email: String, isOnline: Bool, mediaOrFilena
     let mediaTitle = (hasGIF && !hasPhotos) ? "GIF" : "Photos"
     let mediaSub = (hasGIF && !hasPhotos) ? "GIF is" : "photos are"
     
-    if isOnline {
+    if !isConfigured {
+        return (
+            title: "Saved to Email Queue!",
+            subtitle: "Your \(mediaTitle.lowercased()) for \(cleanEmail) are safely saved on this iPad and will be sent as soon as the host enters the Email Password in Settings.",
+            isOnline: isOnline,
+            isConfigured: false
+        )
+    } else if isOnline {
         return (
             title: "Sending Your \(mediaTitle)!",
             subtitle: "Your \(mediaSub) being emailed to \(cleanEmail) in the background right now.",
-            isOnline: true
+            isOnline: true,
+            isConfigured: true
         )
     } else {
         return (
             title: "Saved for Wi-Fi Delivery!",
             subtitle: "The iPad is currently offline. You will receive your email at \(cleanEmail) shortly after the iPad connects to Wi-Fi.",
-            isOnline: false
+            isOnline: false,
+            isConfigured: true
         )
     }
 }
@@ -1437,8 +1457,8 @@ assertEqual(
 )
 assertEqual(
     qaSessionAttachmentDescription(for: ["animation.gif"]),
-    "Your gif from your session are attached to this email.",
-    "GIF-only session produces 'Your gif from your session are attached to this email.'"
+    "Your animated GIF from your session is attached to this email.",
+    "GIF-only session produces 'Your animated GIF from your session is attached to this email.'"
 )
 
 let qaHTML1 = qaBuildEmailHTML(galleryURLString: "https://www.joshal.com/2026", mediaOrFilenames: ["photo.jpg"])
@@ -1894,6 +1914,84 @@ assertTrue(
     emailServiceSource.contains("class CompositeEmailTransport") &&
     emailServiceSource.contains("normalizeJPEGAttachmentTo2MP"),
     "EmailQueueService supports both Gmail SMTP App Passwords (any Gmail recipient) and Resend API keys, plus 2MP iPad JPEG normalization"
+)
+
+// ============================================================================
+// 9. Concurrency, Race Condition, Lifecycle & Resource Cleanup Regression Suite
+// ============================================================================
+print("\n[9] Testing Concurrency, Race Condition, Lifecycle & Resource Cleanup Fixes...")
+
+let appSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/App/Photobooth2App.swift", encoding: .utf8)) ?? ""
+let configManagerSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Config/ConfigManager.swift", encoding: .utf8)) ?? ""
+let localCameraSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Services/LocalCameraClient.swift", encoding: .utf8)) ?? ""
+let mockCameraSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Services/MockCameraClient.swift", encoding: .utf8)) ?? ""
+let gifServiceSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Services/GIFService.swift", encoding: .utf8)) ?? ""
+let gifRetrievalSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Services/GIFRetrievalService.swift", encoding: .utf8)) ?? ""
+let qrCodeViewSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Views/QRCodeGeneratorView.swift", encoding: .utf8)) ?? ""
+
+assertTrue(
+    appSource.contains("@State private var hasStarted = false") &&
+    appSource.contains("if !hasStarted"),
+    "Photobooth2App guards stateMachine.start() with hasStarted so duplicate .onAppear events cannot reset an active session"
+)
+assertTrue(
+    configManagerSource.contains("private var isBatchUpdating: Bool = false") &&
+    configManagerSource.contains("guard !isBatchUpdating else { return }"),
+    "ConfigManager batches UserDefaults writes during resetToDefaults() instead of writing 21 times"
+)
+assertTrue(
+    sonySource.contains("OneShotGate") &&
+    sonySource.contains(".now() + 6.0") &&
+    sonySource.contains("handshakingStartTime") &&
+    sonySource.contains("func shutdown()"),
+    "SonyUSBCameraClient guards ICCameraPTPTransport.sendPTPCommand with a 6s OneShotGate watchdog, 10s handshake watchdog, and shutdown() cleanup"
+)
+assertTrue(
+    stateMachineSource.contains("private var activeStateTask: Task<Void, Never>?") &&
+    stateMachineSource.contains("private var stateGeneration: UInt64 = 0") &&
+    stateMachineSource.contains("isCurrentExecution(generation)") &&
+    stateMachineSource.contains("hasInjectedCameraService"),
+    "StateMachine cancels superseded state tasks, validates stateGeneration across awaits, and protects injected CameraService instances"
+)
+assertTrue(
+    localCameraSource.contains("configureSessionOnQueueIfNeeded()") &&
+    localCameraSource.contains("connection.isActive"),
+    "LocalCameraClient serializes AVCaptureSession setup on sessionQueue and validates active video connection before capturePhoto"
+)
+assertTrue(
+    mockCameraSource.contains("Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self]") &&
+    mockCameraSource.contains("deinit"),
+    "MockCameraClient avoids Timer retain cycle and invalidates timer on deinit"
+)
+assertTrue(
+    emailServiceSource.contains("withTaskCancellationHandler") &&
+    emailServiceSource.contains("conn.cancel()"),
+    "SMTPTLSSession.withTimeout cancels NWConnection on timeout or task cancellation to prevent hung TCP/TLS continuations"
+)
+assertTrue(
+    gifServiceSource.contains("sharedCIContext") &&
+    gifServiceSource.contains("guard !imagePaths.isEmpty else"),
+    "GIFService reuses a shared CIContext and guards against empty input without creating orphaned .gif files"
+)
+assertTrue(
+    gifRetrievalSource.contains("leaveGroupOnce") &&
+    !gifRetrievalSource.contains("to: endDate)!"),
+    "GIFRetrievalService eliminates Date force-unwrap and guards DispatchGroup.leave() with a one-shot gate"
+)
+assertTrue(
+    backdropManagerSource.contains("candidateNormalized.isEmpty || candidateNormalized == BackdropItem.noneID"),
+    "BackdropManager.addCustomBackdrop prevents empty or 'none' normalized IDs from colliding with BackdropItem.noneID"
+)
+assertTrue(
+    qrCodeViewSource.contains("sharedCIContext") &&
+    qrCodeViewSource.contains("cachedQRImage"),
+    "QRCodeGeneratorView reuses a static CIContext and caches rendered QR code images"
+)
+assertTrue(
+    !sharingViewsSource.contains("showSuccessMessage") &&
+    !sharingViewsSource.contains("showFailureOptions") &&
+    sharingViewsSource.contains("closeShareSheetAndFinish()"),
+    "AirDropInstructionsView removes dead state branches and ensures Done button always returns to idle"
 )
 
 print("========================================================")

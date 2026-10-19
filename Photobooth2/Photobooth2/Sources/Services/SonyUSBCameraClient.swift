@@ -57,6 +57,18 @@ actor PTPCommandQueue {
 final class ICCameraPTPTransport: PTPTransport, @unchecked Sendable {
     nonisolated(unsafe) private weak var device: ICCameraDevice?
     
+    private nonisolated final class OneShotGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var didFire = false
+        func tryAcquire() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if didFire { return false }
+            didFire = true
+            return true
+        }
+    }
+    
     nonisolated init(device: ICCameraDevice) {
         self.device = device
     }
@@ -66,7 +78,16 @@ final class ICCameraPTPTransport: PTPTransport, @unchecked Sendable {
             throw CameraError.connectionFailed
         }
         return try await withCheckedThrowingContinuation { continuation in
+            let gate = OneShotGate()
+            
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 6.0) {
+                if gate.tryAcquire() {
+                    continuation.resume(throwing: CameraError.timeout)
+                }
+            }
+            
             device.requestSendPTPCommand(commandPacket, outData: outData) { inData, responsePacket, error in
+                guard gate.tryAcquire() else { return }
                 if let error = error {
                     continuation.resume(throwing: error)
                 } else {
@@ -80,6 +101,7 @@ final class ICCameraPTPTransport: PTPTransport, @unchecked Sendable {
 class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICCameraDeviceDelegate {
     private static let sonyUSBVendorID: Int = 0x054C
     private static let sonyProtocolVersion3: UInt32 = 0x012C // 3.00 for BIONZ XR (A7 IV / A7R V / A7V)
+    nonisolated private static let sharedCIContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
     
     @Published var isConnected: Bool = false
     var connectionStatus: AnyPublisher<Bool, Never> { $isConnected.eraseToAnyPublisher() }
@@ -98,6 +120,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     private var autoDiscoveryTask: Task<Void, Never>?
     private var wasLiveViewRunningBeforeSuspend: Bool = false
     private var sessionOpenContinuation: CheckedContinuation<Void, Error>?
+    private var sessionOpenToken: UUID?
     
     init(injectedTransport: PTPTransport? = nil) {
         self.ptpTransport = injectedTransport
@@ -112,9 +135,42 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         liveViewTask?.cancel()
         keepAliveTask?.cancel()
         autoDiscoveryTask?.cancel()
+        if let pending = sessionOpenContinuation {
+            sessionOpenContinuation = nil
+            pending.resume(throwing: CameraError.connectionFailed)
+        }
+        cameraDevice?.delegate = nil
+        deviceBrowser?.delegate = nil
+        deviceBrowser?.stop()
     }
     
-    private var isOpeningOrHandshaking: Bool = false
+    func shutdown() {
+        stopLiveView()
+        keepAliveTask?.cancel()
+        keepAliveTask = nil
+        autoDiscoveryTask?.cancel()
+        autoDiscoveryTask = nil
+        if let pending = sessionOpenContinuation {
+            sessionOpenContinuation = nil
+            sessionOpenToken = nil
+            pending.resume(throwing: CameraError.connectionFailed)
+        }
+        isOpeningOrHandshaking = false
+        ptpTransport = nil
+        cameraDevice?.delegate = nil
+        cameraDevice = nil
+        deviceBrowser?.delegate = nil
+        deviceBrowser?.stop()
+        deviceBrowser = nil
+        isConnected = false
+    }
+    
+    private var isOpeningOrHandshaking: Bool = false {
+        didSet {
+            handshakingStartTime = isOpeningOrHandshaking ? Date() : nil
+        }
+    }
+    private var handshakingStartTime: Date? = nil
     private var isAuthorizingBrowser: Bool = false
     private var controlAuthSummary: String = "pending"
     private var contentsAuthSummary: String = "pending"
@@ -173,6 +229,18 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                 try? await Task.sleep(nanoseconds: 2_500_000_000) // 2.5s
                 guard let self = self, !Task.isCancelled else { break }
                 await MainActor.run {
+                    if self.isOpeningOrHandshaking,
+                       let start = self.handshakingStartTime,
+                       Date().timeIntervalSince(start) > 10.0 {
+                        // Watchdog: reset stuck handshake state if iPadOS `icdd` dropped a session callback
+                        self.isOpeningOrHandshaking = false
+                        if let pending = self.sessionOpenContinuation {
+                            self.sessionOpenContinuation = nil
+                            self.sessionOpenToken = nil
+                            pending.resume(throwing: CameraError.timeout)
+                        }
+                    }
+                    
                     guard !self.isConnected,
                           !self.isOpeningOrHandshaking,
                           !self.isAuthorizingBrowser else { return }
@@ -341,8 +409,24 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         if !device.hasOpenSession {
             self.statusMessage = "Opening USB session with \(device.name ?? "Camera")..."
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if let existing = self.sessionOpenContinuation {
+                    self.sessionOpenContinuation = nil
+                    existing.resume(throwing: CameraError.connectionFailed)
+                }
+                let token = UUID()
+                self.sessionOpenToken = token
                 self.sessionOpenContinuation = continuation
                 device.requestOpenSession()
+                
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 6_000_000_000)
+                    guard let self = self,
+                          self.sessionOpenToken == token,
+                          let pending = self.sessionOpenContinuation else { return }
+                    self.sessionOpenContinuation = nil
+                    self.sessionOpenToken = nil
+                    pending.resume(throwing: CameraError.timeout)
+                }
             }
         }
         
@@ -741,10 +825,15 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     /// Decodes a JPEG buffer into an upright `CGImage` with EXIF orientation baked in.
     nonisolated private static func decodeUprightCGImage(from jpegData: Data) -> CGImage? {
         if let src = CGImageSourceCreateWithData(jpegData as CFData, nil) {
+            let props = (CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]) ?? [:]
+            let w = (props[kCGImagePropertyPixelWidth] as? Int) ?? 0
+            let h = (props[kCGImagePropertyPixelHeight] as? Int) ?? 0
+            let maxDim = max(w, h, 8192)
             let opts: [CFString: Any] = [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceShouldCache: false
+                kCGImageSourceShouldCache: false,
+                kCGImageSourceThumbnailMaxPixelSize: maxDim as NSNumber
             ]
             if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) {
                 return cg
@@ -806,7 +895,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             }
             
             var unmirroredRawCG = BackdropCompositorService.cropToLandscapeThreeByTwo(decodedRawCG)
-            let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+            let ciContext = Self.sharedCIContext
             
             // Record Triple-Lock manifest entry using `unmirroredRawCG` (upright, un-mirrored, pre-exposure boost)
             // so its 8x8 RGB signature matches the un-boosted SD card DSC0xxxx.JPG file even in dim lighting conditions.
@@ -901,7 +990,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     /// using a fast, single-pass GPU exposure and highlight roll-off pipeline.
     nonisolated static func autoExposeCapturedUIImage(_ image: UIImage, ciContext: CIContext? = nil) -> UIImage {
         guard let cgImage = image.cgImage else { return image }
-        let ctx = ciContext ?? CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+        let ctx = ciContext ?? Self.sharedCIContext
         let boostedCG = autoExposeCapturedCGImage(cgImage, ciContext: ctx)
         if boostedCG === cgImage {
             return image
@@ -937,7 +1026,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         liveViewTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             let targetFrameIntervalNs: UInt64 = 33_000_000 // ~30 FPS
-            let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+            let ciContext = Self.sharedCIContext
             var lastSettingEffectEnforceTime: UInt64 = 0
             
             while !Task.isCancelled {
@@ -979,7 +1068,9 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                         // the camera reloads Memory Recall 1 which resets Live View Setting Effect (0xD231) to ON (1),
                         // causing the camera to send dark Live View frames. Immediately re-assert Setting Effect OFF (2)!
                         let nowNs = DispatchTime.now().uptimeNanoseconds
-                        if meanLuma < 0.16, nowNs - lastSettingEffectEnforceTime > 2_000_000_000 {
+                        if meanLuma < 0.16,
+                           nowNs - lastSettingEffectEnforceTime > 2_000_000_000,
+                           !(await self.commandQueue.isBusyWithCaptureOrConfig) {
                             lastSettingEffectEnforceTime = nowNs
                             try? await self.setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
                             try? await self.setDevicePropertyUInt8(.liveViewSettingEffect, value: 2, using: transport)
@@ -1190,7 +1281,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                     highPriority: false
                 ), rc == SonyPTPResponseCode.ok.rawValue {
                     let currentEffect = SonyPTPPacket.parseUInt8Property(.liveViewSettingEffect, from: propBlob)
-                    if currentEffect == 1 {
+                    if currentEffect == 1, !(await self.commandQueue.isBusyWithCaptureOrConfig) {
                         // Camera mode dial was turned (e.g. to Memory Recall "1") which reset 0xD231 to Setting Effect ON (1).
                         // Immediately restore Setting Effect OFF (2) and unlock physical dials (0xD25A = 0).
                         try? await self.setDevicePropertyUInt8(.priorityMode, value: 1, using: transport)
@@ -1286,13 +1377,16 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             self.ptpTransport = nil
             self.cameraDevice = nil
             self.statusMessage = "USB Session Error: \(error.localizedDescription) — retrying automatically..."
-            sessionOpenContinuation?.resume(throwing: error)
+            sessionOpenToken = nil
+            let pending = sessionOpenContinuation
             sessionOpenContinuation = nil
+            pending?.resume(throwing: error)
             return
         }
         
         // If `connect()` is waiting on `sessionOpenContinuation`, let `connect()` perform the single handshake.
         if let continuation = sessionOpenContinuation {
+            sessionOpenToken = nil
             sessionOpenContinuation = nil
             continuation.resume(returning: ())
             return
@@ -1333,6 +1427,11 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         keepAliveTask?.cancel()
         keepAliveTask = nil
         isOpeningOrHandshaking = false
+        sessionOpenToken = nil
+        if let pending = sessionOpenContinuation {
+            sessionOpenContinuation = nil
+            pending.resume(throwing: CameraError.connectionFailed)
+        }
         ptpTransport = nil
         cameraDevice = nil
         isConnected = false

@@ -5,9 +5,14 @@ import CoreImage.CIFilterBuiltins
 /// Designed for large on-screen display in bright booth environments.
 struct QRCodeGeneratorView: View {
     let urlString: String
+    
+    private static let sharedCIContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
+    private static let cacheLock = NSLock()
+    private static var cachedURLString: String?
+    private static var cachedQRImage: UIImage?
 
     var body: some View {
-        if let image = generateQRCode(from: urlString) {
+        if let image = Self.generateQRCode(from: urlString) {
             Image(uiImage: image)
                 .interpolation(.none)
                 .resizable()
@@ -21,8 +26,15 @@ struct QRCodeGeneratorView: View {
         }
     }
 
-    private func generateQRCode(from string: String) -> UIImage? {
-        guard let data = string.data(using: .utf8) else { return nil }
+    private static func generateQRCode(from string: String) -> UIImage? {
+        guard !string.isEmpty, let data = string.data(using: .utf8) else { return nil }
+        
+        cacheLock.lock()
+        if cachedURLString == string, let existing = cachedQRImage {
+            cacheLock.unlock()
+            return existing
+        }
+        cacheLock.unlock()
 
         guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
         filter.setValue(data, forKey: "inputMessage")
@@ -35,9 +47,13 @@ struct QRCodeGeneratorView: View {
         // crisply at any display size without blurring.
         let scaled = ciImage.transformed(by: CGAffineTransform(scaleX: 10, y: 10))
 
-        let context = CIContext()
-        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else { return nil }
+        guard let cgImage = sharedCIContext.createCGImage(scaled, from: scaled.extent) else { return nil }
 
-        return UIImage(cgImage: cgImage)
+        let rendered = UIImage(cgImage: cgImage)
+        cacheLock.lock()
+        cachedURLString = string
+        cachedQRImage = rendered
+        cacheLock.unlock()
+        return rendered
     }
 }

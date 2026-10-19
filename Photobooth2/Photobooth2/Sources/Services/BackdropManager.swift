@@ -142,8 +142,9 @@ final class BackdropManager: ObservableObject {
         ensureDocumentsBackdropsDirectoryExists()
         guard backgroundData != nil || foregroundPNGData != nil else { return nil }
         let stripped = Self.stripRoleSuffix(from: displayName).trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidateNormalized = Self.normalizedID(from: stripped)
         let trimmed: String
-        if stripped.isEmpty {
+        if candidateNormalized.isEmpty || candidateNormalized == BackdropItem.noneID {
             let existingIDs = Set(availableBackdrops.map(\.id))
             var candidate = "Custom Backdrop"
             var counter = 2
@@ -183,8 +184,15 @@ final class BackdropManager: ObservableObject {
             try? fgData.write(to: fgURL, options: .atomic)
         }
         
-        setForegroundFitMode(for: id, fitMode: fitMode)
-        setBackdropEnabled(id, isEnabled: true)
+        var modes = UserDefaults.standard.dictionary(forKey: fitModesKey) as? [String: String] ?? [:]
+        modes[id] = fitMode.rawValue
+        UserDefaults.standard.set(modes, forKey: fitModesKey)
+        
+        var disabled = Set(UserDefaults.standard.stringArray(forKey: disabledIDsKey) ?? [])
+        disabled.remove(id)
+        UserDefaults.standard.set(Array(disabled), forKey: disabledIDsKey)
+        
+        reloadBackdrops()
         return availableBackdrops.first(where: { $0.id == id })
     }
     

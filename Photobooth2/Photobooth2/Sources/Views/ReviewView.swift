@@ -9,8 +9,8 @@ struct ReviewView: View {
         ZStack {
             Color.black.edgesIgnoringSafeArea(.all)
             
-            if currentIndex < images.count, isGIF(url: images[currentIndex]), let url = URL(string: images[currentIndex]) {
-                GIFPlayerView(url: url)
+            if currentIndex >= 0, currentIndex < images.count, isGIF(url: images[currentIndex]) {
+                GIFPlayerView(url: resolveFileURL(images[currentIndex]))
                     .edgesIgnoringSafeArea(.all)
                     .transition(.opacity)
                     .id("GIF-\(currentIndex)")
@@ -31,7 +31,7 @@ struct ReviewView: View {
             // Optional: Overlay showing "Reviewing X of N"
             VStack {
                 Spacer()
-                Text("Reviewing \(currentIndex + 1) of \(images.count)")
+                Text("Reviewing \(min(max(currentIndex + 1, 1), max(images.count, 1))) of \(images.count)")
                     .font(.headline)
                     .foregroundColor(.white.opacity(0.7))
                     .padding(.bottom, 20)
@@ -42,5 +42,12 @@ struct ReviewView: View {
     
     private func isGIF(url: String) -> Bool {
         return url.lowercased().hasSuffix(".gif")
+    }
+    
+    private func resolveFileURL(_ pathOrURL: String) -> URL {
+        if pathOrURL.hasPrefix("file://"), let parsed = URL(string: pathOrURL) {
+            return parsed
+        }
+        return URL(fileURLWithPath: pathOrURL)
     }
 }

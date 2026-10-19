@@ -24,7 +24,7 @@ class ConfigManager: ObservableObject {
     }
     @Published var gifFrameDuration: Double { didSet { save() } }
     @Published var gifPreviewDuration: Double { didSet { save() } }
-    @Published var gifResolution: Int { didSet { save() } } // 0: 720p, 1: 480p
+    @Published var gifResolution: Int { didSet { save() } } // 0: 1080p, 1: 720p, 2: 480p
     @Published var gifRetrievalWindowHours: Int { didSet { save() } }
 
     // QR Code Configuration
@@ -41,16 +41,22 @@ class ConfigManager: ObservableObject {
     @Published var emailAPIKey: String {
         didSet {
             save()
-            EmailQueueService.shared.notifyConfigurationUpdated()
+            if !isBatchUpdating {
+                EmailQueueService.shared.notifyConfigurationUpdated()
+            }
         }
     }
     @Published var emailFromAddress: String {
         didSet {
             save()
-            EmailQueueService.shared.notifyConfigurationUpdated()
+            if !isBatchUpdating {
+                EmailQueueService.shared.notifyConfigurationUpdated()
+            }
         }
     }
     @Published var emailSubject: String { didSet { save() } }
+    
+    private var isBatchUpdating: Bool = false
 
     private init() {
         self.initialCountdownSec = UserDefaults.standard.object(forKey: "initialCountdownSec") as? Int ?? 5
@@ -68,8 +74,8 @@ class ConfigManager: ObservableObject {
         let savedInterval = UserDefaults.standard.object(forKey: "minTimeBetweenGIFs_v2") as? Double ?? 3.0
         self.gifCaptureInterval = max(0.5, savedInterval)
         self.gifFrameDuration = UserDefaults.standard.object(forKey: "gifFrameDuration") as? Double ?? 0.25
-        self.gifPreviewDuration = UserDefaults.standard.object(forKey: "gifPreviewDuration") as? Double ?? 8.0
-        self.gifResolution = 0 // 1080p
+        self.gifPreviewDuration = UserDefaults.standard.object(forKey: "gifPreviewDuration") as? Double ?? 6.0
+        self.gifResolution = UserDefaults.standard.object(forKey: "gifResolution") as? Int ?? 0 // 0: 1080p
         self.gifRetrievalWindowHours = UserDefaults.standard.object(forKey: "gifRetrievalWindowHours") as? Int ?? 24
 
         // QR Code Defaults (Enabled by default)
@@ -114,6 +120,7 @@ class ConfigManager: ObservableObject {
     }
     
     func save() {
+        guard !isBatchUpdating else { return }
         UserDefaults.standard.set(initialCountdownSec, forKey: "initialCountdownSec")
         UserDefaults.standard.set(interShotCountdownSec, forKey: "interShotCountdownSec")
         UserDefaults.standard.set(photoCount, forKey: "photoCount")
@@ -144,6 +151,7 @@ class ConfigManager: ObservableObject {
     }
     
     func resetToDefaults() {
+        isBatchUpdating = true
         self.initialCountdownSec = 5
         self.interShotCountdownSec = 3
         self.photoCount = 3
@@ -171,6 +179,8 @@ class ConfigManager: ObservableObject {
         self.isEmailSharingEnabled = true
         self.emailFromAddress = "Photobooth <joshal7@gmail.com>"
         self.emailSubject = "Your Photobooth Photos"
+        isBatchUpdating = false
         save()
+        EmailQueueService.shared.notifyConfigurationUpdated()
     }
 }

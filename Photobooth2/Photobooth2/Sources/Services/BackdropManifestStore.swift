@@ -344,7 +344,8 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
                   let thumbCG = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary) else {
                 return nil
             }
-            let sig = BackdropCompositorService.computeRGBSignature8x8(from: thumbCG)
+            let croppedThumbCG = BackdropCompositorService.cropToLandscapeThreeByTwo(thumbCG)
+            let sig = BackdropCompositorService.computeRGBSignature8x8(from: croppedThumbCG)
             candidates[index].cachedSignature8x8 = sig
             return sig
         }
@@ -487,20 +488,26 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             let didApply: Bool = autoreleasepool {
                 guard let src = CGImageSourceCreateWithURL(candidate.url as CFURL, nil) else { return false }
                 let rawProps = (CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]) ?? [:]
+                let rawWidth = (rawProps[kCGImagePropertyPixelWidth] as? Int) ?? 0
+                let rawHeight = (rawProps[kCGImagePropertyPixelHeight] as? Int) ?? 0
+                let maxDim = max(rawWidth, rawHeight, 8192)
                 
                 // Decode full-res upright CGImage
                 let fullResOpts: [CFString: Any] = [
                     kCGImageSourceCreateThumbnailFromImageAlways: true,
                     kCGImageSourceCreateThumbnailWithTransform: true,
-                    kCGImageSourceShouldCache: false
+                    kCGImageSourceShouldCache: false,
+                    kCGImageSourceThumbnailMaxPixelSize: maxDim as NSNumber
                 ]
-                guard let rawFullCG = CGImageSourceCreateThumbnailAtIndex(src, 0, fullResOpts as CFDictionary)
+                guard let decodedFullCG = CGImageSourceCreateThumbnailAtIndex(src, 0, fullResOpts as CFDictionary)
                     ?? CGImageSourceCreateImageAtIndex(src, 0, nil) else {
                     return false
                 }
                 
-                // Step A: Horizontally mirror the external camera subject to match the iPad Live View / Review framing,
+                // Step A: Center-crop to landscape 3:2 (no-op for native 3:2 captures) and horizontally mirror
+                // the external camera subject to match the iPad Live View / Review framing,
                 // then run single-pass highlight-protected auto-exposure on the subject FIRST before compositing.
+                let rawFullCG = BackdropCompositorService.cropToLandscapeThreeByTwo(decodedFullCG)
                 let mirroredFullCG = BackdropCompositorService.mirrorCGImageHorizontally(rawFullCG, ciContext: ciContext)
                 let exposedFullCG = SonyUSBCameraClient.autoExposeCapturedCGImage(mirroredFullCG, ciContext: ciContext)
                 
