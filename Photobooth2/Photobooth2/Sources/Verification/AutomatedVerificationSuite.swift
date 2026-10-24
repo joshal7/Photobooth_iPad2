@@ -2573,6 +2573,33 @@ enum AutomatedVerificationSuite {
         let emptyGIFResult = GIFService.createGIF(from: [], frameDuration: 0.25)
         assertTrue(emptyGIFResult == nil, "GIFService.createGIF(from: []) returns nil cleanly without creating orphaned files")
         assertEqual(BackdropManager.normalizedID(from: "!!!"), "", "BackdropManager.normalizedID returns empty string for punctuation-only input")
+        
+        // 14. LocalCameraClient (iPad Mode) Multi-Frame GIF Capture Verification
+        let localClient = LocalCameraClient()
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        if let ctx = CGContext(data: nil, width: 1440, height: 960, bitsPerComponent: 8, bytesPerRow: 1440 * 4, space: colorSpace, bitmapInfo: bitmapInfo) {
+            ctx.setFillColor(red: 0.55, green: 0.45, blue: 0.65, alpha: 1.0)
+            ctx.fill(CGRect(x: 0, y: 0, width: 1440, height: 960))
+            if let testCG = ctx.makeImage() {
+                localClient.seedLatestSubjectFrameForTesting(testCG)
+                try await localClient.prepareForCapture(mode: .gif)
+                var capturedLocalGIFURLs: [String] = []
+                for _ in 0..<4 {
+                    let urls = try await localClient.takePicture()
+                    if let first = urls.first {
+                        capturedLocalGIFURLs.append(first)
+                    }
+                }
+                await localClient.finishCaptureSequence(mode: .gif)
+                assertEqual(capturedLocalGIFURLs.count, 4, "LocalCameraClient (iPad mode) completes all 4 back-to-back GIF frame captures without stalling after frame 1")
+                for urlStr in capturedLocalGIFURLs {
+                    if let parsed = URL(string: urlStr) {
+                        try? FileManager.default.removeItem(at: parsed)
+                    }
+                }
+            }
+        }
     }
 }
 

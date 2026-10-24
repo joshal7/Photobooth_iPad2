@@ -2203,8 +2203,12 @@ assertTrue(
 )
 assertTrue(
     localCameraSource.contains("configureSessionOnQueueIfNeeded()") &&
-    localCameraSource.contains("connection.isActive"),
-    "LocalCameraClient serializes AVCaptureSession setup on sessionQueue and validates active video connection before capturePhoto"
+    localCameraSource.contains("connection.isActive") &&
+    localCameraSource.contains("videoOutputQueue") &&
+    localCameraSource.contains("photoCIContext") &&
+    localCameraSource.contains("processAndSaveUprightSubjectCGImage") &&
+    localCameraSource.contains("didFinishCaptureFor"),
+    "LocalCameraClient serializes AVCaptureSession setup on sessionQueue, isolates videoOutputQueue & photoCIContext, and captures all GIF frames from the live stream without stalling AVCapturePhotoOutput"
 )
 assertTrue(
     mockCameraSource.contains("Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self]") &&
