@@ -482,6 +482,39 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             }
         }
         
+        // If `folderURL` is a subfolder (e.g. `bad/` or `Good/`) and the manifest `.json` sits in its parent directory,
+        // also check the immediate parent directory as a read-only manifest source before falling back to `fallbackStore`.
+        if decodedFolderDocs.isEmpty {
+            let parentURL = folderURL.deletingLastPathComponent()
+            if parentURL.standardizedFileURL != folderURL.standardizedFileURL,
+               let parentContents = try? fm.contentsOfDirectory(
+                   at: parentURL,
+                   includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
+                   options: [.skipsHiddenFiles]
+               ) {
+                let parentManifestURLs = parentContents
+                    .filter { url in
+                        let lower = url.lastPathComponent.lowercased()
+                        guard lower.hasSuffix(".json") else { return false }
+                        return lower == BackdropManifestDocument.defaultFilename
+                            || lower.contains("manifest")
+                            || lower.contains("backdrop")
+                    }
+                    .sorted { a, b in
+                        let dateA = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                        let dateB = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                        if dateA != dateB { return dateA < dateB }
+                        return a.lastPathComponent.localizedStandardCompare(b.lastPathComponent) == .orderedAscending
+                    }
+                for mURL in parentManifestURLs {
+                    if let data = try? Data(contentsOf: mURL),
+                       let decoded = try? decoder.decode(BackdropManifestDocument.self, from: data) {
+                        decodedFolderDocs.append(decoded)
+                    }
+                }
+            }
+        }
+        
         var manifestDoc: BackdropManifestDocument
         if !decodedFolderDocs.isEmpty {
             manifestDoc = sanitizeAndMergeManifestDocuments(decodedFolderDocs)
@@ -606,6 +639,7 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
         struct Pass1MatchCandidate {
             let entryIdx: Int
             let candIdx: Int
+            let candidatePriorityRank: Int
             let sameAppliedBackdrop: Bool
             let timeDiff: Double
             let sigDist: Double
@@ -640,10 +674,22 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
                     guard sigDist < maxAllowedDist else { continue }
                 }
                 
+                // Prefer verified un-composited original camera JPEGs (rank 0, e.g. fresh SD card copy or `DSC0xxxx 2.JPG`
+                // placed alongside an older already-processed `DSC0xxxx.JPG`) over already-stamped files (rank 1).
+                let priorityRank: Int
+                if cand.alreadyAppliedBackdropID == nil {
+                    priorityRank = 0
+                } else if sameApplied {
+                    priorityRank = 1
+                } else {
+                    priorityRank = 2
+                }
+                
                 pass1Pool.append(
                     Pass1MatchCandidate(
                         entryIdx: entryIdx,
                         candIdx: candIdx,
+                        candidatePriorityRank: priorityRank,
                         sameAppliedBackdrop: sameApplied,
                         timeDiff: timeDiff,
                         sigDist: sigDist,
@@ -654,8 +700,8 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
         }
         
         pass1Pool.sort { a, b in
-            if a.sameAppliedBackdrop != b.sameAppliedBackdrop {
-                return a.sameAppliedBackdrop && !b.sameAppliedBackdrop
+            if a.candidatePriorityRank != b.candidatePriorityRank {
+                return a.candidatePriorityRank < b.candidatePriorityRank
             }
             if abs(a.timeDiff - b.timeDiff) > 0.05 {
                 return a.timeDiff < b.timeDiff

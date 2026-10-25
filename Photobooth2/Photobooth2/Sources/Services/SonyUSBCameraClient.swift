@@ -1110,11 +1110,12 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         return (UIImage(cgImage: boostedCG, scale: image.scale, orientation: image.imageOrientation), subjectSrgbLuma)
     }
     
-    /// Measures center-weighted sRGB scene luminance (`subjectSrgbY`, discarding only the top 5% specular
-    /// pinpoints so small lamps don't skew dark-room metering) and the 90th-percentile highlight luminance
-    /// (`p90SrgbY`, used to prevent blowing out faces/walls in dim or high-contrast shots).
+    /// Measures center-weighted sRGB scene luminance (`subjectSrgbY`, discarding only the top 2% specular
+    /// pinpoints so small lamps don't skew dark-room metering) and the 98th-percentile highlight peak RGB channel
+    /// (`p90SrgbY`, measuring `max(R, G, B)` at the 98th weighted percentile so studio strobe subjects against dark
+    /// curtains or wearing dark costumes never overexpose or clip warm skin/red channels into yellow).
     nonisolated static func measureSceneLuminance(_ cgImage: CGImage) -> (subjectSrgbY: Double, p90SrgbY: Double) {
-        let sampleSize = 24
+        let sampleSize = 48
         var pixels = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(
@@ -1128,57 +1129,72 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         ) else {
             return (0.5, 0.7)
         }
-        ctx.interpolationQuality = .low
+        ctx.interpolationQuality = .medium
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
         
         struct Sample {
             let srgbY: Double
+            let peakRGB: Double
             let weight: Double
         }
         
         var samples: [Sample] = []
         samples.reserveCapacity(sampleSize * sampleSize)
+        var totalWeight = 0.0
         
         for y in 0..<sampleSize {
-            let isCenterY = (y >= sampleSize / 4) && (y < (sampleSize * 3) / 4)
+            let isCenterY = (y >= sampleSize / 5) && (y < (sampleSize * 4) / 5)
             for x in 0..<sampleSize {
-                let isCenterX = (x >= sampleSize / 4) && (x < (sampleSize * 3) / 4)
+                let isCenterX = (x >= sampleSize / 5) && (x < (sampleSize * 4) / 5)
                 let offset = (y * sampleSize + x) * 4
                 let r = Double(pixels[offset]) / 255.0
                 let g = Double(pixels[offset + 1]) / 255.0
                 let b = Double(pixels[offset + 2]) / 255.0
                 
                 let srgbY = 0.2126 * r + 0.7152 * g + 0.0722 * b
-                let weight = (isCenterX && isCenterY) ? 1.8 : 1.0
-                samples.append(Sample(srgbY: srgbY, weight: weight))
+                let peakRGB = max(r, max(g, b))
+                let weight = (isCenterX && isCenterY) ? 2.0 : 1.0
+                samples.append(Sample(srgbY: srgbY, peakRGB: peakRGB, weight: weight))
+                totalWeight += weight
             }
         }
         
-        samples.sort { $0.srgbY < $1.srgbY }
-        let p90Index = min(samples.count - 1, max(0, Int(Double(samples.count) * 0.90)))
-        let p90SrgbY = samples[p90Index].srgbY
-        
-        // Discard only the brightest 5% specular pinpoints (e.g. a small bulb in frame)
-        let keepCount = max(1, Int(Double(samples.count) * 0.95))
-        var weightedSrgbSum = 0.0
-        var totalWeight = 0.0
-        for i in 0..<keepCount {
-            let s = samples[i]
-            weightedSrgbSum += s.srgbY * s.weight
-            totalWeight += s.weight
+        // 99th weighted percentile of peak RGB channel max(R, G, B) protects lit faces/skin/clothing
+        // even when a small subject occupies only 1.5%..5% of a dark studio backdrop curtain,
+        // while still ignoring < 1% specular pinpoints (e.g. a small background bulb).
+        let byPeak = samples.sorted { $0.peakRGB < $1.peakRGB }
+        var cumWeight = 0.0
+        var highlightPeakRGB = byPeak.last?.peakRGB ?? 0.8
+        for s in byPeak {
+            cumWeight += s.weight
+            if cumWeight >= totalWeight * 0.99 {
+                highlightPeakRGB = s.peakRGB
+                break
+            }
         }
         
-        guard totalWeight > 0 else { return (0.5, p90SrgbY) }
-        return (weightedSrgbSum / totalWeight, p90SrgbY)
+        // Discard only the brightest 1% specular pinpoints when averaging scene luminance
+        let byY = samples.sorted { $0.srgbY < $1.srgbY }
+        let keepCount = max(1, Int(Double(byY.count) * 0.99))
+        var weightedSrgbSum = 0.0
+        var keptWeight = 0.0
+        for i in 0..<keepCount {
+            let s = byY[i]
+            weightedSrgbSum += s.srgbY * s.weight
+            keptWeight += s.weight
+        }
+        
+        guard keptWeight > 0 else { return (0.5, highlightPeakRGB) }
+        return (weightedSrgbSum / keptWeight, highlightPeakRGB)
     }
     
-    /// Simple, robust, GPU-native Lightroom-style Auto Exposure + very light GPU de-graining:
+    /// Simple, robust, GPU-native Auto Exposure + very light GPU de-graining:
     /// - Runs 100% on the GPU via `CoreImage` in `< 4 ms` per frame (zero CPU pixel/blur loops).
-    /// - Uses pure linear-light `CIExposureAdjust` (matching Lightroom's Exposure adjustment) with highlight protection
-    ///   (`p90SrgbY`) and `inputShadowAmount = 0.0` so deep shadows scale linearly along the sRGB toe without
-    ///   the 45x LSB quantization cliff (`0 -> 45`) caused by `CIHighlightShadowAdjust` shadow lifting + `CIGammaAdjust`.
-    /// - Applies very light GPU `CINoiseReduction` (`inputNoiseLevel = 0.015`) when lifting low-light still captures
-    ///   or when smoothing a Sony `0xFFFFC002` Live View hardware-autogain fallback frame.
+    /// - Uses pure linear-light `CIExposureAdjust` bounded by the 98th-percentile peak RGB channel (`highlightPeakRGB`)
+    ///   so well-exposed studio strobe portraits against dark curtains or dark costumes are left untouched (`ev = 0.0`)
+    ///   and warm skin tones or red clothing never clip a single channel and shift toward yellow.
+    /// - Applies gentle proportional chroma tempering via `CIColorControls` when lifting exposure so boosted images
+    ///   never over-saturate, plus light `CINoiseReduction` (`inputNoiseLevel = 0.015`) on lifted low-light stills.
     nonisolated static func adjustCGImageExposureIfNeeded(
         _ cgImage: CGImage,
         ciContext: CIContext,
@@ -1189,18 +1205,16 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         enableNoiseReduction: Bool = true,
         forceLightDegrain: Bool = false
     ) -> (CGImage, Double) {
-        let (subjectSrgbY, p90SrgbY) = measureSceneLuminance(cgImage)
+        let (subjectSrgbY, highlightPeakRGB) = measureSceneLuminance(cgImage)
+        let highlightCeiling = enableNoiseReduction ? 0.72 : 0.76
         
         var ev: Double = 0.0
-        if subjectSrgbY < triggerThresholdSrgb && subjectSrgbY >= minRecoverableSrgbLuma && p90SrgbY < 0.78 {
+        if subjectSrgbY < triggerThresholdSrgb && subjectSrgbY >= minRecoverableSrgbLuma && highlightPeakRGB < highlightCeiling {
             let safeLuma = max(subjectSrgbY, 0.035)
-            ev = min(max(log2(targetSrgbLuma / safeLuma) * 1.45, 0.0), maxEVBoost)
-            
-            // Protect highlights (faces, hands, bright walls) from blowing out past 0.80 sRGB
-            if p90SrgbY > 0.22 {
-                let highlightSafeEV = max(0.0, log2(0.80 / p90SrgbY) * 1.65)
-                ev = min(ev, highlightSafeEV)
-            }
+            let lumaEV = min(max(log2(targetSrgbLuma / safeLuma) * 1.40, 0.0), maxEVBoost)
+            let safePeak = max(highlightPeakRGB, 0.04)
+            let highlightSafeEV = max(0.0, log2(highlightCeiling / safePeak) * 1.65)
+            ev = min(lumaEV, highlightSafeEV)
         }
         
         let shouldApplyExposure = (ev > 0.04)
@@ -1213,7 +1227,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
         let ciInput = CIImage(cgImage: cgImage)
         var currentCI = ciInput
         
-        // 1. Pure linear-light exposure gain (Lightroom "Auto Exposure" equivalent)
+        // 1. Pure linear-light exposure gain bounded by highlight peak RGB headroom
         if shouldApplyExposure, let exposureFilter = CIFilter(name: "CIExposureAdjust") {
             exposureFilter.setValue(currentCI, forKey: kCIInputImageKey)
             exposureFilter.setValue(ev, forKey: kCIInputEVKey)
@@ -1222,21 +1236,10 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             }
         }
         
-        // 2. Smooth highlight shoulder roll-off with ZERO shadow lift (inputShadowAmount = 0.0)
-        //    so 8-bit shadow LSBs never experience a non-linear quantization cliff.
-        if ev > 0.5, let highlightFilter = CIFilter(name: "CIHighlightShadowAdjust") {
-            highlightFilter.setValue(currentCI, forKey: kCIInputImageKey)
-            highlightFilter.setValue(0.0, forKey: "inputShadowAmount")
-            highlightFilter.setValue(0.85, forKey: "inputHighlightAmount")
-            if let out = highlightFilter.outputImage {
-                currentCI = out
-            }
-        }
-        
-        // 3. In very low light (subjectSrgbY < 0.10), gently temper chroma saturation (0.88..1.0)
-        //    so 8-bit 4:2:0 JPEG shadow chroma noise is not over-saturated when lifted.
-        if shouldApplyExposure && subjectSrgbY < 0.10, let colorFilter = CIFilter(name: "CIColorControls") {
-            let sat = max(0.88, min(1.0, 0.88 + (subjectSrgbY / 0.10) * 0.12))
+        // 2. Gently temper chroma saturation proportionally when lifting exposure so warm skin tones
+        //    and shadow chroma noise never over-saturate or shift yellow when boosted.
+        if shouldApplyExposure && (ev > 0.15 || subjectSrgbY < 0.10), let colorFilter = CIFilter(name: "CIColorControls") {
+            let sat = max(0.88, min(1.0, 1.0 - ev * 0.035))
             colorFilter.setValue(currentCI, forKey: kCIInputImageKey)
             colorFilter.setValue(sat, forKey: kCIInputSaturationKey)
             if let out = colorFilter.outputImage {
@@ -1244,7 +1247,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             }
         }
         
-        // 4. Very light GPU noise reduction on low-light still captures or Live View autogain fallback
+        // 3. Very light GPU noise reduction on low-light still captures or Live View autogain fallback
         //    to take the edge off high-ISO graininess without softening facial details or creating halos.
         if shouldApplyDegrain, let nrFilter = CIFilter(name: "CINoiseReduction") {
             nrFilter.setValue(currentCI, forKey: kCIInputImageKey)

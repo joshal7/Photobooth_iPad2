@@ -52,7 +52,7 @@ func assertEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: String, li
 let ciContext = CIContext(options: [.useSoftwareRenderer: false, .cacheIntermediates: false])
 
 func measureSceneLuminance(_ cgImage: CGImage) -> (subjectSrgbY: Double, p90SrgbY: Double) {
-    let sampleSize = 24
+    let sampleSize = 48
     var pixels = [UInt8](repeating: 0, count: sampleSize * sampleSize * 4)
     let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     guard let ctx = CGContext(
@@ -66,59 +66,71 @@ func measureSceneLuminance(_ cgImage: CGImage) -> (subjectSrgbY: Double, p90Srgb
     ) else {
         return (0.5, 0.7)
     }
-    ctx.interpolationQuality = .low
+    ctx.interpolationQuality = .medium
     ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: sampleSize, height: sampleSize))
     
     struct Sample {
         let srgbY: Double
+        let peakRGB: Double
         let weight: Double
     }
     
     var samples: [Sample] = []
     samples.reserveCapacity(sampleSize * sampleSize)
+    var totalWeight = 0.0
     
     for y in 0..<sampleSize {
-        let isCenterY = (y >= sampleSize / 4) && (y < (sampleSize * 3) / 4)
+        let isCenterY = (y >= sampleSize / 5) && (y < (sampleSize * 4) / 5)
         for x in 0..<sampleSize {
-            let isCenterX = (x >= sampleSize / 4) && (x < (sampleSize * 3) / 4)
+            let isCenterX = (x >= sampleSize / 5) && (x < (sampleSize * 4) / 5)
             let offset = (y * sampleSize + x) * 4
             let r = Double(pixels[offset]) / 255.0
             let g = Double(pixels[offset + 1]) / 255.0
             let b = Double(pixels[offset + 2]) / 255.0
             
             let srgbY = 0.2126 * r + 0.7152 * g + 0.0722 * b
-            let weight = (isCenterX && isCenterY) ? 1.8 : 1.0
-            samples.append(Sample(srgbY: srgbY, weight: weight))
+            let peakRGB = max(r, max(g, b))
+            let weight = (isCenterX && isCenterY) ? 2.0 : 1.0
+            samples.append(Sample(srgbY: srgbY, peakRGB: peakRGB, weight: weight))
+            totalWeight += weight
         }
     }
     
-    samples.sort { $0.srgbY < $1.srgbY }
-    let p90Index = min(samples.count - 1, max(0, Int(Double(samples.count) * 0.90)))
-    let p90SrgbY = samples[p90Index].srgbY
-    
-    let keepCount = max(1, Int(Double(samples.count) * 0.95))
-    var weightedSrgbSum = 0.0
-    var totalWeight = 0.0
-    for i in 0..<keepCount {
-        let s = samples[i]
-        weightedSrgbSum += s.srgbY * s.weight
-        totalWeight += s.weight
+    let byPeak = samples.sorted { $0.peakRGB < $1.peakRGB }
+    var cumWeight = 0.0
+    var highlightPeakRGB = byPeak.last?.peakRGB ?? 0.8
+    for s in byPeak {
+        cumWeight += s.weight
+        if cumWeight >= totalWeight * 0.99 {
+            highlightPeakRGB = s.peakRGB
+            break
+        }
     }
     
-    guard totalWeight > 0 else { return (0.5, p90SrgbY) }
-    return (weightedSrgbSum / totalWeight, p90SrgbY)
+    let byY = samples.sorted { $0.srgbY < $1.srgbY }
+    let keepCount = max(1, Int(Double(byY.count) * 0.99))
+    var weightedSrgbSum = 0.0
+    var keptWeight = 0.0
+    for i in 0..<keepCount {
+        let s = byY[i]
+        weightedSrgbSum += s.srgbY * s.weight
+        keptWeight += s.weight
+    }
+    
+    guard keptWeight > 0 else { return (0.5, highlightPeakRGB) }
+    return (weightedSrgbSum / keptWeight, highlightPeakRGB)
 }
 
 func autoExposeCapturedCGImage(_ cgImage: CGImage, forceLightDegrain: Bool = false) -> CGImage {
-    let (subjectSrgbY, p90SrgbY) = measureSceneLuminance(cgImage)
+    let (subjectSrgbY, highlightPeakRGB) = measureSceneLuminance(cgImage)
+    let highlightCeiling = 0.72
     var ev: Double = 0.0
-    if subjectSrgbY < 0.38 && p90SrgbY < 0.78 {
+    if subjectSrgbY < 0.38 && highlightPeakRGB < highlightCeiling {
         let safeLuma = max(subjectSrgbY, 0.035)
-        ev = min(max(log2(0.40 / safeLuma) * 1.45, 0.0), 3.2)
-        if p90SrgbY > 0.22 {
-            let highlightSafeEV = max(0.0, log2(0.80 / p90SrgbY) * 1.65)
-            ev = min(ev, highlightSafeEV)
-        }
+        let lumaEV = min(max(log2(0.40 / safeLuma) * 1.40, 0.0), 3.2)
+        let safePeak = max(highlightPeakRGB, 0.04)
+        let highlightSafeEV = max(0.0, log2(highlightCeiling / safePeak) * 1.65)
+        ev = min(lumaEV, highlightSafeEV)
     }
     let shouldApplyExposure = (ev > 0.04)
     let shouldApplyDegrain = min(cgImage.width, cgImage.height) >= 160 && (forceLightDegrain || ev > 0.65)
@@ -134,16 +146,8 @@ func autoExposeCapturedCGImage(_ cgImage: CGImage, forceLightDegrain: Bool = fal
             currentCI = out
         }
     }
-    if ev > 0.5, let highlightFilter = CIFilter(name: "CIHighlightShadowAdjust") {
-        highlightFilter.setValue(currentCI, forKey: kCIInputImageKey)
-        highlightFilter.setValue(0.0, forKey: "inputShadowAmount")
-        highlightFilter.setValue(0.85, forKey: "inputHighlightAmount")
-        if let out = highlightFilter.outputImage {
-            currentCI = out
-        }
-    }
-    if shouldApplyExposure && subjectSrgbY < 0.10, let colorFilter = CIFilter(name: "CIColorControls") {
-        let sat = max(0.88, min(1.0, 0.88 + (subjectSrgbY / 0.10) * 0.12))
+    if shouldApplyExposure && (ev > 0.15 || subjectSrgbY < 0.10), let colorFilter = CIFilter(name: "CIColorControls") {
+        let sat = max(0.88, min(1.0, 1.0 - ev * 0.035))
         colorFilter.setValue(currentCI, forKey: kCIInputImageKey)
         colorFilter.setValue(sat, forKey: kCIInputSaturationKey)
         if let out = colorFilter.outputImage {
@@ -170,23 +174,34 @@ func createEqualizedGIF(from urls: [URL], frameDuration: Double) -> URL? {
     let frameProperties: [String: Any] = [kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFDelayTime as String: frameDuration]]
     CGImageDestinationSetProperties(destination, fileProperties as CFDictionary)
     
-    struct FrameEntry { let cgImage: CGImage; let luma: Double }
+    struct FrameEntry { let cgImage: CGImage; let luma: Double; let highlightPeak: Double }
     var loadedFrames: [FrameEntry] = []
     for url in urls {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
               let rawCG = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
         let isAlreadyNormalizedSonyFrame = url.lastPathComponent.hasPrefix("sony_")
         let baseCG = isAlreadyNormalizedSonyFrame ? rawCG : autoExposeCapturedCGImage(rawCG)
-        let (luma, _) = measureSceneLuminance(baseCG)
-        loadedFrames.append(FrameEntry(cgImage: baseCG, luma: max(luma, 0.06)))
+        let (luma, highlightPeak) = measureSceneLuminance(baseCG)
+        loadedFrames.append(FrameEntry(cgImage: baseCG, luma: max(luma, 0.06), highlightPeak: max(highlightPeak, 0.06)))
     }
     guard !loadedFrames.isEmpty else { return nil }
     let sorted = loadedFrames.map(\.luma).sorted()
+    let sortedPeaks = loadedFrames.map(\.highlightPeak).sorted()
     let mid = sorted.count / 2
     let medianLuma = (sorted.count % 2 == 0 && sorted.count >= 2) ? (sorted[mid - 1] + sorted[mid]) * 0.5 : sorted[mid]
+    let medianPeak = (sortedPeaks.count % 2 == 0 && sortedPeaks.count >= 2) ? (sortedPeaks[mid - 1] + sortedPeaks[mid]) * 0.5 : sortedPeaks[mid]
     
     for entry in loadedFrames {
-        let clampedDeltaEV = min(max(2.2 * log2(medianLuma / entry.luma), -1.20), 1.20)
+        let lumaDeltaEV = 2.2 * log2(medianLuma / entry.luma)
+        let peakDeltaEV = 2.2 * log2(medianPeak / entry.highlightPeak)
+        let agreedDeltaEV: Double
+        if lumaDeltaEV >= 0 {
+            let headroomEV = entry.highlightPeak < 0.72 ? max(0.0, log2(0.72 / entry.highlightPeak) * 1.65) : 0.0
+            agreedDeltaEV = min(lumaDeltaEV, min(max(0.0, peakDeltaEV), headroomEV))
+        } else {
+            agreedDeltaEV = max(lumaDeltaEV, min(0.0, peakDeltaEV))
+        }
+        let clampedDeltaEV = min(max(agreedDeltaEV, -0.85), 0.85)
         let finalCG: CGImage
         if abs(clampedDeltaEV) > 0.04, let exp = CIFilter(name: "CIExposureAdjust") {
             let ciIn = CIImage(cgImage: entry.cgImage)
@@ -465,6 +480,107 @@ if let benchCtx = CGContext(
     )
 }
 
+// 5d. Studio Strobe + Dark Sequin Curtain + Small Subject / Black Costume / Red Clothing Non-Overexposure & Non-Yellowing Verification
+//     Simulates Sony A7V manual (f/10, ISO 200, 1/125s) + Godox SK400II strobe where 92% of the frame is dark navy curtain
+//     or black costume (RGB 12,18,34) and a small child's strobe-lit face (RGB 218,174,148) + red shirt (RGB 228,38,32)
+//     occupies ~4% of the frame. Must NOT overexpose or clip R into yellow!
+let strobeW = 240, strobeH = 160
+var strobePixels = [UInt8](repeating: 255, count: strobeW * strobeH * 4)
+for y in 0..<strobeH {
+    for x in 0..<strobeW {
+        let idx = (y * strobeW + x) * 4
+        if x >= 106 && x < 134 && y >= 72 && y < 96 {
+            // Strobe-lit child face (~1.75% of frame, well-exposed warm skin tone)
+            strobePixels[idx]     = 218
+            strobePixels[idx + 1] = 174
+            strobePixels[idx + 2] = 148
+        } else if x >= 98 && x < 142 && y >= 96 && y < 156 {
+            // Black Halloween costume (~7% of frame) with small red emblem
+            if x >= 112 && x < 128 && y >= 110 && y < 126 {
+                strobePixels[idx]     = 228
+                strobePixels[idx + 1] = 38
+                strobePixels[idx + 2] = 32
+            } else {
+                strobePixels[idx]     = 18
+                strobePixels[idx + 1] = 18
+                strobePixels[idx + 2] = 20
+            }
+        } else {
+            // Dark navy sequin backdrop curtain (91% of frame)
+            strobePixels[idx]     = 12
+            strobePixels[idx + 1] = 18
+            strobePixels[idx + 2] = 34
+        }
+    }
+}
+if let strobeCtx = CGContext(
+    data: &strobePixels,
+    width: strobeW,
+    height: strobeH,
+    bitsPerComponent: 8,
+    bytesPerRow: strobeW * 4,
+    space: CGColorSpace(name: CGColorSpace.sRGB)!,
+    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+), let rawStrobeCG = strobeCtx.makeImage() {
+    let (strobeLuma, strobePeakRGB) = measureSceneLuminance(rawStrobeCG)
+    let outStrobeCG = autoExposeCapturedCGImage(rawStrobeCG)
+    let faceBefore = readPixelRGB(rawStrobeCG, x: 120, y: 84)
+    let faceAfter = readPixelRGB(outStrobeCG, x: 120, y: 84)
+    let redBefore = readPixelRGB(rawStrobeCG, x: 120, y: 118)
+    let redAfter = readPixelRGB(outStrobeCG, x: 120, y: 118)
+    assertTrue(
+        strobeLuma < 0.12 && strobePeakRGB >= 0.72 && outStrobeCG === rawStrobeCG &&
+        faceAfter.r == faceBefore.r && faceAfter.g == faceBefore.g && faceAfter.b == faceBefore.b &&
+        redAfter.r == redBefore.r && redAfter.g == redBefore.g,
+        String(format: "Studio strobe small subject on dark curtain (meanY=%.3f, p98Peak=%.3f) receives 0.0 EV boost with zero yellowing (face RGB=%d,%d,%d)", strobeLuma, strobePeakRGB, faceAfter.r, faceAfter.g, faceAfter.b)
+    )
+    
+    // Also verify GIF burst where guest stands tall in Frames 1-3 and crouches in Frame 4 against dark curtain
+    // under constant strobe illumination: Frame 4 must NOT be blown out by GIF equalization!
+    var tallPixels = strobePixels
+    for y in 40..<156 {
+        for x in 80..<160 {
+            let idx = (y * strobeW + x) * 4
+            tallPixels[idx]     = 216
+            tallPixels[idx + 1] = 172
+            tallPixels[idx + 2] = 146
+        }
+    }
+    if let tallCtx = CGContext(
+        data: &tallPixels,
+        width: strobeW,
+        height: strobeH,
+        bitsPerComponent: 8,
+        bytesPerRow: strobeW * 4,
+        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ), let tallStrobeCG = tallCtx.makeImage() {
+        var poseURLs: [URL] = []
+        for (idx, cg) in [tallStrobeCG, tallStrobeCG, tallStrobeCG, rawStrobeCG].enumerated() {
+            let u = tempDir.appendingPathComponent("sony_pose_\(idx)_\(UUID().uuidString).jpg")
+            writeJPEG(cg, to: u)
+            poseURLs.append(u)
+        }
+        if let poseGIFURL = createEqualizedGIF(from: poseURLs, frameDuration: 0.25),
+           let refGIFURL = createEqualizedGIF(from: [poseURLs[3], poseURLs[3]], frameDuration: 0.25),
+           let poseSrc = CGImageSourceCreateWithURL(poseGIFURL as CFURL, nil),
+           let refSrc = CGImageSourceCreateWithURL(refGIFURL as CFURL, nil),
+           CGImageSourceGetCount(poseSrc) == 4,
+           let frame3CG = CGImageSourceCreateImageAtIndex(poseSrc, 3, nil),
+           let refCG = CGImageSourceCreateImageAtIndex(refSrc, 0, nil) {
+            let crouchFace = readPixelRGB(frame3CG, x: 120, y: 84)
+            let refFace = readPixelRGB(refCG, x: 120, y: 84)
+            assertTrue(
+                abs(crouchFace.r - refFace.r) <= 2 && abs(crouchFace.g - refFace.g) <= 2,
+                "GIF burst with guest crouching against dark curtain under constant strobe preserves face exposure without blowing out (face RGB=\(crouchFace.r),\(crouchFace.g),\(crouchFace.b) vs reference \(refFace.r),\(refFace.g),\(refFace.b))"
+            )
+            try? FileManager.default.removeItem(at: poseGIFURL)
+            try? FileManager.default.removeItem(at: refGIFURL)
+        }
+        for u in poseURLs { try? FileManager.default.removeItem(at: u) }
+    }
+}
+
 // 6. Top-Center Pill Wait Bar (10% trailing -> 30% leading left-to-right fill) & Photo/GIF Progress Dot Verification
 func computePillWaitBarFillWidth(pillWidth: Double, progress: Double) -> Double {
     let clamped = min(max(progress, 0.0), 1.0)
@@ -649,8 +765,8 @@ assertEqual(
 )
 assertEqual(
     discoveredStarters.last?.id,
-    "703_zach_levine_bar_mitzvah",
-    "Last backdrop in carousel/Settings sort order is 703_zach_levine_bar_mitzvah ('\(discoveredStarters.last?.displayName ?? "")')"
+    "705_bathroom_toilet_ipad",
+    "Last backdrop in carousel/Settings sort order is 705_bathroom_toilet_ipad ('\(discoveredStarters.last?.displayName ?? "")')"
 )
 
 // 7C. Resolution Auto-Scaling & 3-Layer Compositing Order (Background -> Segmented Subject -> Foreground Frame)

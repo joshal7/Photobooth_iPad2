@@ -1068,6 +1068,101 @@ enum AutomatedVerificationSuite {
             )
         }
         
+        // 9. Studio Strobe + Dark Sequin Curtain + Small Subject / Black Costume / Red Clothing Non-Overexposure & Non-Yellowing Verification
+        let strobeW = 240, strobeH = 160
+        var strobePixels = [UInt8](repeating: 255, count: strobeW * strobeH * 4)
+        for y in 0..<strobeH {
+            for x in 0..<strobeW {
+                let idx = (y * strobeW + x) * 4
+                if x >= 106 && x < 134 && y >= 72 && y < 96 {
+                    strobePixels[idx]     = 218
+                    strobePixels[idx + 1] = 174
+                    strobePixels[idx + 2] = 148
+                } else if x >= 98 && x < 142 && y >= 96 && y < 156 {
+                    if x >= 112 && x < 128 && y >= 110 && y < 126 {
+                        strobePixels[idx]     = 228
+                        strobePixels[idx + 1] = 38
+                        strobePixels[idx + 2] = 32
+                    } else {
+                        strobePixels[idx]     = 18
+                        strobePixels[idx + 1] = 18
+                        strobePixels[idx + 2] = 20
+                    }
+                } else {
+                    strobePixels[idx]     = 12
+                    strobePixels[idx + 1] = 18
+                    strobePixels[idx + 2] = 34
+                }
+            }
+        }
+        if let strobeCtx = CGContext(
+            data: &strobePixels,
+            width: strobeW,
+            height: strobeH,
+            bitsPerComponent: 8,
+            bytesPerRow: strobeW * 4,
+            space: deblockCS,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ), let rawStrobeCG = strobeCtx.makeImage() {
+            let (strobeLuma, strobePeakRGB) = SonyUSBCameraClient.measureSceneLuminance(rawStrobeCG)
+            let outStrobeCG = SonyUSBCameraClient.autoExposeCapturedCGImage(rawStrobeCG, ciContext: ciContext)
+            let faceBefore = readPixelRGB(rawStrobeCG, x: 120, y: 84)
+            let faceAfter = readPixelRGB(outStrobeCG, x: 120, y: 84)
+            let redBefore = readPixelRGB(rawStrobeCG, x: 120, y: 118)
+            let redAfter = readPixelRGB(outStrobeCG, x: 120, y: 118)
+            assertTrue(
+                strobeLuma < 0.12 && strobePeakRGB >= 0.72 && outStrobeCG === rawStrobeCG &&
+                faceAfter.r == faceBefore.r && faceAfter.g == faceBefore.g && faceAfter.b == faceBefore.b &&
+                redAfter.r == redBefore.r && redAfter.g == redBefore.g,
+                String(format: "Studio strobe small subject on dark curtain (meanY=%.3f, p98Peak=%.3f) receives 0.0 EV boost with zero yellowing (face RGB=%d,%d,%d)", strobeLuma, strobePeakRGB, faceAfter.r, faceAfter.g, faceAfter.b)
+            )
+            
+            var tallPixels = strobePixels
+            for y in 40..<156 {
+                for x in 80..<160 {
+                    let idx = (y * strobeW + x) * 4
+                    tallPixels[idx]     = 216
+                    tallPixels[idx + 1] = 172
+                    tallPixels[idx + 2] = 146
+                }
+            }
+            if let tallCtx = CGContext(
+                data: &tallPixels,
+                width: strobeW,
+                height: strobeH,
+                bitsPerComponent: 8,
+                bytesPerRow: strobeW * 4,
+                space: deblockCS,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ), let tallStrobeCG = tallCtx.makeImage() {
+                var poseURLs: [URL] = []
+                for (idx, cg) in [tallStrobeCG, tallStrobeCG, tallStrobeCG, rawStrobeCG].enumerated() {
+                    let u = tempDir.appendingPathComponent("sony_pose_\(idx)_\(UUID().uuidString).jpg")
+                    try UIImage(cgImage: cg).jpegData(compressionQuality: 0.92)!.write(to: u)
+                    poseURLs.append(u)
+                }
+                if let poseGIFURL = GIFService.createGIF(from: poseURLs.map(\.absoluteString), frameDuration: 0.25),
+                   let refGIFURL = GIFService.createGIF(from: [poseURLs[3].absoluteString, poseURLs[3].absoluteString], frameDuration: 0.25),
+                   let poseSrc = CGImageSourceCreateWithURL(poseGIFURL as CFURL, nil),
+                   let refSrc = CGImageSourceCreateWithURL(refGIFURL as CFURL, nil),
+                   CGImageSourceGetCount(poseSrc) == 4,
+                   let frame3CG = CGImageSourceCreateImageAtIndex(poseSrc, 3, nil),
+                   let refCG = CGImageSourceCreateImageAtIndex(refSrc, 0, nil) {
+                    let fx = Int((Double(frame3CG.width) * 0.5).rounded())
+                    let fy = Int((Double(frame3CG.height) * 84.0 / 160.0).rounded())
+                    let crouchFace = readPixelRGB(frame3CG, x: fx, y: fy)
+                    let refFace = readPixelRGB(refCG, x: fx, y: fy)
+                    assertTrue(
+                        abs(crouchFace.r - refFace.r) <= 2 && abs(crouchFace.g - refFace.g) <= 2,
+                        "GIFService burst with guest crouching against dark curtain under constant strobe preserves face exposure without blowing out (face RGB=\(crouchFace.r),\(crouchFace.g),\(crouchFace.b) vs reference \(refFace.r),\(refFace.g),\(refFace.b))"
+                    )
+                    try? FileManager.default.removeItem(at: poseGIFURL)
+                    try? FileManager.default.removeItem(at: refGIFURL)
+                }
+                for u in poseURLs { try? FileManager.default.removeItem(at: u) }
+            }
+        }
+        
         try runBackdropAndForegroundQATests(ciContext: ciContext)
     }
     
