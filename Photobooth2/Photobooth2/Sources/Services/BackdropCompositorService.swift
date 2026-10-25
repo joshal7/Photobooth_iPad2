@@ -4,6 +4,8 @@ import CoreImage.CIFilterBuiltins
 import Vision
 import ImageIO
 import UIKit
+import Metal
+import ObjectiveC.runtime
 
 enum SegmentationQuality: Sendable {
     /// Uses Vision `.balanced` real-time video segmentation on the Apple Neural Engine
@@ -110,6 +112,54 @@ final class BackdropCompositorService: Sendable {
         private let accurateSegmentationLock = NSLock()
         private var reusableAccurateRequest: VNGeneratePersonSegmentationRequest?
         
+        /// Workaround for an Apple `Vision.framework` bug on "My Mac (Designed for iPad)" when Xcode's
+        /// Metal API Validation (`MTLDebugDevice` / `MTLDebugBuffer`) is active:
+        /// `-[VNBGRBilinearUpsampler applyEspressoMask:toImage:highResMaskBuffer:]` (called by
+        /// `VNInstanceMaskObservation.generateScaledMaskForImage`) allocates a `512x512` `MTLBuffer` with
+        /// `options: 0x10` (`MTLResourceStorageModeManaged`) on macOS, and then creates a `MTLTextureDescriptor`
+        /// without setting `resourceOptions`. Because the app binary targets iOS, `MTLTextureDescriptor` defaults
+        /// its `resourceOptions` to `0x0` (`MTLResourceStorageModeShared`), causing `MTLDebugBuffer` to abort with:
+        /// `failed assertion 'New Texture With Descriptor Validation resourceOptions (0x0) must match backing buffer resource options (0x10).'`.
+        /// Synchronizing the storage/cache mode bits on `MTLDebugDevice` and `MTLDebugBuffer` prevents the abort.
+        private static let didInstallMetalValidationWorkaround: Bool = {
+            _ = MTLCreateSystemDefaultDevice()
+            if let debugDeviceClass = NSClassFromString("MTLDebugDevice") {
+                let bSel = NSSelectorFromString("newBufferWithBytes:length:options:")
+                if let bMethod = class_getInstanceMethod(debugDeviceClass, bSel) {
+                    typealias OrigBufIMP = @convention(c) (AnyObject, Selector, UnsafeRawPointer, Int, MTLResourceOptions) -> AnyObject?
+                    let origBufIMP = unsafeBitCast(method_getImplementation(bMethod), to: OrigBufIMP.self)
+                    let bBlock: @convention(block) (AnyObject, UnsafeRawPointer, Int, MTLResourceOptions) -> AnyObject? = { selfObj, ptr, len, opts in
+                        var adjustedOpts = opts
+                        if (opts.rawValue & 0xF0) == 0x10 {
+                            adjustedOpts = MTLResourceOptions(rawValue: opts.rawValue & ~UInt(0xF0))
+                        }
+                        return origBufIMP(selfObj, bSel, ptr, len, adjustedOpts)
+                    }
+                    method_setImplementation(bMethod, imp_implementationWithBlock(bBlock))
+                }
+            }
+            if let debugBufferClass = NSClassFromString("MTLDebugBuffer") {
+                let tSel = NSSelectorFromString("newTextureWithDescriptor:offset:bytesPerRow:")
+                if let tMethod = class_getInstanceMethod(debugBufferClass, tSel) {
+                    typealias OrigTexIMP = @convention(c) (AnyObject, Selector, MTLTextureDescriptor, Int, Int) -> AnyObject?
+                    let origTexIMP = unsafeBitCast(method_getImplementation(tMethod), to: OrigTexIMP.self)
+                    let tBlock: @convention(block) (AnyObject, MTLTextureDescriptor, Int, Int) -> AnyObject? = { selfObj, desc, offset, bytesPerRow in
+                        if let mtlBuf = selfObj as? MTLBuffer {
+                            let bufStorageAndCache = mtlBuf.resourceOptions.rawValue & 0xFF
+                            let descStorageAndCache = desc.resourceOptions.rawValue & 0xFF
+                            if descStorageAndCache != bufStorageAndCache {
+                                let merged = (desc.resourceOptions.rawValue & ~UInt(0xFF)) | bufStorageAndCache
+                                desc.resourceOptions = MTLResourceOptions(rawValue: merged)
+                            }
+                        }
+                        return origTexIMP(selfObj, tSel, desc, offset, bytesPerRow)
+                    }
+                    method_setImplementation(tMethod, imp_implementationWithBlock(tBlock))
+                }
+            }
+            return true
+        }()
+        
         func image(forKey key: String, loader: () -> CIImage?) -> CIImage? {
             lock.lock()
             if let existing = cache[key] {
@@ -189,6 +239,7 @@ final class BackdropCompositorService: Sendable {
         ) -> (mask: CIImage, isFullResolutionHybrid: Bool)? {
             accurateSegmentationLock.lock()
             defer { accurateSegmentationLock.unlock() }
+            _ = Self.didInstallMetalValidationWorkaround
             
             let rawExtent = ciImage.extent
             let w = rawExtent.width

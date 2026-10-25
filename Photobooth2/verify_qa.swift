@@ -1664,7 +1664,7 @@ assertEqual(
     "Live JIT execution of 15-entry user scenario (DSC09816..DSC09838) & SD card reset scenario produced 3 Snowy Peaks, 3 No-Background, and 3 Golden Gate Bridge"
 )
 
-// 7T. Hybrid .captureAccurate Segmentation (VNGenerateForegroundInstanceMaskRequest + VNGeneratePersonSegmentationRequest + 360x240 Hysteresis Limb Rescue)
+// 7T. Hybrid .captureAccurate Segmentation (VNGenerateForegroundInstanceMaskRequest + VNGeneratePersonSegmentationRequest + 360x240 Hysteresis Limb Rescue + MTLDebugBuffer iOS-on-Mac Workaround)
 let backdropCompositorSource = (try? String(contentsOfFile: "/Users/joshal/workspace/PhotoboothApp2/Photobooth2/Photobooth2/Sources/Services/BackdropCompositorService.swift", encoding: .utf8)) ?? ""
 assertTrue(
     backdropCompositorSource.contains("VNGenerateForegroundInstanceMaskRequest") &&
@@ -1672,8 +1672,10 @@ assertTrue(
     backdropCompositorSource.contains("clusterSeeds.count < 65 || farSeedCount < 25") &&
     backdropCompositorSource.contains("CIFilter.blendWithRedMask()") &&
     backdropCompositorSource.contains("CIMaximumCompositing") &&
-    backdropCompositorSource.contains("createSolidifiedMaskCIImage"),
-    "BackdropCompositorService implements hybrid ForegroundInstanceMask + PersonSegmentation pipeline with shadow-lifted Vision input, 360x240 hysteresis limb rescue, and solidified mask fallback"
+    backdropCompositorSource.contains("createSolidifiedMaskCIImage") &&
+    backdropCompositorSource.contains("didInstallMetalValidationWorkaround") &&
+    backdropCompositorSource.contains("newTextureWithDescriptor:offset:bytesPerRow:"),
+    "BackdropCompositorService implements hybrid ForegroundInstanceMask + PersonSegmentation pipeline with shadow-lifted Vision input, 360x240 hysteresis limb rescue, solidified mask fallback, and MTLDebugBuffer iOS-on-Mac validation workaround"
 )
 
 func qaHybridAccurateMask(mirroredCI: CIImage, extent: CGRect) -> CIImage? {
