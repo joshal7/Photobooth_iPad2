@@ -9,7 +9,9 @@ enum SegmentationQuality: Sendable {
     /// Uses Vision `.balanced` real-time video segmentation on the Apple Neural Engine
     /// combined with Hermite smoothstep matte solidification and motion-adaptive temporal EMA stabilization.
     case liveFast
-    /// Uses Vision `.accurate` high-resolution still segmentation with smoothstep matte solidification.
+    /// Uses a hybrid Vision `VNGenerateForegroundInstanceMaskRequest` + `VNGeneratePersonSegmentationRequest` (`.accurate`)
+    /// pipeline with shadow-lifted Vision input and `360x240` hysteresis limb rescue to preserve props/costumes/hair,
+    /// eliminate sequin curtain bleed, and recover shadowed limbs/hands.
     case captureAccurate
 }
 
@@ -181,39 +183,313 @@ final class BackdropCompositorService: Sendable {
             }
         }
         
-        func performAccurateSegmentation(on ciImage: CIImage) -> CIImage? {
+        func performAccurateSegmentation(
+            on ciImage: CIImage,
+            ciContext: CIContext
+        ) -> (mask: CIImage, isFullResolutionHybrid: Bool)? {
             accurateSegmentationLock.lock()
             defer { accurateSegmentationLock.unlock() }
             
-            let request: VNGeneratePersonSegmentationRequest
+            let rawExtent = ciImage.extent
+            let w = rawExtent.width
+            let h = rawExtent.height
+            guard w > 1, h > 1 else { return nil }
+            let extent = CGRect(x: 0, y: 0, width: w, height: h)
+            let normalizedCI = (rawExtent.minX != 0 || rawExtent.minY != 0)
+                ? ciImage.transformed(by: CGAffineTransform(translationX: -rawExtent.minX, y: -rawExtent.minY))
+                : ciImage
+            
+            // 1. Sample 360x240 RGB grid for scene luminance and hysteresis limb rescue
+            let gw = 360, gh = 240
+            let gExtent = CGRect(x: 0, y: 0, width: gw, height: gh)
+            let sx = CGFloat(gw) / w
+            let sy = CGFloat(gh) / h
+            let smallRGB = normalizedCI
+                .transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+                .cropped(to: gExtent)
+            var rgbBytes = [UInt8](repeating: 0, count: gw * gh * 4)
+            ciContext.render(
+                smallRGB,
+                toBitmap: &rgbBytes,
+                rowBytes: gw * 4,
+                bounds: gExtent,
+                format: .RGBA8,
+                colorSpace: CGColorSpaceCreateDeviceRGB()
+            )
+            
+            var lumaSum = 0
+            let cellCount = gw * gh
+            for i in 0..<cellCount {
+                lumaSum += (Int(rgbBytes[i * 4]) * 2 + Int(rgbBytes[i * 4 + 1]) * 5 + Int(rgbBytes[i * 4 + 2])) >> 3
+            }
+            let meanLuma = Double(lumaSum) / Double(cellCount)
+            
+            // 2. Build a shadow-lifted input image ONLY for the Vision neural network pass so dark hair,
+            //    black sleeves, and shadowed limbs cleanly separate from dark studio curtains without
+            //    altering the actual subject pixels.
+            let shadowAmt = meanLuma < 65.0 ? 0.62 : 0.45
+            let evAmt = meanLuma < 65.0 ? 0.52 : 0.35
+            let hs = CIFilter.highlightShadowAdjust()
+            hs.inputImage = normalizedCI
+            hs.shadowAmount = Float(shadowAmt)
+            hs.highlightAmount = 0.93
+            let ev = CIFilter.exposureAdjust()
+            ev.inputImage = hs.outputImage ?? normalizedCI
+            ev.ev = Float(evAmt)
+            let visionCI = (ev.outputImage ?? normalizedCI).cropped(to: extent)
+            
+            let personSeg: VNGeneratePersonSegmentationRequest
             if let existing = reusableAccurateRequest {
-                request = existing
+                personSeg = existing
             } else {
                 let req = VNGeneratePersonSegmentationRequest()
                 req.qualityLevel = .accurate
                 req.outputPixelFormat = kCVPixelFormatType_OneComponent8
                 reusableAccurateRequest = req
-                request = req
+                personSeg = req
+            }
+            let fgInst = VNGenerateForegroundInstanceMaskRequest()
+            
+            let handler = VNImageRequestHandler(ciImage: visionCI, options: [:])
+            do {
+                try handler.perform([fgInst, personSeg])
+            } catch {
+                // Fallback if running both requests together fails on an unsupported environment
+                do {
+                    try handler.perform([personSeg])
+                } catch {
+                    return nil
+                }
             }
             
-            let handler = VNImageRequestHandler(ciImage: ciImage, options: [:])
-            do {
-                try handler.perform([request])
-                guard let pixelBuffer = request.results?.first?.pixelBuffer else { return nil }
-                var scratchBuffer: [UInt8] = []
-                var w = 0
-                var h = 0
-                return Self.createSolidifiedMaskCIImage(
-                    from: pixelBuffer,
-                    lut: BackdropCompositorService.accurateMatteLUT,
-                    temporalBuffer: &scratchBuffer,
-                    previousWidth: &w,
-                    previousHeight: &h,
-                    enableTemporalSmoothing: false
-                )
-            } catch {
+            // 3. Hybrid Foreground Instance + Person Segmentation Limb-Rescue Path
+            if let obs = fgInst.results?.first,
+               !obs.allInstances.isEmpty,
+               let fgPB = try? obs.generateScaledMaskForImage(forInstances: obs.allInstances, from: handler),
+               let personPB = personSeg.results?.first?.pixelBuffer {
+                
+                let fgRawCI = CIImage(cvPixelBuffer: fgPB)
+                guard fgRawCI.extent.width > 0, fgRawCI.extent.height > 0 else { return nil }
+                let fgMaskCI = fgRawCI
+                    .transformed(by: CGAffineTransform(translationX: -fgRawCI.extent.minX, y: -fgRawCI.extent.minY))
+                    .transformed(by: CGAffineTransform(scaleX: w / fgRawCI.extent.width, y: h / fgRawCI.extent.height))
+                    .cropped(to: extent)
+                
+                let pRawCI = CIImage(cvPixelBuffer: personPB)
+                guard pRawCI.extent.width > 0, pRawCI.extent.height > 0 else { return nil }
+                let pMaskCI = pRawCI
+                    .transformed(by: CGAffineTransform(translationX: -pRawCI.extent.minX, y: -pRawCI.extent.minY))
+                    .transformed(by: CGAffineTransform(scaleX: w / pRawCI.extent.width, y: h / pRawCI.extent.height))
+                    .cropped(to: extent)
+                
+                let smallFg = fgMaskCI.transformed(by: CGAffineTransform(scaleX: sx, y: sy)).cropped(to: gExtent)
+                let smallP = pMaskCI.transformed(by: CGAffineTransform(scaleX: sx, y: sy)).cropped(to: gExtent)
+                
+                var fgBytes = [UInt8](repeating: 0, count: cellCount)
+                var pBytes = [UInt8](repeating: 0, count: cellCount)
+                ciContext.render(smallFg, toBitmap: &fgBytes, rowBytes: gw, bounds: gExtent, format: .R8, colorSpace: nil)
+                ciContext.render(smallP, toBitmap: &pBytes, rowBytes: gw, bounds: gExtent, format: .R8, colorSpace: nil)
+                
+                func isNearFg(_ x: Int, _ y: Int, rad: Int) -> Bool {
+                    let minY = max(0, y - rad), maxY = min(gh - 1, y + rad)
+                    let minX = max(0, x - rad), maxX = min(gw - 1, x + rad)
+                    for ny in minY...maxY {
+                        let row = ny * gw
+                        for nx in minX...maxX {
+                            if fgBytes[row + nx] >= 128 { return true }
+                        }
+                    }
+                    return false
+                }
+                
+                func isValidSeedColor(_ r: Int, _ g: Int, _ b: Int) -> Bool {
+                    return r >= 75 && (r - b) >= 15 && g >= 40
+                }
+                
+                // Identify disconnected missed-limb seeds where personSeg is confident (>= 200),
+                // fgInst missed (< 32 and not within 5 cells of fgInst), and color is warm skin/prop
+                var seedQueue: [Int] = []
+                for y in 0..<gh {
+                    for x in 0..<gw {
+                        let i = y * gw + x
+                        if fgBytes[i] < 32 && pBytes[i] >= 200 && !isNearFg(x, y, rad: 5) {
+                            let r = Int(rgbBytes[i * 4]), g = Int(rgbBytes[i * 4 + 1]), b = Int(rgbBytes[i * 4 + 2])
+                            if isValidSeedColor(r, g, b) {
+                                seedQueue.append(i)
+                            }
+                        }
+                    }
+                }
+                
+                var rescueRGBA = [UInt8](repeating: 0, count: cellCount * 4)
+                var rescuedCount = 0
+                let dirs = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)]
+                
+                if seedQueue.count >= 65 {
+                    var visitedSeed = [Bool](repeating: false, count: cellCount)
+                    for startIdx in seedQueue {
+                        if visitedSeed[startIdx] { continue }
+                        var clusterSeeds: [Int] = [startIdx]
+                        visitedSeed[startIdx] = true
+                        var farSeedCount = 0
+                        var head = 0
+                        while head < clusterSeeds.count {
+                            let c = clusterSeeds[head]; head += 1
+                            let cx = c % gw, cy = c / gw
+                            if !isNearFg(cx, cy, rad: 7) { farSeedCount += 1 }
+                            for dy in -4...4 {
+                                for dx in -4...4 {
+                                    let nx = cx + dx, ny = cy + dy
+                                    if nx >= 0 && nx < gw && ny >= 0 && ny < gh {
+                                        let ni = ny * gw + nx
+                                        if !visitedSeed[ni] && fgBytes[ni] < 32 && pBytes[ni] >= 200 && !isNearFg(nx, ny, rad: 5) {
+                                            let r = Int(rgbBytes[ni * 4]), g = Int(rgbBytes[ni * 4 + 1]), b = Int(rgbBytes[ni * 4 + 2])
+                                            if isValidSeedColor(r, g, b) {
+                                                visitedSeed[ni] = true
+                                                clusterSeeds.append(ni)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if clusterSeeds.count < 65 || farSeedCount < 25 { continue }
+                        
+                        var minX = gw, maxX = 0, minY = gh, maxY = 0
+                        for idx in clusterSeeds {
+                            let x = idx % gw, y = idx / gw
+                            if x < minX { minX = x }; if x > maxX { maxX = x }
+                            if y < minY { minY = y }; if y > maxY { maxY = y }
+                        }
+                        let allowMinX = max(0, minX - gw / 5), allowMaxX = min(gw - 1, maxX + gw / 5)
+                        let allowMinY = max(0, minY - gh / 5), allowMaxY = min(gh - 1, maxY + gh / 5)
+                        
+                        var q = clusterSeeds
+                        var visitedGrow = [Bool](repeating: false, count: cellCount)
+                        for idx in q {
+                            visitedGrow[idx] = true
+                            rescueRGBA[idx * 4] = 255
+                            rescueRGBA[idx * 4 + 1] = 255
+                            rescueRGBA[idx * 4 + 2] = 255
+                            rescueRGBA[idx * 4 + 3] = 255
+                        }
+                        var gHead = 0
+                        while gHead < q.count {
+                            let curr = q[gHead]; gHead += 1
+                            let cx = curr % gw, cy = curr / gw
+                            for (dx, dy) in dirs {
+                                let nx = cx + dx, ny = cy + dy
+                                if nx >= allowMinX && nx <= allowMaxX && ny >= allowMinY && ny <= allowMaxY {
+                                    let ni = ny * gw + nx
+                                    let r = Int(rgbBytes[ni * 4]), b = Int(rgbBytes[ni * 4 + 2])
+                                    let pVal = pBytes[ni]
+                                    if !visitedGrow[ni] && pVal >= 120 && (b - r) < 8 {
+                                        visitedGrow[ni] = true
+                                        rescueRGBA[ni * 4] = 255
+                                        rescueRGBA[ni * 4 + 1] = 255
+                                        rescueRGBA[ni * 4 + 2] = 255
+                                        rescueRGBA[ni * 4 + 3] = 255
+                                        q.append(ni)
+                                    }
+                                }
+                            }
+                        }
+                        rescuedCount += q.count
+                    }
+                }
+                
+                // Normalize fgMaskCI to R=G=B=r, A=1 clamped to [0, 1]
+                let normFg = fgMaskCI.applyingFilter("CIColorMatrix", parameters: [
+                    "inputRVector": CIVector(x: 1, y: 0, z: 0, w: 0),
+                    "inputGVector": CIVector(x: 1, y: 0, z: 0, w: 0),
+                    "inputBVector": CIVector(x: 1, y: 0, z: 0, w: 0),
+                    "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                    "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 1)
+                ]).applyingFilter("CIColorClamp", parameters: [
+                    "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 1),
+                    "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+                ]).cropped(to: extent)
+                
+                if rescuedCount > 0 {
+                    var dilatedRGBA = rescueRGBA
+                    for y in 1..<(gh - 1) {
+                        for x in 1..<(gw - 1) {
+                            let i = y * gw + x
+                            if rescueRGBA[i * 4] == 255 {
+                                for dy in -1...1 {
+                                    for dx in -1...1 {
+                                        let ni = (y + dy) * gw + (x + dx)
+                                        let r = Int(rgbBytes[ni * 4]), b = Int(rgbBytes[ni * 4 + 2])
+                                        if (b - r) < 8 {
+                                            dilatedRGBA[ni * 4] = 255
+                                            dilatedRGBA[ni * 4 + 1] = 255
+                                            dilatedRGBA[ni * 4 + 2] = 255
+                                            dilatedRGBA[ni * 4 + 3] = 255
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let rescueData = Data(dilatedRGBA)
+                    let rescueSmallCI = CIImage(
+                        bitmapData: rescueData,
+                        bytesPerRow: gw * 4,
+                        size: CGSize(width: gw, height: gh),
+                        format: .RGBA8,
+                        colorSpace: nil
+                    )
+                    let rescueScaled = rescueSmallCI
+                        .clampedToExtent()
+                        .applyingFilter("CIGaussianBlur", parameters: [kCIInputRadiusKey: 1.5])
+                        .cropped(to: gExtent)
+                        .transformed(by: CGAffineTransform(scaleX: w / CGFloat(gw), y: h / CGFloat(gh)))
+                        .cropped(to: extent)
+                    
+                    let boostedPerson = pMaskCI.applyingFilter("CIColorMatrix", parameters: [
+                        "inputRVector": CIVector(x: 4.5, y: 0, z: 0, w: 0),
+                        "inputGVector": CIVector(x: 4.5, y: 0, z: 0, w: 0),
+                        "inputBVector": CIVector(x: 4.5, y: 0, z: 0, w: 0),
+                        "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                        "inputBiasVector": CIVector(x: -1.0, y: -1.0, z: -1.0, w: 1.0)
+                    ]).applyingFilter("CIColorClamp", parameters: [
+                        "inputMinComponents": CIVector(x: 0, y: 0, z: 0, w: 1),
+                        "inputMaxComponents": CIVector(x: 1, y: 1, z: 1, w: 1)
+                    ]).cropped(to: extent)
+                    
+                    let gateFilter = CIFilter.blendWithRedMask()
+                    gateFilter.inputImage = boostedPerson
+                    gateFilter.backgroundImage = CIImage(color: .black).cropped(to: extent)
+                    gateFilter.maskImage = rescueScaled
+                    if let gatedPerson = gateFilter.outputImage?.cropped(to: extent),
+                       let maxF = CIFilter(name: "CIMaximumCompositing") {
+                        maxF.setValue(normFg, forKey: kCIInputImageKey)
+                        maxF.setValue(gatedPerson, forKey: kCIInputBackgroundImageKey)
+                        if let fused = maxF.outputImage?.cropped(to: extent) {
+                            return (fused, true)
+                        }
+                    }
+                }
+                
+                return (normFg, true)
+            }
+            
+            // 4. Fallback to solidified person segmentation if fgInst produced no instances (e.g. flat synthetic test images)
+            guard let pixelBuffer = personSeg.results?.first?.pixelBuffer else { return nil }
+            var scratchBuffer: [UInt8] = []
+            var pw = 0
+            var ph = 0
+            guard let fallbackMask = Self.createSolidifiedMaskCIImage(
+                from: pixelBuffer,
+                lut: BackdropCompositorService.accurateMatteLUT,
+                temporalBuffer: &scratchBuffer,
+                previousWidth: &pw,
+                previousHeight: &ph,
+                enableTemporalSmoothing: false
+            ) else {
                 return nil
             }
+            return (fallbackMask, false)
         }
         
         private static func createSolidifiedMaskCIImage(
@@ -368,6 +644,7 @@ final class BackdropCompositorService: Sendable {
                 for: normalizedSubject,
                 targetExtent: targetExtent,
                 quality: quality,
+                ciContext: ciContext,
                 customMaskProvider: customMaskProvider
             ) {
                 if let blendFilter = CIFilter(name: "CIBlendWithMask") {
@@ -396,6 +673,7 @@ final class BackdropCompositorService: Sendable {
         for subjectCI: CIImage,
         targetExtent: CGRect,
         quality: SegmentationQuality,
+        ciContext: CIContext,
         customMaskProvider: ((CIImage) -> CIImage?)?
     ) -> CIImage? {
         if let provider = customMaskProvider, let customMask = provider(subjectCI) {
@@ -407,7 +685,16 @@ final class BackdropCompositorService: Sendable {
         case .liveFast:
             rawMaskCI = AssetImageCache.shared.performLiveBalancedSegmentation(on: subjectCI)
         case .captureAccurate:
-            rawMaskCI = AssetImageCache.shared.performAccurateSegmentation(on: subjectCI)
+            guard let accurateResult = AssetImageCache.shared.performAccurateSegmentation(
+                on: subjectCI,
+                ciContext: ciContext
+            ) else {
+                return nil
+            }
+            if accurateResult.isFullResolutionHybrid {
+                return accurateResult.mask.cropped(to: targetExtent)
+            }
+            rawMaskCI = accurateResult.mask
         }
         
         guard let rawMaskCI = rawMaskCI else { return nil }

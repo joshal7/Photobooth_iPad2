@@ -2064,6 +2064,20 @@ enum AutomatedVerificationSuite {
             "Levis Stadium Niners",
             "304_levis_stadium_niners_bg.jpg displays as 'Levis Stadium Niners'"
         )
+        
+        // 12. Hybrid .captureAccurate Segmentation Execution (Foreground Instance Mask + Person Segmentation Hysteresis Limb Rescue + Fallback)
+        if let eiffelBgItem = eiffel {
+            let liveSegComposite = BackdropCompositorService.composite(
+                cgImage: subjectCG,
+                backdrop: eiffelBgItem,
+                quality: .captureAccurate,
+                ciContext: ciContext,
+                additionalSearchDirectories: [sampleBackdropsDir],
+                customMaskProvider: nil
+            )
+            assertEqual(liveSegComposite.width, 240, "Hybrid .captureAccurate segmentation preserves width (240) without customMaskProvider")
+            assertEqual(liveSegComposite.height, 160, "Hybrid .captureAccurate segmentation preserves height (160) without customMaskProvider")
+        }
     }
     
     // MARK: - Simulated Email Sharing & Spotty Wi-Fi Queue QA Suite
