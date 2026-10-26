@@ -1127,6 +1127,79 @@ final class BackdropCompositorService: Sendable {
         return baseDate
     }
     
+    /// Parses an EXIF timezone offset string (e.g. `"-07:00"`, `"+02:00"`, or `"Z"`) into a `TimeZone`.
+    nonisolated private static func parseEXIFTimeZoneOffset(_ offsetTime: String?) -> TimeZone? {
+        guard let raw = offsetTime?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        if raw == "Z" || raw == "+00:00" || raw == "-00:00" {
+            return TimeZone(secondsFromGMT: 0)
+        }
+        guard raw.first == "+" || raw.first == "-" else { return nil }
+        let sign = (raw.first == "-") ? -1 : 1
+        let remainder = String(raw.dropFirst())
+        let parts = remainder.split(separator: ":")
+        let hours: Int
+        let minutes: Int
+        if parts.count == 2, let h = Int(parts[0]), let m = Int(parts[1]) {
+            hours = h
+            minutes = m
+        } else if remainder.count == 4,
+                  let h = Int(remainder.prefix(2)),
+                  let m = Int(remainder.suffix(2)) {
+            hours = h
+            minutes = m
+        } else {
+            return nil
+        }
+        guard hours >= 0, hours <= 14, minutes >= 0, minutes < 60 else { return nil }
+        return TimeZone(secondsFromGMT: sign * (hours * 3600 + minutes * 60))
+    }
+    
+    /// Parses an EXIF date string (`"YYYY:MM:DD HH:MM:SS"`) in the camera/local wall-clock timezone
+    /// (or using `offsetTime` if present in EXIF) so filesystem `creationDate` matches the actual time taken.
+    nonisolated static func parseEXIFDateInLocalTimeZone(
+        _ exifString: String?,
+        subSec: String? = nil,
+        offsetTime: String? = nil
+    ) -> Date? {
+        guard let raw = exifString?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        let targetTimeZone = parseEXIFTimeZoneOffset(offsetTime) ?? TimeZone.current
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = targetTimeZone
+        formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+        guard let baseDate = formatter.date(from: raw) else { return nil }
+        if let sub = subSec, let frac = Double("0.\(sub.trimmingCharacters(in: .whitespaces))") {
+            return baseDate.addingTimeInterval(frac)
+        }
+        return baseDate
+    }
+    
+    /// Extracts the original capture `Date` from an image's EXIF/TIFF properties (falling back to manifest EXIF strings),
+    /// interpreted in the camera/local timezone so macOS Finder displays the exact date & time the photo was taken.
+    nonisolated static func parseEXIFCaptureDate(
+        fromProperties props: [CFString: Any],
+        fallbackEXIFDateTime: String? = nil,
+        fallbackSubSec: String? = nil
+    ) -> Date? {
+        let exif = props[kCGImagePropertyExifDictionary] as? [CFString: Any]
+        let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+        let dtString = (exif?[kCGImagePropertyExifDateTimeOriginal] as? String)
+            ?? (exif?[kCGImagePropertyExifDateTimeDigitized] as? String)
+            ?? (tiff?[kCGImagePropertyTIFFDateTime] as? String)
+            ?? fallbackEXIFDateTime
+        let subSec = (exif?[kCGImagePropertyExifSubsecTimeOriginal] as? String)
+            ?? (exif?[kCGImagePropertyExifSubsecTime] as? String)
+            ?? fallbackSubSec
+        let offsetStr = (exif?[kCGImagePropertyExifOffsetTimeOriginal] as? String)
+            ?? (exif?[kCGImagePropertyExifOffsetTime] as? String)
+            ?? (exif?[kCGImagePropertyExifOffsetTimeDigitized] as? String)
+        return parseEXIFDateInLocalTimeZone(dtString, subSec: subSec, offsetTime: offsetStr)
+    }
+    
     /// Computes a compact 192-byte (`8x8x3` RGB) perceptual color signature from the center 80% of `cgImage`.
     nonisolated static func computeRGBSignature8x8(from cgImage: CGImage) -> [UInt8] {
         let gridSize = 8

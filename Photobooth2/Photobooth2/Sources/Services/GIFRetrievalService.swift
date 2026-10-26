@@ -11,6 +11,37 @@ enum GIFRetrievalError: Error {
 
 final class GIFRetrievalService: Sendable {
     
+    /// Resolves the clean `.gif` export filename for a Photo Library GIF resource so that exported GIFs
+    /// start with the exact name of the first image and end with `.gif` (without prepending a random UUID).
+    nonisolated static func resolvedExportFilename(
+        for originalFilename: String,
+        usedFilenames: inout Set<String>
+    ) -> String {
+        let trimmed = originalFilename.trimmingCharacters(in: .whitespacesAndNewlines)
+        var rawStem = (trimmed as NSString).deletingPathExtension
+        // If an older exported file had "<UUID>_<stem>", strip the leading "<UUID>_"
+        if rawStem.count > 37 {
+            let prefix36 = String(rawStem.prefix(36))
+            let sepIdx = rawStem.index(rawStem.startIndex, offsetBy: 36)
+            if rawStem[sepIdx] == "_", UUID(uuidString: prefix36) != nil {
+                rawStem = String(rawStem.dropFirst(37))
+            }
+        }
+        let baseFilename = GIFService.gifFilename(fromFirstImagePath: rawStem)
+        let cleanStem = (baseFilename as NSString).deletingPathExtension
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalStem = cleanStem.isEmpty ? UUID().uuidString : cleanStem
+        
+        var candidate = "\(finalStem).gif"
+        var counter = 2
+        while usedFilenames.contains(candidate.lowercased()) {
+            candidate = "\(finalStem)_\(counter).gif"
+            counter += 1
+        }
+        usedFilenames.insert(candidate.lowercased())
+        return candidate
+    }
+    
     /// Fetches GIFs created within the last N hours and returns their local file URLs.
     /// - Parameter hours: The window of time in hours.
     /// - Returns: A list of temporary file URLs for the fetched GIFs.
@@ -42,6 +73,7 @@ final class GIFRetrievalService: Sendable {
             
             // 3. Extract Data & Save to Temp
             var resultURLs: [URL] = []
+            var usedFilenames: Set<String> = []
             let group = DispatchGroup()
             let lock = NSLock()
             
@@ -75,8 +107,14 @@ final class GIFRetrievalService: Sendable {
                     let resourceOptions = PHAssetResourceRequestOptions()
                     resourceOptions.isNetworkAccessAllowed = true
                     
-                    let filename = gifResource.originalFilename
-                    let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + "_" + filename)
+                    lock.lock()
+                    let filename = Self.resolvedExportFilename(
+                        for: gifResource.originalFilename,
+                        usedFilenames: &usedFilenames
+                    )
+                    lock.unlock()
+                    let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+                    try? FileManager.default.removeItem(at: tempURL)
                     
                     PHAssetResourceManager.default().writeData(for: gifResource, toFile: tempURL, options: resourceOptions) { error in
                         if let error = error {

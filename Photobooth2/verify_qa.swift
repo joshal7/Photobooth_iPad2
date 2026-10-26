@@ -2580,13 +2580,20 @@ assertTrue(
 )
 assertTrue(
     gifServiceSource.contains("sharedCIContext") &&
-    gifServiceSource.contains("guard !imagePaths.isEmpty else"),
-    "GIFService reuses a shared CIContext and guards against empty input without creating orphaned .gif files"
+    gifServiceSource.contains("guard !imagePaths.isEmpty else") &&
+    gifServiceSource.contains("gifFilename(fromFirstImagePath:"),
+    "GIFService reuses a shared CIContext, guards against empty input, and names GIFs after the first image with a .gif extension"
 )
 assertTrue(
     gifRetrievalSource.contains("leaveGroupOnce") &&
-    !gifRetrievalSource.contains("to: endDate)!"),
-    "GIFRetrievalService eliminates Date force-unwrap and guards DispatchGroup.leave() with a one-shot gate"
+    !gifRetrievalSource.contains("to: endDate)!") &&
+    gifRetrievalSource.contains("resolvedExportFilename("),
+    "GIFRetrievalService eliminates Date force-unwrap, guards DispatchGroup.leave() with a one-shot gate, and preserves the first image filename on exported GIFs"
+)
+assertTrue(
+    manifestSource.contains("restoreFileCreationDate(") &&
+    backdropCompositorSource.contains("parseEXIFCaptureDate("),
+    "BackdropManifestStore.applyBackdropsToFolder preserves file Date Created to be the date the image was originally taken"
 )
 assertTrue(
     backdropManagerSource.contains("candidateNormalized.isEmpty || candidateNormalized == BackdropItem.noneID"),

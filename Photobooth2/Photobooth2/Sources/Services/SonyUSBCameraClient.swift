@@ -180,6 +180,7 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
     private nonisolated(unsafe) var activeCaptureMode: CaptureMode = .standard
     private nonisolated(unsafe) var latestLiveViewJPEGData: Data? = nil
     private nonisolated(unsafe) var latestLiveViewTimestampNs: UInt64 = 0
+    private nonisolated(unsafe) var lastKnownPTPFilenameStem: String? = nil
     
     nonisolated func updateSelectedBackdrop(_ backdrop: BackdropItem) {
         backdropLock.lock()
@@ -217,6 +218,63 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
             return nil
         }
         return data
+    }
+    
+    /// Increments the trailing numeric counter of a camera filename stem (e.g. `"DSC09819"` -> `"DSC09820"`).
+    nonisolated static func incrementCameraFilenameStem(_ filenameOrStem: String) -> String? {
+        let trimmed = filenameOrStem.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lastComponent = (trimmed as NSString).lastPathComponent
+        let stem = (lastComponent as NSString).deletingPathExtension
+        guard !stem.isEmpty else { return nil }
+        
+        var digitCount = 0
+        for ch in stem.reversed() {
+            if ch.isASCII && ch.isNumber {
+                digitCount += 1
+            } else {
+                break
+            }
+        }
+        guard digitCount > 0 else { return nil }
+        let prefix = String(stem.dropLast(digitCount))
+        let numberStr = String(stem.suffix(digitCount))
+        guard let numberVal = Int(numberStr) else { return nil }
+        let nextVal = numberVal + 1
+        return prefix + String(format: "%0\(digitCount)d", nextVal)
+    }
+    
+    /// Resolves the camera filename stem (e.g. `"DSC09820"`) from PTP `0x1008` `ObjectInfo`,
+    /// falling back to incrementing the last known PTP filename stem when `pcOnly` mode omits `ObjectInfo.Filename`.
+    nonisolated private func resolveCameraFilenameStem(
+        from objectInfoData: Data?,
+        allowManifestFallback: Bool
+    ) -> String? {
+        if let parsedFilename = BackdropCompositorService.parsePTPObjectInfoFilename(from: objectInfoData) {
+            let cleanStem = ((parsedFilename as NSString).lastPathComponent as NSString).deletingPathExtension
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanStem.isEmpty {
+                backdropLock.lock()
+                lastKnownPTPFilenameStem = cleanStem
+                backdropLock.unlock()
+                return cleanStem
+            }
+        }
+        
+        backdropLock.lock()
+        let cachedStem = lastKnownPTPFilenameStem
+        backdropLock.unlock()
+        
+        let baseCandidate = cachedStem ?? (allowManifestFallback
+            ? BackdropManifestStore.shared.allEntries().compactMap(\.ptpFilename).last
+            : nil)
+        guard let base = baseCandidate,
+              let nextStem = Self.incrementCameraFilenameStem(base) else {
+            return nil
+        }
+        backdropLock.lock()
+        lastKnownPTPFilenameStem = nextStem
+        backdropLock.unlock()
+        return nextStem
     }
     
     /// Continuously monitors USB discovery every 2.5s while disconnected so that if the camera was already
@@ -783,8 +841,18 @@ class SonyUSBCameraClient: NSObject, CameraService, ICDeviceBrowserDelegate, ICC
                                 fallbackLiveViewJPEG: fallbackLVData
                             )
                         }.value
+                        let cameraStem = self.resolveCameraFilenameStem(
+                            from: downloaded.objectInfoData,
+                            allowManifestFallback: self.deviceBrowser != nil
+                        )
+                        let tempFilename: String
+                        if let cameraStem = cameraStem, !cameraStem.isEmpty {
+                            tempFilename = "sony_\(cameraStem)_\(UUID().uuidString).jpg"
+                        } else {
+                            tempFilename = "sony_\(UUID().uuidString).jpg"
+                        }
                         let tempURL = FileManager.default.temporaryDirectory
-                            .appendingPathComponent("sony_\(UUID().uuidString).jpg")
+                            .appendingPathComponent(tempFilename)
                         try normalizedData.write(to: tempURL, options: .atomic)
                         return [tempURL.absoluteString]
                     }

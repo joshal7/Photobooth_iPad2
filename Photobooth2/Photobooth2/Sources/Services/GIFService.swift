@@ -20,6 +20,40 @@ final class GIFService: Sendable {
         }
         return URL(fileURLWithPath: pathOrURL)
     }
+    
+    /// Derives the `.gif` filename from the first source image so that the GIF starts with the exact name
+    /// of the first image (e.g. `"DSC09820.JPG"` -> `"DSC09820.gif"`, or `"sony_DSC09820_<UUID>.jpg"` -> `"DSC09820.gif"`),
+    /// enabling chronological sorting by filename alongside camera `.JPG` files on macOS.
+    nonisolated static func gifFilename(fromFirstImagePath firstPath: String?) -> String {
+        guard let firstPath = firstPath, !firstPath.isEmpty else {
+            return "\(UUID().uuidString).gif"
+        }
+        let url = resolveFileURL(firstPath)
+        let rawStem = url.deletingPathExtension().lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawStem.isEmpty else {
+            return "\(UUID().uuidString).gif"
+        }
+        
+        // If captured by SonyUSBCameraClient with embedded camera filename ("sony_<CAMERA_STEM>_<UUID>"),
+        // extract the exact camera stem (e.g. "DSC09820").
+        if rawStem.hasPrefix("sony_") {
+            let afterPrefix = String(rawStem.dropFirst("sony_".count))
+            if afterPrefix.count > 37 {
+                let uuidPart = String(afterPrefix.suffix(36))
+                let sepIndex = afterPrefix.index(afterPrefix.endIndex, offsetBy: -37)
+                if afterPrefix[sepIndex] == "_", UUID(uuidString: uuidPart) != nil {
+                    let cameraStem = String(afterPrefix[..<sepIndex])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cameraStem.isEmpty {
+                        return "\(cameraStem).gif"
+                    }
+                }
+            }
+        }
+        
+        return "\(rawStem).gif"
+    }
 
     /// Creates an animated GIF from a list of image paths or file:// URLs at 1080p resolution.
     /// - Parameters:
@@ -130,7 +164,9 @@ final class GIFService: Sendable {
         }
         
         let tempDir = FileManager.default.temporaryDirectory
-        let gifURL = tempDir.appendingPathComponent("\(UUID().uuidString).gif")
+        let gifFileName = gifFilename(fromFirstImagePath: imagePaths.first)
+        let gifURL = tempDir.appendingPathComponent(gifFileName)
+        try? FileManager.default.removeItem(at: gifURL)
         
         guard let destination = CGImageDestinationCreateWithURL(gifURL as CFURL, UTType.gif.identifier as CFString, loadedFrames.count, nil) else {
             print("Failed to create GIF destination")

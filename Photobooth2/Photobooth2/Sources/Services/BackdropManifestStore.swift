@@ -890,6 +890,12 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             // skip re-applying! (If the user replaced the JPEG with a fresh un-composited copy from the SD card,
             // `alreadyAppliedBackdropID` is nil so it will re-apply cleanly.)
             if candidate.alreadyAppliedBackdropID == entry.backdropID {
+                if let healDate = BackdropCompositorService.parseEXIFDateInLocalTimeZone(
+                    candidate.exifDateTimeOriginal ?? entry.exifDateTimeOriginal,
+                    subSec: entry.exifSubSecOriginal
+                ) {
+                    Self.restoreFileCreationDate(healDate, for: candidate.url, fileManager: fm)
+                }
                 manifestDoc.entries[entryIndex].appliedToFullRes = true
                 manifestDoc.entries[entryIndex].matchedFullResFilename = candidate.url.lastPathComponent
                 skippedAlreadyApplied += 1
@@ -927,8 +933,15 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             
             // 5. Apply Full-Resolution Auto-Exposure + .captureAccurate Backdrop Compositing inside autoreleasepool
             let didApply: Bool = autoreleasepool {
+                let existingCreationDate = (try? fm.attributesOfItem(atPath: candidate.url.path)[.creationDate] as? Date)
+                    ?? (try? candidate.url.resourceValues(forKeys: [.creationDateKey]).creationDate)
                 guard let src = CGImageSourceCreateWithURL(candidate.url as CFURL, nil) else { return false }
                 let rawProps = (CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]) ?? [:]
+                let originalCaptureDate = BackdropCompositorService.parseEXIFCaptureDate(
+                    fromProperties: rawProps,
+                    fallbackEXIFDateTime: entry.exifDateTimeOriginal ?? candidate.exifDateTimeOriginal,
+                    fallbackSubSec: entry.exifSubSecOriginal
+                ) ?? existingCreationDate
                 let rawWidth = (rawProps[kCGImagePropertyPixelWidth] as? Int) ?? 0
                 let rawHeight = (rawProps[kCGImagePropertyPixelHeight] as? Int) ?? 0
                 let maxDim = max(rawWidth, rawHeight, 8192)
@@ -975,6 +988,14 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
                 updatedProps[kCGImagePropertyOrientation] = 1
                 var exifDict = (updatedProps[kCGImagePropertyExifDictionary] as? [CFString: Any]) ?? [:]
                 exifDict[kCGImagePropertyExifUserComment] = "PB2_BACKDROP:\(entry.backdropID)"
+                if exifDict[kCGImagePropertyExifDateTimeOriginal] == nil,
+                   let fallbackDT = entry.exifDateTimeOriginal ?? candidate.exifDateTimeOriginal {
+                    exifDict[kCGImagePropertyExifDateTimeOriginal] = fallbackDT
+                }
+                if exifDict[kCGImagePropertyExifDateTimeDigitized] == nil,
+                   let origDT = (exifDict[kCGImagePropertyExifDateTimeOriginal] as? String) ?? entry.exifDateTimeOriginal {
+                    exifDict[kCGImagePropertyExifDateTimeDigitized] = origDT
+                }
                 updatedProps[kCGImagePropertyExifDictionary] = exifDict
                 updatedProps[kCGImageDestinationLossyCompressionQuality] = 0.94
                 
@@ -983,6 +1004,9 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
                 
                 do {
                     try (outData as Data).write(to: candidate.url, options: .atomic)
+                    if let captureDate = originalCaptureDate {
+                        Self.restoreFileCreationDate(captureDate, for: candidate.url, fileManager: fm)
+                    }
                     return true
                 } catch {
                     return false
@@ -1019,5 +1043,23 @@ final class BackdropManifestStore: ObservableObject, @unchecked Sendable {
             unmatchedCount: unmatched,
             appliedFilenames: appliedFilenames
         )
+    }
+    
+    /// Restores the file's creation date (and modification date so APFS `btime <= mtime` holds)
+    /// to the original photo capture timestamp after an atomic in-place write.
+    nonisolated static func restoreFileCreationDate(
+        _ captureDate: Date,
+        for fileURL: URL,
+        fileManager: FileManager = .default
+    ) {
+        try? fileManager.setAttributes(
+            [.creationDate: captureDate, .modificationDate: captureDate],
+            ofItemAtPath: fileURL.path
+        )
+        var resourceValues = URLResourceValues()
+        resourceValues.creationDate = captureDate
+        resourceValues.contentModificationDate = captureDate
+        var mutableURL = fileURL
+        try? mutableURL.setResourceValues(resourceValues)
     }
 }

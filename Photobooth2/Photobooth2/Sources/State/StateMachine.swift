@@ -926,7 +926,9 @@ class StateMachine: ObservableObject {
             try? await PHPhotoLibrary.shared().performChanges {
                 for url in urls {
                     let creationRequest = PHAssetCreationRequest.forAsset()
-                    creationRequest.addResource(with: .photo, fileURL: url, options: nil)
+                    let options = PHAssetResourceCreationOptions()
+                    options.originalFilename = url.lastPathComponent
+                    creationRequest.addResource(with: .photo, fileURL: url, options: options)
                 }
             }
         }

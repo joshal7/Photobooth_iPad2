@@ -637,17 +637,29 @@ enum AutomatedVerificationSuite {
         try await Task.sleep(nanoseconds: 100_000_000)
         assertEqual(sm.state, .idle, "App background -> foreground transition preserves .idle state and resumes USB session cleanly")
         
-        // 10. GIFService file:// URL Aspect Ratio & Resolution Scaling Verification
-        let frame1URL = tempDir.appendingPathComponent("gif_test_1_\(UUID().uuidString).jpg")
-        let frame2URL = tempDir.appendingPathComponent("gif_test_2_\(UUID().uuidString).jpg")
+        // 10. GIFService file:// URL Aspect Ratio, Resolution Scaling & First-Image Filename Preservation Verification
+        let frame1URL = tempDir.appendingPathComponent("sony_DSC09830_\(UUID().uuidString).jpg")
+        let frame2URL = tempDir.appendingPathComponent("sony_DSC09831_\(UUID().uuidString).jpg")
         try transport.sampleJPEGData.write(to: frame1URL)
         try transport.sampleJPEGData.write(to: frame2URL)
         if let gifURL = GIFService.createGIF(from: [frame1URL.absoluteString, frame2URL.path], frameDuration: 0.25, resolution: 0) {
             assertTrue(FileManager.default.fileExists(atPath: gifURL.path), "GIFService.createGIF handles mixed file:// URLs and POSIX paths")
+            assertEqual(gifURL.lastPathComponent, "DSC09830.gif", "GIFService.createGIF names the output GIF with the exact name of the first image and .gif extension")
             try? FileManager.default.removeItem(at: gifURL)
         } else {
             assertTrue(false, "GIFService.createGIF failed on valid JPEG inputs")
         }
+        var usedExportNames: Set<String> = []
+        assertEqual(
+            GIFRetrievalService.resolvedExportFilename(for: "DSC09830.gif", usedFilenames: &usedExportNames),
+            "DSC09830.gif",
+            "GIFRetrievalService preserves exact camera filename DSC09830.gif without prepending a UUID"
+        )
+        assertEqual(
+            GIFRetrievalService.resolvedExportFilename(for: "DSC09830.gif", usedFilenames: &usedExportNames),
+            "DSC09830_2.gif",
+            "GIFRetrievalService disambiguates duplicate GIF filenames while still starting with DSC09830 and ending with .gif"
+        )
         try? FileManager.default.removeItem(at: frame1URL)
         try? FileManager.default.removeItem(at: frame2URL)
         
@@ -1465,6 +1477,16 @@ enum AutomatedVerificationSuite {
         )
         assertEqual(report1.newlyAppliedCount, 2, "Mac batch processor applied backdrops to 2 matched full-res photos in-place")
         assertEqual(report1.unmatchedCount, 0, "Mac batch processor had 0 unmatched manifest entries")
+        if let expectedCaptureDate = BackdropCompositorService.parseEXIFDateInLocalTimeZone("2026:10:15 20:15:30", subSec: "120"),
+           let actualCreationDate = (try? fm.attributesOfItem(atPath: dsc1URL.path)[.creationDate] as? Date)
+               ?? (try? dsc1URL.resourceValues(forKeys: [.creationDateKey]).creationDate) {
+            assertTrue(
+                abs(actualCreationDate.timeIntervalSince(expectedCaptureDate)) < 2.0,
+                "Mac batch processor preserves file Date Created to be the date the image was originally taken (\(actualCreationDate) vs \(expectedCaptureDate))"
+            )
+        } else {
+            assertTrue(false, "Expected valid Date Created on DSC00001.JPG after applying backdrop")
+        }
         
         // Check SmugMug-clean file count: ONLY DSC00001.JPG, DSC00002.JPG, DSC00003.JPG, and photobooth_backdrop_manifest.json exist!
         let postFiles = try fm.contentsOfDirectory(at: partyFolder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
